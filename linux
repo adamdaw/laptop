@@ -92,23 +92,22 @@ else
   ok "installed gh"
 fi
 
-# ── NVM + Node ────────────────────────────────────────────────────────────────
+# ── fnm + Node ────────────────────────────────────────────────────────────────
 
-step "Installing NVM + Node LTS"
-export NVM_DIR="$HOME/.nvm"
-if [ -d "$NVM_DIR" ]; then
-  ok "nvm already installed"
+step "Installing fnm + Node LTS"
+FNM_BIN="$HOME/.local/share/fnm/fnm"
+if [ -x "$FNM_BIN" ]; then
+  ok "fnm already installed ($("$FNM_BIN" --version))"
 else
-  curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
-  ok "installed nvm"
+  curl -fsSL https://fnm.vercel.app/install | bash -s -- --skip-shell
+  ok "installed fnm"
 fi
-source "$NVM_DIR/nvm.sh"
+eval "$("$FNM_BIN" env --shell bash)"
 if cmd_exists node; then
   ok "node already installed ($(node --version))"
 else
-  nvm install --lts
-  nvm use --lts
-  nvm alias default node
+  fnm install --lts
+  fnm default lts-latest
   ok "installed node $(node --version)"
 fi
 
@@ -168,6 +167,16 @@ else
   ok "installed JetBrains Mono Nerd Font"
 fi
 
+# ── Ghostty ──────────────────────────────────────────────────────────────────
+
+step "Installing Ghostty"
+if cmd_exists ghostty; then
+  ok "ghostty already installed ($(ghostty --version | head -1))"
+else
+  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/mkasberg/ghostty-ubuntu/HEAD/install.sh)"
+  ok "installed ghostty"
+fi
+
 # ── Telemetry opt-outs ────────────────────────────────────────────────────────
 
 step "Disabling telemetry"
@@ -222,7 +231,7 @@ clone_if_absent "$DOTFILES_REPO" "$DOTFILES_DIR"
 
 cd "$DOTFILES_DIR"
 for pkg in bash zsh git ssh ghostty starship nvim bin ripgrep bat; do
-  stow --restow --target="$HOME" "$pkg" 2>/dev/null && ok "stowed $pkg" || true
+  stow --adopt --restow --target="$HOME" "$pkg" 2>/dev/null && ok "stowed $pkg" || true
 done
 
 # ── Shell ─────────────────────────────────────────────────────────────────────
