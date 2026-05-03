@@ -72,7 +72,9 @@ apt_install \
   fd-find \
   fzf \
   bat \
-  xclip
+  xclip \
+  zsh-autosuggestions \
+  zsh-syntax-highlighting
 
 # ── gh CLI ───────────────────────────────────────────────────────────────────
 
@@ -120,6 +122,26 @@ else
   ok "installed claude"
 fi
 
+# ── Bun ──────────────────────────────────────────────────────────────────────
+
+step "Installing Bun"
+if [ -x "$HOME/.bun/bin/bun" ]; then
+  ok "bun already installed ($("$HOME/.bun/bin/bun" --version))"
+else
+  curl -fsSL https://bun.sh/install | bash
+  ok "installed bun"
+fi
+
+# ── uv (Python package manager) ───────────────────────────────────────────────
+
+step "Installing uv"
+if cmd_exists uv; then
+  ok "uv already installed"
+else
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  ok "installed uv"
+fi
+
 # ── Starship ─────────────────────────────────────────────────────────────────
 
 step "Installing Starship prompt"
@@ -128,6 +150,22 @@ if cmd_exists starship; then
 else
   curl -sS https://starship.rs/install.sh | sh -s -- --yes
   ok "installed starship"
+fi
+
+# ── JetBrains Mono Nerd Font ─────────────────────────────────────────────────
+
+step "Installing JetBrains Mono Nerd Font"
+FONT_DIR="$HOME/.local/share/fonts"
+if fc-list | grep -qi "JetBrainsMono Nerd"; then
+  ok "JetBrains Mono Nerd Font already installed"
+else
+  mkdir -p "$FONT_DIR"
+  curl -fsSL https://github.com/ryanoasis/nerd-fonts/releases/latest/download/JetBrainsMono.zip \
+    -o /tmp/JetBrainsMono.zip
+  unzip -o /tmp/JetBrainsMono.zip -d "$FONT_DIR/JetBrainsMono" '*.ttf' 2>/dev/null
+  fc-cache -f "$FONT_DIR"
+  rm /tmp/JetBrainsMono.zip
+  ok "installed JetBrains Mono Nerd Font"
 fi
 
 # ── Telemetry opt-outs ────────────────────────────────────────────────────────
@@ -183,7 +221,7 @@ mkdir -p "$HOME_PROJECTS_DIR"
 clone_if_absent "$DOTFILES_REPO" "$DOTFILES_DIR"
 
 cd "$DOTFILES_DIR"
-for pkg in bash zsh git ssh ghostty starship nvim bin; do
+for pkg in bash zsh git ssh ghostty starship nvim bin ripgrep bat; do
   stow --restow --target="$HOME" "$pkg" 2>/dev/null && ok "stowed $pkg" || true
 done
 

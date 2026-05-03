@@ -19,13 +19,16 @@ bash laptop/linux
 
 | Category | Tools |
 |---|---|
-| Shell | zsh, Starship prompt |
+| Shell | zsh, zsh-autosuggestions, zsh-syntax-highlighting, Starship |
 | Core | git, git-delta, curl, wget, build-essential, stow |
 | Terminal | neovim, xclip |
 | Search | ripgrep, fd-find, fzf, bat |
 | Data | jq |
 | GitHub | gh CLI |
 | Node | nvm + Node LTS, Claude Code |
+| Python | uv |
+| JavaScript runtime | Bun |
+| Font | JetBrains Mono Nerd Font |
 
 ## What it configures
 
@@ -54,6 +57,21 @@ clone_if_absent "https://github.com/you/your-repo.git" "$HOME_PROJECTS_DIR/your-
 # ~/bin symlinks
 mkdir -p "$HOME/bin"
 symlink_bin "$HOME_PROJECTS_DIR/your-repo/bin/your-script" "$HOME/bin/your-script"
+
+# Anacron — user-level job scheduler (survives sleep/wake cycles)
+# Step 1: add to crontab (crontab -e):
+#   @hourly /usr/sbin/anacron -s -t ~/.anacron/etc/anacrontab -S ~/.anacron/spool
+# Step 2: create ~/.anacron/etc/anacrontab:
+mkdir -p ~/.anacron/etc ~/.anacron/spool
+cat > ~/.anacron/etc/anacrontab << 'ANACRONTAB'
+SHELL=/bin/bash
+PATH=/home/you/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+HOME=/home/you
+LOGNAME=you
+
+1  5  daily-digest             /home/you/bin/daily-digest >> ~/.local/share/daily-digest.log 2>&1
+1  10 commonplace-daily-commit /home/you/bin/commonplace-daily-commit.sh
+ANACRONTAB
 ```
 
 ## Telemetry
