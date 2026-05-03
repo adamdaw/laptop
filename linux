@@ -43,7 +43,7 @@ apt_install \
   stow \
   zsh \
   tmux \
-  vim \
+  neovim \
   jq \
   ripgrep \
   fd-find \
@@ -160,7 +160,7 @@ else
 fi
 
 cd "$DOTFILES_DIR"
-for pkg in bash zsh git tmux ghostty starship; do
+for pkg in bash zsh git tmux ghostty starship nvim; do
   stow --restow --target="$HOME" "$pkg" 2>/dev/null && ok "stowed $pkg" || true
 done
 

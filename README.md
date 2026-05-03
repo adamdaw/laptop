@@ -21,7 +21,7 @@ bash laptop/linux
 |---|---|
 | Shell | zsh, Starship prompt |
 | Core | git, curl, wget, build-essential, stow |
-| Terminal | tmux, vim, xclip |
+| Terminal | tmux, neovim, xclip |
 | Search | ripgrep, fd-find, fzf, bat |
 | Data | jq |
 | GitHub | gh CLI |
