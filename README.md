@@ -32,9 +32,9 @@ bash laptop/linux
 
 ## What it configures
 
-- git: user name/email, `core.hooksPath`, gh credential helper
+- git: `core.hooksPath`, delta pager, `pull.rebase`, `push.autoSetupRemote`, `init.defaultBranch=main` — identity goes in `~/.laptop.local`
 - SSH: generates `~/.ssh/id_ed25519` if absent
-- Dotfiles: clones [adamdaw/dotfiles](https://github.com/adamdaw/dotfiles) into `~/homeProjects/dotfiles` and stows all packages
+- Dotfiles: clones your dotfiles repo and stows all packages — update `DOTFILES_REPO` at the top of `linux` to point at yours
 - Shell: sets zsh as default
 
 ## Personal additions
