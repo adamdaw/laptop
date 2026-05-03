@@ -20,7 +20,7 @@ bash laptop/linux
 | Category | Tools |
 |---|---|
 | Shell | zsh, Starship prompt |
-| Core | git, curl, wget, build-essential, stow |
+| Core | git, git-delta, curl, wget, build-essential, stow |
 | Terminal | neovim, xclip |
 | Search | ripgrep, fd-find, fzf, bat |
 | Data | jq |

@@ -26,6 +26,26 @@ apt_install() {
   done
 }
 
+clone_if_absent() {
+  local repo="$1" dir="$2"
+  if [ -d "$dir/.git" ]; then
+    ok "$(basename "$dir") already cloned"
+  else
+    git clone "$repo" "$dir"
+    ok "cloned $(basename "$dir")"
+  fi
+}
+
+symlink_bin() {
+  local target="$1" link="$2"
+  if [ -L "$link" ]; then
+    ok "$(basename "$link") symlink already exists"
+  else
+    ln -s "$target" "$link"
+    ok "linked $(basename "$link")"
+  fi
+}
+
 # ── System update ─────────────────────────────────────────────────────────────
 
 step "Updating system packages"
@@ -40,6 +60,7 @@ apt_install \
   curl \
   wget \
   git \
+  git-delta \
   stow \
   zsh \
   neovim \
@@ -128,8 +149,17 @@ step "Configuring git"
 git config --global user.name  "Adam Daw"
 git config --global user.email "adam@adamdaw.com"
 git config --global core.hooksPath "$HOME/.config/git/hooks"
+git config --global core.pager delta
+git config --global interactive.diffFilter "delta --color-only"
+git config --global delta.navigate true
+git config --global delta.side-by-side true
 git config --global credential."https://github.com".helper ""
 git config --global --add credential."https://github.com".helper "!/usr/bin/gh auth git-credential"
+git config --global pull.rebase true
+git config --global push.autoSetupRemote true
+git config --global init.defaultBranch main
+git config --global merge.conflictstyle diff3
+git config --global diff.colorMoved default
 ok "git configured"
 
 # ── SSH ───────────────────────────────────────────────────────────────────────
@@ -151,17 +181,27 @@ fi
 
 step "Cloning and applying dotfiles"
 mkdir -p "$HOME_PROJECTS_DIR"
-if [ -d "$DOTFILES_DIR/.git" ]; then
-  ok "dotfiles already cloned"
-else
-  git clone "$DOTFILES_REPO" "$DOTFILES_DIR"
-  ok "cloned dotfiles"
-fi
+clone_if_absent "$DOTFILES_REPO" "$DOTFILES_DIR"
 
 cd "$DOTFILES_DIR"
-for pkg in bash zsh git ghostty starship nvim; do
+for pkg in bash zsh git ssh ghostty starship nvim bin; do
   stow --restow --target="$HOME" "$pkg" 2>/dev/null && ok "stowed $pkg" || true
 done
+
+# ── homeProjects repos ────────────────────────────────────────────────────────
+
+step "Cloning homeProjects repos"
+clone_if_absent "https://github.com/adamdaw/adamdaw.github.io.git" "$HOME_PROJECTS_DIR/adamdaw.github.io"
+clone_if_absent "https://github.com/adamdaw/daily-digest.git"      "$HOME_PROJECTS_DIR/daily-digest"
+clone_if_absent "https://github.com/adamdaw/daedalus.git"           "$HOME_PROJECTS_DIR/daedalus"
+clone_if_absent "https://github.com/adamdaw/unitasker.git"          "$HOME_PROJECTS_DIR/Unitasker"
+
+# ── ~/bin symlinks ────────────────────────────────────────────────────────────
+
+step "Wiring ~/bin symlinks"
+mkdir -p "$HOME/bin"
+symlink_bin "$HOME_PROJECTS_DIR/adamdaw.github.io/bin/publish-reading" "$HOME/bin/publish-reading"
+symlink_bin "$HOME_PROJECTS_DIR/daily-digest/bin/daily-digest"         "$HOME/bin/daily-digest"
 
 # ── Shell ─────────────────────────────────────────────────────────────────────
 
@@ -173,6 +213,12 @@ else
   ok "default shell set to zsh (takes effect on next login)"
 fi
 
-# ── Done ──────────────────────────────────────────────────────────────────────
+# ── Manual steps ──────────────────────────────────────────────────────────────
 
-printf "\n\033[1;32mDone.\033[0m Log out and back in to start using zsh.\n\n"
+printf "\n\033[1;32mDone.\033[0m Log out and back in to start using zsh.\n"
+printf "\nManual steps remaining:\n"
+printf "  - gh auth login\n"
+printf "  - Add SSH key to GitHub: https://github.com/settings/keys\n"
+printf "  - rmapi: download from https://github.com/juruen/rmapi/releases\n"
+printf "  - voxtype (transcribe): clone peteonrails/voxtype and cargo build --release\n"
+printf "  - commonplace: gh repo clone adamdaw/commonplace ~/commonplace\n\n"
