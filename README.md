@@ -34,6 +34,28 @@ bash laptop/linux
 - Dotfiles: clones [adamdaw/dotfiles](https://github.com/adamdaw/dotfiles) into `~/homeProjects/dotfiles` and stows all packages
 - Shell: sets zsh as default
 
+## Personal additions
+
+Create `~/.laptop.local` before running — it's sourced at the end of the script. Use it for anything personal: identity, private repo clones, bin symlinks.
+
+```bash
+# ~/.laptop.local
+
+# git identity (also needed in ~/.gitconfig.local — see dotfiles README)
+git config --global user.name  "Your Name"
+git config --global user.email "you@example.com"
+git config --global credential."https://github.com".helper ""
+git config --global --add credential."https://github.com".helper \
+  "!/usr/bin/gh auth git-credential"
+
+# Private repo clones
+clone_if_absent "https://github.com/you/your-repo.git" "$HOME_PROJECTS_DIR/your-repo"
+
+# ~/bin symlinks
+mkdir -p "$HOME/bin"
+symlink_bin "$HOME_PROJECTS_DIR/your-repo/bin/your-script" "$HOME/bin/your-script"
+```
+
 ## Telemetry
 
 Disables ubuntu-report, popularity-contest, apport, go telemetry, and npm fund messages. The dotfiles zshrc exports `DO_NOT_TRACK=1` and related opt-outs.

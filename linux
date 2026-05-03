@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Bootstrap a Pop_OS 24.04 / Ubuntu 24.04 development machine.
 # Idempotent: safe to re-run.
+#
+# Personal additions (name, email, private repos, bin symlinks) go in
+# ~/.laptop.local — sourced at the end of this script.
 
 set -euo pipefail
 
@@ -146,31 +149,27 @@ ok "telemetry disabled"
 # ── git config ────────────────────────────────────────────────────────────────
 
 step "Configuring git"
-git config --global user.name  "Adam Daw"
-git config --global user.email "adam@adamdaw.com"
 git config --global core.hooksPath "$HOME/.config/git/hooks"
 git config --global core.pager delta
 git config --global interactive.diffFilter "delta --color-only"
 git config --global delta.navigate true
 git config --global delta.side-by-side true
-git config --global credential."https://github.com".helper ""
-git config --global --add credential."https://github.com".helper "!/usr/bin/gh auth git-credential"
 git config --global pull.rebase true
 git config --global push.autoSetupRemote true
 git config --global init.defaultBranch main
 git config --global merge.conflictstyle diff3
 git config --global diff.colorMoved default
-ok "git configured"
+ok "git configured (identity set via ~/.gitconfig.local)"
 
 # ── SSH ───────────────────────────────────────────────────────────────────────
 
 step "SSH setup"
 mkdir -p ~/.ssh && chmod 700 ~/.ssh
 if [ ! -f ~/.ssh/id_ed25519 ]; then
-  ssh-keygen -t ed25519 -C "adam@adamdaw.com" -f ~/.ssh/id_ed25519 -N ""
+  ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N ""
   ok "generated ~/.ssh/id_ed25519"
   echo ""
-  echo "  Add this public key to GitHub: https://github.com/settings/keys"
+  echo "  Add this public key to GitHub (or wherever needed):"
   cat ~/.ssh/id_ed25519.pub
   echo ""
 else
@@ -188,21 +187,6 @@ for pkg in bash zsh git ssh ghostty starship nvim bin; do
   stow --restow --target="$HOME" "$pkg" 2>/dev/null && ok "stowed $pkg" || true
 done
 
-# ── homeProjects repos ────────────────────────────────────────────────────────
-
-step "Cloning homeProjects repos"
-clone_if_absent "https://github.com/adamdaw/adamdaw.github.io.git" "$HOME_PROJECTS_DIR/adamdaw.github.io"
-clone_if_absent "https://github.com/adamdaw/daily-digest.git"      "$HOME_PROJECTS_DIR/daily-digest"
-clone_if_absent "https://github.com/adamdaw/daedalus.git"           "$HOME_PROJECTS_DIR/daedalus"
-clone_if_absent "https://github.com/adamdaw/unitasker.git"          "$HOME_PROJECTS_DIR/Unitasker"
-
-# ── ~/bin symlinks ────────────────────────────────────────────────────────────
-
-step "Wiring ~/bin symlinks"
-mkdir -p "$HOME/bin"
-symlink_bin "$HOME_PROJECTS_DIR/adamdaw.github.io/bin/publish-reading" "$HOME/bin/publish-reading"
-symlink_bin "$HOME_PROJECTS_DIR/daily-digest/bin/daily-digest"         "$HOME/bin/daily-digest"
-
 # ── Shell ─────────────────────────────────────────────────────────────────────
 
 step "Setting zsh as default shell"
@@ -213,12 +197,16 @@ else
   ok "default shell set to zsh (takes effect on next login)"
 fi
 
-# ── Manual steps ──────────────────────────────────────────────────────────────
+# ── Personal additions ────────────────────────────────────────────────────────
 
-printf "\n\033[1;32mDone.\033[0m Log out and back in to start using zsh.\n"
-printf "\nManual steps remaining:\n"
-printf "  - gh auth login\n"
-printf "  - Add SSH key to GitHub: https://github.com/settings/keys\n"
-printf "  - rmapi: download from https://github.com/juruen/rmapi/releases\n"
-printf "  - voxtype (transcribe): clone peteonrails/voxtype and cargo build --release\n"
-printf "  - commonplace: gh repo clone adamdaw/commonplace ~/commonplace\n\n"
+if [ -f ~/.laptop.local ]; then
+  step "Running ~/.laptop.local"
+  source ~/.laptop.local
+else
+  printf "\n  No ~/.laptop.local found — skipping personal additions.\n"
+  printf "  Create one to clone private repos, add bin symlinks, etc.\n"
+fi
+
+# ── Done ──────────────────────────────────────────────────────────────────────
+
+printf "\n\033[1;32mDone.\033[0m Log out and back in to start using zsh.\n\n"
