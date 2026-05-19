@@ -8,8 +8,8 @@
 set -euo pipefail
 
 DOTFILES_REPO="https://github.com/adamdaw/dotfiles.git"
-DOTFILES_DIR="$HOME/homeProjects/dotfiles"
-HOME_PROJECTS_DIR="$HOME/homeProjects"
+DOTFILES_DIR="$HOME/Projects/Home/dotfiles"
+HOME_PROJECTS_DIR="$HOME/Projects/Home"
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -103,11 +103,11 @@ else
   ok "installed fnm"
 fi
 eval "$("$FNM_BIN" env --shell bash)"
-if cmd_exists node; then
-  ok "node already installed ($(node --version))"
+if "$FNM_BIN" list 2>/dev/null | grep -q "lts"; then
+  ok "node lts already installed via fnm"
 else
-  fnm install --lts
-  fnm default lts-latest
+  "$FNM_BIN" install --lts
+  "$FNM_BIN" default lts-latest
   ok "installed node $(node --version)"
 fi
 
