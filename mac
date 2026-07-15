@@ -83,6 +83,25 @@ step "Installing packages from Brewfile"
 brew bundle --file="$SCRIPT_DIR/Brewfile"
 ok "brew bundle complete"
 
+# ── GPG pinentry ───────────────────────────────────────────────────────────────
+# Point gpg-agent at the GUI pinentry so passphrase prompts (e.g. decrypting the
+# credentials backup) pop a macOS dialog instead of failing on a headless TTY.
+step "Configuring GPG pinentry"
+mkdir -p ~/.gnupg && chmod 700 ~/.gnupg
+PINENTRY="$(brew --prefix)/bin/pinentry-mac"
+if [ -x "$PINENTRY" ]; then
+  if ! grep -qxF "pinentry-program $PINENTRY" ~/.gnupg/gpg-agent.conf 2>/dev/null; then
+    printf 'pinentry-program %s\n' "$PINENTRY" >> ~/.gnupg/gpg-agent.conf
+    chmod 600 ~/.gnupg/gpg-agent.conf
+    gpgconf --kill gpg-agent 2>/dev/null || true
+    ok "gpg-agent → pinentry-mac"
+  else
+    ok "gpg-agent already using pinentry-mac"
+  fi
+else
+  ok "pinentry-mac not found — skipping (check Brewfile)"
+fi
+
 # ── Node (via fnm) + global CLIs ───────────────────────────────────────────────
 # fnm/mise manage project node versions; install an LTS baseline under fnm.
 
