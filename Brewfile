@@ -23,6 +23,10 @@ brew "fzf"
 brew "bat"
 brew "neovim"
 
+# ── Security ─────────────────────────────────────────────────────────────────
+brew "gnupg"                     # GPG — decrypt/verify (e.g. the credentials backup)
+brew "pinentry-mac"              # GUI passphrase prompt for gpg-agent on macOS
+
 # ── Shell ────────────────────────────────────────────────────────────────────
 brew "zsh"
 brew "zsh-autosuggestions"
