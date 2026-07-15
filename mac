@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+# Bootstrap a macOS (Apple Silicon) development machine.
+# Idempotent: safe to re-run.
+#
+# Package list lives in ./Brewfile (applied via `brew bundle`). Personal
+# additions (name, email, private repos, bin symlinks) go in ~/.laptop.local —
+# sourced at the end of this script.
+#
+# This is the macOS counterpart to `linux`. All Homebrew logic lives here, so
+# running `./linux` on a Linux box never touches brew.
+
+set -euo pipefail
+
+# ── macOS guard ────────────────────────────────────────────────────────────────
+# Refuse to run anywhere but macOS. On Linux use ./linux (apt) instead.
+if [ "$(uname -s)" != "Darwin" ]; then
+  echo "This script is macOS-only. On Linux, run ./linux instead." >&2
+  exit 1
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DOTFILES_REPO="https://github.com/adamdaw/dotfiles.git"
+DOTFILES_DIR="$HOME/Projects/Home/dotfiles"
+HOME_PROJECTS_DIR="$HOME/Projects/Home"
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+step() { printf "\n\033[1;34m==>\033[0m %s\n" "$1"; }
+ok()   { printf "  \033[1;32m✓\033[0m %s\n" "$1"; }
+
+cmd_exists() { command -v "$1" &>/dev/null; }
+
+clone_if_absent() {
+  local repo="$1" dir="$2"
+  if [ -d "$dir/.git" ]; then
+    ok "$(basename "$dir") already cloned"
+  else
+    git clone "$repo" "$dir"
+    ok "cloned $(basename "$dir")"
+  fi
+}
+
+# ── Xcode Command Line Tools ───────────────────────────────────────────────────
+# Provides git, clang, make — needed before Homebrew.
+
+step "Xcode Command Line Tools"
+if xcode-select -p &>/dev/null; then
+  ok "Command Line Tools already installed"
+else
+  xcode-select --install
+  echo "  Finish the GUI installer, then re-run this script."
+  exit 1
+fi
+
+# ── Rosetta 2 (Apple Silicon) ──────────────────────────────────────────────────
+# A few casks are still x86-only.
+
+if [ "$(uname -m)" = "arm64" ]; then
+  step "Rosetta 2"
+  if /usr/bin/pgrep -q oahd; then
+    ok "Rosetta already installed"
+  else
+    softwareupdate --install-rosetta --agree-to-license
+    ok "installed Rosetta 2"
+  fi
+fi
+
+# ── Homebrew ───────────────────────────────────────────────────────────────────
+
+step "Homebrew"
+if cmd_exists brew; then
+  ok "Homebrew already installed"
+else
+  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+  ok "installed Homebrew"
+fi
+# Put brew on PATH for the rest of this script (Apple Silicon prefix).
+eval "$(/opt/homebrew/bin/brew shellenv)"
+
+# ── Packages (Brewfile) ────────────────────────────────────────────────────────
+
+step "Installing packages from Brewfile"
+brew bundle --file="$SCRIPT_DIR/Brewfile"
+ok "brew bundle complete"
+
+# ── Node (via fnm) + global CLIs ───────────────────────────────────────────────
+# fnm/mise manage project node versions; install an LTS baseline under fnm.
+
+step "Node LTS via fnm"
+if cmd_exists fnm; then
+  eval "$(fnm env --shell bash)"
+  if fnm list 2>/dev/null | grep -q "lts"; then
+    ok "node lts already installed via fnm"
+  else
+    fnm install --lts && fnm default lts-latest
+    ok "installed node $(node --version 2>/dev/null)"
+  fi
+fi
+
+step "Global npm CLIs"
+if cmd_exists npm; then
+  if npm ls -g --depth=0 2>/dev/null | grep -q "@openai/codex"; then
+    ok "codex already installed"
+  else
+    npm install -g @openai/codex
+    ok "installed codex"
+  fi
+fi
+# Claude Code is installed as the `claude-code` cask via the Brewfile.
+
+# ── git config ─────────────────────────────────────────────────────────────────
+
+step "Configuring git"
+git config --global core.hooksPath "$HOME/.config/git/hooks"
+git config --global core.pager delta
+git config --global interactive.diffFilter "delta --color-only"
+git config --global delta.navigate true
+git config --global delta.side-by-side true
+git config --global pull.rebase true
+git config --global push.autoSetupRemote true
+git config --global init.defaultBranch main
+git config --global merge.conflictstyle diff3
+git config --global diff.colorMoved default
+ok "git configured (identity set via ~/.gitconfig.local)"
+
+# ── SSH ─────────────────────────────────────────────────────────────────────────
+# Pre-create ~/.ssh as a real dir so stow links only .ssh/config (never folds
+# the whole dir into the dotfiles repo). Generate a key only if none exists —
+# if you are restoring keys from backup, do that first and this step no-ops.
+
+step "SSH setup"
+mkdir -p ~/.ssh && chmod 700 ~/.ssh
+if [ ! -f ~/.ssh/id_ed25519 ]; then
+  ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N ""
+  ok "generated ~/.ssh/id_ed25519"
+  echo ""
+  echo "  Add this public key to GitHub (or wherever needed):"
+  cat ~/.ssh/id_ed25519.pub
+  echo ""
+else
+  ok "SSH key already exists"
+fi
+
+# ── Dotfiles ────────────────────────────────────────────────────────────────────
+
+step "Cloning and applying dotfiles"
+mkdir -p "$HOME_PROJECTS_DIR"
+clone_if_absent "$DOTFILES_REPO" "$DOTFILES_DIR"
+
+cd "$DOTFILES_DIR"
+for pkg in bash zsh git ssh ghostty starship nvim bin ripgrep bat; do
+  stow --adopt --restow --target="$HOME" "$pkg" 2>/dev/null && ok "stowed $pkg" || true
+done
+
+# Reconcile mise install path: dotfiles .zshrc expects ~/.local/bin/mise, but
+# brew installs it under the Homebrew prefix. Symlink so mise activation works.
+if cmd_exists brew && [ ! -e "$HOME/.local/bin/mise" ] && [ -x "$(brew --prefix)/bin/mise" ]; then
+  mkdir -p "$HOME/.local/bin"
+  ln -sf "$(brew --prefix)/bin/mise" "$HOME/.local/bin/mise"
+  ok "linked ~/.local/bin/mise -> $(brew --prefix)/bin/mise"
+fi
+
+# ── Shell ────────────────────────────────────────────────────────────────────────
+
+step "Setting Homebrew zsh as default shell"
+BREW_ZSH="$(brew --prefix)/bin/zsh"
+if [ "$SHELL" = "$BREW_ZSH" ]; then
+  ok "Homebrew zsh is already the default shell"
+else
+  grep -qxF "$BREW_ZSH" /etc/shells || echo "$BREW_ZSH" | sudo tee -a /etc/shells >/dev/null
+  chsh -s "$BREW_ZSH"
+  ok "default shell set to $BREW_ZSH (takes effect on next login)"
+fi
+
+# ── Personal additions ────────────────────────────────────────────────────────
+
+if [ -f ~/.laptop.local ]; then
+  step "Running ~/.laptop.local"
+  source ~/.laptop.local
+else
+  printf "\n  No ~/.laptop.local found — skipping personal additions.\n"
+  printf "  Create one to clone private repos, add bin symlinks, etc.\n"
+fi
+
+# ── Done ──────────────────────────────────────────────────────────────────────
+
+printf "\n\033[1;32mDone.\033[0m Log out and back in to start using zsh.\n\n"
