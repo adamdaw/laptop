@@ -109,6 +109,26 @@ All layered packages go into **one** `rpm-ostree install --idempotent` transacti
 
 A layered package is only usable after you reboot into the new deployment. The summary prints `Reboot required to use layered packages: ghostty` when that applies. **The script never reboots.** Run `systemctl reboot` when it suits you.
 
+### git identity and credentials
+
+The dotfiles `.gitconfig` carries the shared git settings and includes `~/.gitconfig.local` for machine-local ones. Before an existing `~/.gitconfig` is backed up to make way for it, the script copies its `user.name`, `user.email`, `user.signingkey` and every `credential.*` entry into `~/.gitconfig.local`. Multi-valued keys keep all their values in order, including the empty `helper =` reset that gh writes. A key already in `~/.gitconfig.local` is never changed.
+
+The copy is all or nothing. The new file is built in a temp file next to `~/.gitconfig.local`, from a copy of the existing file plus the missing keys. Every copied value is checked, and then the temp file is moved into place with mode 0600. The rename never follows a link or goes into a directory, and the result is checked afterwards. If any step fails, including listing `~/.gitconfig`, `~/.gitconfig.local` is left as it was. A trap removes the temp file if the run is interrupted. `--dry-run` lists the key names it would copy, never their values.
+
+The script refuses to migrate in these cases. It warns, leaves `~/.gitconfig` in place and doesn't stow the git package:
+
+- `~/.gitconfig` uses `[include]` or `[includeIf]`. Flattening them would change which settings apply where.
+- An existing `~/.gitconfig.local` uses `[include]` or `[includeIf]`. The script can't tell safely which keys it already has.
+- `~/.gitconfig.local` is a symlink or not a regular file. The script never writes through it.
+- A key it would copy has no value (a bare key). `git config` can't write one exactly.
+- Either file can't be read.
+
+In each case, move the settings into `~/.gitconfig.local` by hand and re-run.
+
+`git config --global` is only used when the dotfiles git package was not stowed and neither `~/.gitconfig` nor `~/.config/git/config` resolves into the dotfiles repo, because otherwise it would write into the repo. The identity is checked last, after `~/.laptop.local` runs, from the final `~/.config/git/config` and `~/.gitconfig` with their includes, in git's order. If `user.name` or `user.email` is missing or empty, the summary warns you.
+
+The font counts as installed when `~/.local/share/fonts/JetBrainsMono/` has `.ttf` files, or when `fc-list` lists "JetBrainsMono Nerd". Only then is the download skipped.
+
 ### Shell
 
 zsh comes from Homebrew, and the login shell stays bash: no `chsh`, no `usermod`. Ghostty starts zsh through its `command =` setting, which lives in the dotfiles Ghostty config (for example `command = /home/linuxbrew/.linuxbrew/bin/zsh`). If that line is missing, the script warns you.
@@ -120,12 +140,10 @@ Create `~/.laptop.local` before running. The script sources it at the end (under
 ```bash
 # ~/.laptop.local
 
-# git identity (also needed in ~/.gitconfig.local — see dotfiles README)
-git config --global user.name  "Your Name"
-git config --global user.email "you@example.com"
-git config --global credential."https://github.com".helper ""
-git config --global --add credential."https://github.com".helper \
-  "!/usr/bin/gh auth git-credential"
+# git identity goes in ~/.gitconfig.local, which the stowed dotfiles
+# .gitconfig includes. Not --global: ~/.gitconfig is a link into the repo.
+git config --file ~/.gitconfig.local user.name  "Your Name"
+git config --file ~/.gitconfig.local user.email "you@example.com"
 
 # Private repo clones
 clone_if_absent "https://github.com/you/your-repo.git" "$HOME_PROJECTS_DIR/your-repo"

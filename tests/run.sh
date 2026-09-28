@@ -28,7 +28,7 @@ ALL_FORMULAE=(git git-delta stow neovim tmux jq ripgrep fd fzf bat wget gh stars
 ALL_PACKAGES=(agy bash bat bin ghostty git nvim ripgrep ssh starship tmux zsh)
 
 # Calls that would change the machine. None may appear during --dry-run.
-MUTATING='^(sudo|apt-get|chsh|usermod|ujust|ssh-keygen|npm|curl|stow|systemctl|ubuntu-report|unzip|fc-cache)( |$)|^brew install|^rpm-ostree (install|upgrade|reboot)|^flatpak install|^git (clone|config)|^mise (use|install|reshim)|^mise-'
+MUTATING='^(sudo|apt-get|chsh|usermod|ujust|ssh-keygen|npm|curl|stow|systemctl|ubuntu-report|unzip|fc-cache)( |$)|^brew install|^rpm-ostree (install|upgrade|reboot)|^flatpak install|^git clone|^git config (--global [^-]|.* --(add|unset|unset-all|replace-all|remove-section|rename-section)( |$))|^mise (use|install|reshim)|^mise-'
 
 # rpm-ostree status --json shapes. Deployments are listed newest first:
 # staged/pending, then booted, then rollback.
@@ -139,6 +139,61 @@ EOF
   chmod +x "$STATE/node-install"
 }
 
+# The git stub. `git config --file F` (reads, and writes to
+# ~/.gitconfig.local) and `git config --global --get...` (reads of ~/.gitconfig
+# and ~/.config/git/config) run the real git, and only when every file it
+# would read resolves inside HOME (no "..", no symlink out). With --includes,
+# that covers every include/includeIf target, recursively. Otherwise the call
+# is refused with exit 98. Every other git call, --global writes included, is a
+# logged no-op. Test hooks:
+#   STUB_GIT_FAIL=S           a call whose arguments contain S fails (no output)
+#   STUB_GIT_TRUNC=S          a call containing S prints 20 bytes of its output, then fails
+#   STUB_GIT_ON=S STUB_GIT_DO=CMD   CMD runs (eval) before a call containing S
+write_git_stub() {
+  cat > "$STUBS/git" <<'EOF'
+#!@BASH@
+printf '%s\n' "git $*" >> "$STUB_LOG"
+real="$STUB_STATE/real/git"
+if [ -n "${STUB_GIT_FAIL:-}" ] && [[ "$*" == *"$STUB_GIT_FAIL"* ]]; then exit 1; fi
+if [ -n "${STUB_GIT_ON:-}" ] && [[ "$*" == *"$STUB_GIT_ON"* ]]; then eval "$STUB_GIT_DO"; fi
+home="$(realpath -m -- "$HOME")"
+inside() {
+  case "/$1/" in */../*) return 1 ;; esac
+  [[ "$(realpath -m -- "$1")" == "$home"/* ]]
+}
+includes_inside() { # includes_inside FILE DEPTH
+  local f="$1" entry p
+  [ "$2" -lt 10 ] || return 1
+  [ -e "$f" ] || return 0
+  while IFS= read -r -d '' entry; do
+    p="${entry#*$'\n'}"
+    case "$p" in "~/"*) p="$HOME/${p#\~/}" ;; /*) ;; *) p="$(dirname -- "$f")/$p" ;; esac
+    inside "$p" && includes_inside "$p" $(($2 + 1)) || return 1
+  done < <(GIT_CONFIG_NOSYSTEM=1 "$real" config --file "$f" --no-includes --null --get-regexp '^include(if)?\..*path$' 2>/dev/null)
+}
+case "$1 ${2:-}" in
+  "clone "*)        mkdir -p "$3/.git"; exit 0 ;;
+  "config --file")  files=("$3"); export GIT_CONFIG_GLOBAL=/dev/null ;;
+  "config --global") case " $* " in *" --get"*) ;; *) exit 0 ;; esac
+                    files=("$HOME/.gitconfig" "${XDG_CONFIG_HOME:-$HOME/.config}/git/config") ;;
+  *)                exit 0 ;;
+esac
+for f in "${files[@]}"; do
+  inside "$f" || { echo "stub git: config file outside HOME: $f" >&2; exit 98; }
+  if [[ " $* " == *" --includes "* ]]; then
+    includes_inside "$f" 0 || { echo "stub git: include outside HOME in $f" >&2; exit 98; }
+  fi
+done
+export GIT_CONFIG_NOSYSTEM=1
+if [ -n "${STUB_GIT_TRUNC:-}" ] && [[ "$*" == *"$STUB_GIT_TRUNC"* ]]; then
+  "$real" "$@" | head -c 20; exit 1
+fi
+exec "$real" "$@"
+EOF
+  sed -i "s|@BASH@|$SANDBOX/sysbin/bash|g" "$STUBS/git"
+  chmod +x "$STUBS/git"
+}
+
 # ── Assertions ───────────────────────────────────────────────────────────────
 
 pass() { PASS=$((PASS + 1)); printf "  ok   %s\n" "$1"; }
@@ -218,7 +273,8 @@ setup() { # setup TEST_NAME
   stub dpkg '[ "$1" = --print-architecture ] && echo amd64 || exit 1'
   stub gpg 'exit "${STUB_GPG_RC:-0}"'
   stub fc-list 'echo "/x/JetBrainsMonoNerdFont-Regular.ttf: JetBrainsMono Nerd Font:style=Regular"'
-  stub git 'if [ "$1" = clone ]; then mkdir -p "$3/.git"; fi'
+  mkdir -p "$STATE/real"; ln -s "$(PATH=/usr/bin:/bin type -P git)" "$STATE/real/git" || { echo "missing git" >&2; exit 2; }
+  write_git_stub
   stub ssh-keygen 'while [ $# -gt 0 ]; do [ "$1" = -f ] && { touch "$2" "$2.pub"; break; }; shift; done'
   stub brew '
 case "$1" in
@@ -301,7 +357,7 @@ dotfiles_fixture() {
   echo "font-family = JetBrainsMono Nerd Font" > "$d/ghostty/.config/ghostty/config.ghostty"
   echo "-- init" > "$d/nvim/.config/nvim/init.lua"
   echo "#!/bin/sh" > "$d/bin/bin/hello"
-  echo "[user]" > "$d/git/.gitconfig"
+  printf '[include]\n\tpath = ~/.gitconfig.local\n[pull]\n\trebase = true\n' > "$d/git/.gitconfig"
   echo "{}" > "$d/agy/.config/agy/permissions.json"
   echo "--theme=x" > "$d/bat/.config/bat/config"
   echo "Host *" > "$d/ssh/.ssh/config"
@@ -384,7 +440,7 @@ sandboxed() {
     LAPTOP_YUM_REPOS_DIR="$LAPTOP_YUM_REPOS_DIR" LAPTOP_BREW_DIRS="$LAPTOP_BREW_DIRS"
     STUB_LOG="$STUB_LOG" STUB_STATE="$STUB_STATE"
   )
-  for v in STUB_CURL_RC STUB_CURL_FAIL STUB_GPG_RC STUB_MISE_RC STUB_RESHIM_RC STUB_OSTREE_RC; do
+  for v in STUB_GIT_FAIL STUB_GIT_TRUNC STUB_GIT_ON STUB_GIT_DO STUB_CURL_RC STUB_CURL_FAIL STUB_GPG_RC STUB_MISE_RC STUB_RESHIM_RC STUB_OSTREE_RC; do
     if [ -n "${!v:-}" ]; then vars+=("$v=${!v}"); fi
   done
   "$SANDBOX/sysbin/env" -i "${vars[@]}" "$@"
@@ -1333,6 +1389,521 @@ test_mise_edge_cases() {
   teardown
 }
 
+# ── Tests: ~/.gitconfig identity and credentials ─────────────────────────────
+
+GIT_EMAIL="me@example.test"
+
+# An existing ~/.gitconfig as gh leaves it: identity, and per-host credential
+# helpers whose first (empty) value resets any inherited helper.
+user_gitconfig() {
+  cat > "$HOME/.gitconfig" <<EOF
+[user]
+	name = Test User
+	email = $GIT_EMAIL
+	signingkey = ABC123
+[core]
+	editor = vim
+[credential "https://github.com"]
+	helper =
+	helper = !gh auth git-credential
+[credential "https://gist.github.com"]
+	helper =
+	helper = !gh auth git-credential
+EOF
+}
+
+# Read ~/.gitconfig.local with the real git: every value of KEY, one per line.
+local_get_all() { sandboxed "$STATE/real/git" config --file "$HOME/.gitconfig.local" --get-all "$1"; }
+
+mode_600() { [ -n "$(find "$1" -maxdepth 0 -perm 0600 2>/dev/null)" ]; }
+
+gitconfig_run() { # gitconfig_run PLATFORM(bazzite|pop)
+  setup "$1 run: ~/.gitconfig identity/credentials carried to ~/.gitconfig.local"
+  if [ "$1" = pop ]; then os_release pop "ubuntu debian"; else bazzite; fi
+  dotfiles_fixture
+  user_gitconfig
+  local original; original="$(cat "$HOME/.gitconfig")"
+  local helpers; helpers="$(printf '\n!gh auth git-credential')"
+  run_linux
+  check "exits 0" [ "$RC" -eq 0 ]
+  check "creates ~/.gitconfig.local" [ -f "$HOME/.gitconfig.local" ]
+  check "new ~/.gitconfig.local is mode 0600" mode_600 "$HOME/.gitconfig.local"
+  check "user.name carried" [ "$(local_get_all user.name)" = "Test User" ]
+  check "user.email carried" [ "$(local_get_all user.email)" = "$GIT_EMAIL" ]
+  check "user.signingkey carried" [ "$(local_get_all user.signingkey)" = ABC123 ]
+  check "github helpers carried in order, empty reset first" [ "$(local_get_all credential.https://github.com.helper)" = "$helpers" ]
+  check "gist helpers carried in order, empty reset first" [ "$(local_get_all credential.https://gist.github.com.helper)" = "$helpers" ]
+  check "other settings not carried" [ -z "$(local_get_all core.editor)" ]
+  local backup; backup="$(find "$HOME/.local/state/laptop/backups" -name .gitconfig -type f 2>/dev/null | head -1)"
+  check "old ~/.gitconfig backed up" [ -n "$backup" ]
+  check "backup keeps the original content" [ "$(cat "${backup:-/nonexistent}" 2>/dev/null)" = "$original" ]
+  check "new ~/.gitconfig links into dotfiles" [ "$(readlink "$HOME/.gitconfig")" = "$HOME/Projects/Home/dotfiles/git/.gitconfig" ]
+  check "no git config --global writes (they would go into the repo)" log_lacks '^git config --global [^-]'
+  check "says identity is set via ~/.gitconfig.local" has "$OUT" "git identity set via ~/.gitconfig.local"
+  check "no identity warning" lacks "$OUT" "git identity is not set"
+  check "never prints the email" lacks "$OUT" "$GIT_EMAIL"
+  local local_before; local_before="$(cat "$HOME/.gitconfig.local")"
+  : > "$LOG"
+  run_linux
+  check "re-run exits 0" [ "$RC" -eq 0 ]
+  check "re-run leaves ~/.gitconfig.local unchanged" [ "$local_before" = "$(cat "$HOME/.gitconfig.local")" ]
+  check "re-run writes nothing to it" log_lacks '^git config --file .* --add '
+  check "re-run still reports identity" has "$OUT" "git identity set via ~/.gitconfig.local"
+  teardown
+}
+
+test_gitconfig_carry_over() {
+  gitconfig_run bazzite
+  gitconfig_run pop
+}
+
+test_gitconfig_local_kept() {
+  setup "existing ~/.gitconfig.local keys are never overwritten"
+  bazzite
+  dotfiles_fixture
+  user_gitconfig
+  printf '[user]\n\temail = keep@local.test\n[credential "https://github.com"]\n\thelper = keep\n' > "$HOME/.gitconfig.local"
+  chmod 644 "$HOME/.gitconfig.local"
+  run_linux
+  check "exits 0" [ "$RC" -eq 0 ]
+  check "existing user.email kept" [ "$(local_get_all user.email)" = keep@local.test ]
+  check "existing github helper kept, nothing appended" [ "$(local_get_all credential.https://github.com.helper)" = keep ]
+  check "missing user.name added" [ "$(local_get_all user.name)" = "Test User" ]
+  check "missing gist helpers added" [ "$(local_get_all credential.https://gist.github.com.helper)" = "$(printf '\n!gh auth git-credential')" ]
+  check "reports the kept key" has "$OUT" "kept existing user.email in ~/.gitconfig.local"
+  check "rewritten file is mode 0600" mode_600 "$HOME/.gitconfig.local"
+  teardown
+}
+
+test_gitconfig_missing_identity() {
+  local mode
+  for mode in --dry-run run; do
+    setup "no identity anywhere ($mode)"
+    bazzite
+    dotfiles_fixture
+    printf '[credential "https://github.com"]\n\thelper =\n\thelper = !gh auth git-credential\n' > "$HOME/.gitconfig"
+    if [ "$mode" = run ]; then run_linux; else run_linux --dry-run; fi
+    check "exits 0" [ "$RC" -eq 0 ]
+    check "warns identity is missing" has "$OUT" "git identity is not set \(missing user.name user.email\)"
+    check "warning is in the summary" has "$(sed -n '/==> Summary/,$p' <<<"$OUT")" "! git identity is not set"
+    check "does not claim identity is set" lacks "$OUT" "identity (will be )?set via"
+    teardown
+  done
+
+  setup "identity set by ~/.laptop.local"
+  bazzite
+  dotfiles_fixture
+  printf 'git config --file ~/.gitconfig.local user.name "Local User"\ngit config --file ~/.gitconfig.local user.email "%s"\n' "$GIT_EMAIL" > "$HOME/.laptop.local"
+  run_linux --dry-run
+  check "dry-run: warning says ~/.laptop.local may set it" has "$OUT" "git identity is not set \(unless ~/.laptop.local sets it\)"
+  run_linux
+  check "exits 0" [ "$RC" -eq 0 ]
+  check "identity checked after ~/.laptop.local ran" has "$OUT" "git identity set via ~/.gitconfig.local"
+  check "no identity warning" lacks "$OUT" "git identity is not set"
+  teardown
+
+  setup "no ~/.gitconfig at all"
+  bazzite
+  dotfiles_fixture
+  run_linux
+  check "exits 0" [ "$RC" -eq 0 ]
+  check "warns identity is missing" has "$OUT" "git identity is not set"
+  check "no ~/.gitconfig.local created" [ ! -e "$HOME/.gitconfig.local" ]
+  teardown
+}
+
+test_gitconfig_dry_run() {
+  setup "dry-run: ~/.gitconfig carry-over is planned, nothing written"
+  bazzite
+  dotfiles_fixture
+  user_gitconfig
+  local before; before="$(home_snapshot)"
+  run_linux --dry-run
+  check "exits 0" [ "$RC" -eq 0 ]
+  check "HOME is untouched" [ "$before" = "$(home_snapshot)" ]
+  check "no ~/.gitconfig.local created" [ ! -e "$HOME/.gitconfig.local" ]
+  check "no mutating command was executed" log_lacks "$MUTATING"
+  check "plans user.name" has "$OUT" "would copy user.name to ~/.gitconfig.local \(1 value\)"
+  check "plans user.email" has "$OUT" "would copy user.email to ~/.gitconfig.local"
+  check "plans user.signingkey" has "$OUT" "would copy user.signingkey to ~/.gitconfig.local"
+  check "plans both github helper values" has "$OUT" "would copy credential.https://github.com.helper to ~/.gitconfig.local \(2 values\)"
+  check "plans gist helpers" has "$OUT" "would copy credential.https://gist.github.com.helper"
+  check "does not plan other settings" lacks "$OUT" "would copy core"
+  check "never prints the email" lacks "$OUT" "$GIT_EMAIL"
+  check "plans the backup of ~/.gitconfig" has "$OUT" "would back up ~/.gitconfig "
+  check "says identity will come from ~/.gitconfig.local" has "$OUT" "git identity will be set via ~/.gitconfig.local"
+  check "no identity warning" lacks "$OUT" "git identity is not set"
+  check "plans no git config --global" lacks "$OUT" "git config --global"
+  teardown
+}
+
+test_gitconfig_unreadable() {
+  setup "unreadable ~/.gitconfig stays put"
+  bazzite
+  dotfiles_fixture
+  printf '[user\n\tname = broken\n' > "$HOME/.gitconfig"
+  local original; original="$(cat "$HOME/.gitconfig")"
+  run_linux
+  check "exits 0" [ "$RC" -eq 0 ]
+  check "leaves ~/.gitconfig in place" [ -f "$HOME/.gitconfig" ]
+  check "is not replaced by a link" [ ! -L "$HOME/.gitconfig" ]
+  check "keeps its content" [ "$(cat "$HOME/.gitconfig")" = "$original" ]
+  check "git package skipped with a warning" has "$OUT" "skipped stowing git"
+  check "explains why" has "$OUT" "could not read ~/.gitconfig"
+  teardown
+}
+
+no_temp_left() { [ -z "$(find "$HOME" -maxdepth 1 -name '.gitconfig.local.*')" ]; }
+not_stowed_git() { [ -f "$HOME/.gitconfig" ] && [ ! -L "$HOME/.gitconfig" ]; }
+
+test_gitconfig_includes_refused() {
+  local kind mode
+  for kind in include includeIf; do
+    for mode in --dry-run run; do
+      setup "[$kind] in ~/.gitconfig: not migrated ($mode)"
+      bazzite
+      dotfiles_fixture
+      user_gitconfig
+      printf '[user]\n\tname = Work Name\n' > "$HOME/.gitconfig.work"
+      if [ "$kind" = include ]; then
+        printf '[include]\n\tpath = ~/.gitconfig.work\n' >> "$HOME/.gitconfig"
+      else
+        printf '[includeIf "gitdir:~/work/"]\n\tpath = ~/.gitconfig.work\n' >> "$HOME/.gitconfig"
+      fi
+      local original; original="$(cat "$HOME/.gitconfig")"
+      if [ "$mode" = run ]; then run_linux; else run_linux --dry-run; fi
+      check "exits 0" [ "$RC" -eq 0 ]
+      check "explains the refusal" has "$OUT" "it uses \[include\]/\[includeIf\]"
+      check "says what to do by hand" has "$OUT" "By hand: put user.name"
+      check "git package skipped" has "$OUT" "skipped stowing git"
+      check "copies nothing" lacks "$OUT" "(would )?cop(y|ied) (user|credential)"
+      check "no ~/.gitconfig.local created" [ ! -e "$HOME/.gitconfig.local" ]
+      check "leaves ~/.gitconfig as a file" not_stowed_git
+      check "keeps its content" [ "$(cat "$HOME/.gitconfig")" = "$original" ]
+      check "plans no backup of it" lacks "$OUT" "back(ed)? up ~/.gitconfig"
+      teardown
+    done
+  done
+}
+
+test_gitconfig_write_failure_retry() {
+  local helpers; helpers="$(printf '\n!gh auth git-credential')"
+  setup "write fails mid-migration, then retry (no ~/.gitconfig.local)"
+  bazzite
+  dotfiles_fixture
+  user_gitconfig
+  local original; original="$(cat "$HOME/.gitconfig")"
+  STUB_GIT_FAIL='helper !gh auth' run_linux
+  check "exits 0" [ "$RC" -eq 0 ]
+  check "warns the write failed" has "$OUT" "could not write ~/.gitconfig.local \(left unchanged\)"
+  check "no partial ~/.gitconfig.local" [ ! -e "$HOME/.gitconfig.local" ]
+  check "no temp file left" no_temp_left
+  check "keeps ~/.gitconfig as a file" not_stowed_git
+  check "keeps ~/.gitconfig content" [ "$(cat "$HOME/.gitconfig")" = "$original" ]
+  check "git package skipped" has "$OUT" "skipped stowing git"
+  run_linux
+  check "retry exits 0" [ "$RC" -eq 0 ]
+  check "retry keeps gh auth (both helper values)" [ "$(local_get_all credential.https://github.com.helper)" = "$helpers" ]
+  check "retry keeps gist gh auth" [ "$(local_get_all credential.https://gist.github.com.helper)" = "$helpers" ]
+  check "retry carries user.name" [ "$(local_get_all user.name)" = "Test User" ]
+  check "retry stows git" [ -L "$HOME/.gitconfig" ]
+  check "retry leaves no temp file" no_temp_left
+  teardown
+
+  setup "write fails mid-migration, then retry (existing ~/.gitconfig.local)"
+  bazzite
+  dotfiles_fixture
+  user_gitconfig
+  printf '[user]\n\temail = keep@local.test\n' > "$HOME/.gitconfig.local"
+  chmod 644 "$HOME/.gitconfig.local"
+  local before; before="$(cat "$HOME/.gitconfig.local"; ls -l "$HOME/.gitconfig.local")"
+  STUB_GIT_FAIL='helper !gh auth' run_linux
+  check "existing ~/.gitconfig.local byte-identical, same mode" [ "$before" = "$(cat "$HOME/.gitconfig.local"; ls -l "$HOME/.gitconfig.local")" ]
+  check "no temp file left" no_temp_left
+  run_linux
+  check "retry keeps gh auth (both helper values)" [ "$(local_get_all credential.https://github.com.helper)" = "$helpers" ]
+  check "retry keeps the existing email" [ "$(local_get_all user.email)" = keep@local.test ]
+  teardown
+
+  setup "verification of the new ~/.gitconfig.local fails"
+  bazzite
+  dotfiles_fixture
+  user_gitconfig
+  STUB_GIT_FAIL='--null --get-all' run_linux
+  check "warns the write failed" has "$OUT" "could not write ~/.gitconfig.local \(left unchanged\)"
+  check "unverified file not moved into place" [ ! -e "$HOME/.gitconfig.local" ]
+  check "no temp file left" no_temp_left
+  check "keeps ~/.gitconfig as a file" not_stowed_git
+  teardown
+}
+
+test_gitconfig_local_not_regular() {
+  setup "symlinked ~/.gitconfig.local is refused"
+  bazzite
+  dotfiles_fixture
+  user_gitconfig
+  local target="$HOME/Projects/Home/dotfiles/git/local.example"
+  printf '[core]\n\teditor = nano\n' > "$target"
+  ln -s "$target" "$HOME/.gitconfig.local"
+  local target_before; target_before="$(cat "$target")"
+  run_linux
+  check "exits 0" [ "$RC" -eq 0 ]
+  check "explains the refusal" has "$OUT" "not writing through ~/.gitconfig.local: it is a symlink or not a regular file"
+  check "link target unchanged" [ "$(cat "$target")" = "$target_before" ]
+  check "link left as is" [ "$(readlink "$HOME/.gitconfig.local")" = "$target" ]
+  check "keeps ~/.gitconfig as a file" not_stowed_git
+  check "git package skipped" has "$OUT" "skipped stowing git"
+  teardown
+
+  setup "directory at ~/.gitconfig.local is refused"
+  bazzite
+  dotfiles_fixture
+  user_gitconfig
+  mkdir "$HOME/.gitconfig.local"
+  run_linux
+  check "explains the refusal" has "$OUT" "not writing through ~/.gitconfig.local"
+  check "directory left empty" [ -z "$(ls -A "$HOME/.gitconfig.local")" ]
+  check "keeps ~/.gitconfig as a file" not_stowed_git
+  teardown
+}
+
+test_gitconfig_identity_final() {
+  local what cmd
+  for what in empty unset; do
+    if [ "$what" = empty ]; then cmd='git config --file ~/.gitconfig.local user.email ""'; else cmd='git config --file ~/.gitconfig.local --unset user.email'; fi
+    setup "identity carried, then $what by ~/.laptop.local"
+    bazzite
+    dotfiles_fixture
+    user_gitconfig
+    echo "$cmd" > "$HOME/.laptop.local"
+    run_linux
+    check "exits 0" [ "$RC" -eq 0 ]
+    check "email really is $what now" [ -z "$(local_get_all user.email)" ]
+    check "warns user.email is missing" has "$OUT" "git identity is not set \(missing user.email\)"
+    check "does not claim identity is set" lacks "$OUT" "identity (will be )?set via"
+    teardown
+  done
+}
+
+test_gitconfig_bare_key() {
+  setup "bare (valueless) credential key is refused, not turned into true"
+  bazzite
+  dotfiles_fixture
+  user_gitconfig
+  printf '[credential]\n\tuseHttpPath\n' >> "$HOME/.gitconfig"
+  run_linux
+  check "exits 0" [ "$RC" -eq 0 ]
+  check "explains the refusal" has "$OUT" "credential.usehttppath in ~/.gitconfig has no value"
+  check "no ~/.gitconfig.local written" [ ! -e "$HOME/.gitconfig.local" ]
+  check "keeps ~/.gitconfig as a file" not_stowed_git
+  teardown
+}
+
+test_global_config_not_written_into_repo() {
+  setup "no git config --global when ~/.config/git/config links into the repo"
+  bazzite
+  dotfiles_fixture
+  local d="$HOME/Projects/Home/dotfiles"
+  rm -rf "$d/git"
+  mkdir -p "$d/misc" "$HOME/.config/git"
+  echo "[core]" > "$d/misc/gitconfig"
+  ln -s "$d/misc/gitconfig" "$HOME/.config/git/config"
+  run_linux
+  check "exits 0" [ "$RC" -eq 0 ]
+  check "git package was not stowed" has "$OUT" "dotfiles has no 'git' package"
+  check "no git config --global writes" log_lacks '^git config --global [^-]'
+  check "repo file unchanged" [ "$(cat "$d/misc/gitconfig")" = "[core]" ]
+  teardown
+}
+
+test_git_stub_sandbox() {
+  setup "git stub refuses --file outside HOME"
+  mkdir -p "$SANDBOX/outside"
+  printf '[user]\n\tname = x\n' > "$SANDBOX/outside/cfg"
+  printf '[user]\n\tname = x\n' > "$HOME/cfg"
+  ln -s "$SANDBOX/outside" "$HOME/esc"
+  sandboxed "$STUBS/git" config --file "$HOME/../outside/cfg" --list >/dev/null 2>&1
+  check "refuses a .. escape" [ $? -eq 98 ]
+  sandboxed "$STUBS/git" config --file "$HOME/esc/cfg" --list >/dev/null 2>&1
+  check "refuses a symlink escape" [ $? -eq 98 ]
+  sandboxed "$STUBS/git" config --file "$HOME/cfg" --list >/dev/null 2>&1
+  check "allows a file inside HOME" [ $? -eq 0 ]
+  teardown
+}
+
+test_gitconfig_local_includes_refused() {
+  local kind mode
+  for kind in include includeIf; do
+    for mode in --dry-run run; do
+      setup "[$kind] in existing ~/.gitconfig.local: not migrated ($mode)"
+      bazzite
+      dotfiles_fixture
+      user_gitconfig
+      printf '[user]\n\temail = creds@local.test\n' > "$HOME/.gitconfig.creds"
+      if [ "$kind" = include ]; then
+        printf '[include]\n\tpath = ~/.gitconfig.creds\n' > "$HOME/.gitconfig.local"
+      else
+        printf '[includeIf "gitdir:~/work/"]\n\tpath = ~/.gitconfig.creds\n' > "$HOME/.gitconfig.local"
+      fi
+      local before; before="$(cat "$HOME/.gitconfig.local")"
+      if [ "$mode" = run ]; then run_linux; else run_linux --dry-run; fi
+      check "exits 0" [ "$RC" -eq 0 ]
+      check "explains the refusal" has "$OUT" "not copying into ~/.gitconfig.local: it uses \[include\]/\[includeIf\]"
+      check "copies nothing" lacks "$OUT" "(would )?cop(y|ied) (user|credential)"
+      check "leaves ~/.gitconfig.local unchanged" [ "$(cat "$HOME/.gitconfig.local")" = "$before" ]
+      check "keeps ~/.gitconfig as a file" not_stowed_git
+      check "git package skipped" has "$OUT" "skipped stowing git"
+      teardown
+    done
+  done
+}
+
+test_gitconfig_listing_failure() {
+  local how
+  for how in STUB_GIT_FAIL STUB_GIT_TRUNC; do
+    setup "listing ~/.gitconfig fails ($how)"
+    bazzite
+    dotfiles_fixture
+    user_gitconfig
+    local original; original="$(cat "$HOME/.gitconfig")"
+    if [ "$how" = STUB_GIT_FAIL ]; then STUB_GIT_FAIL='--null --list' run_linux; else STUB_GIT_TRUNC='--null --list' run_linux; fi
+    check "exits 0" [ "$RC" -eq 0 ]
+    check "explains the refusal" has "$OUT" "could not list the settings in ~/.gitconfig"
+    check "no ~/.gitconfig.local written" [ ! -e "$HOME/.gitconfig.local" ]
+    check "keeps ~/.gitconfig as a file" not_stowed_git
+    check "keeps ~/.gitconfig content" [ "$(cat "$HOME/.gitconfig")" = "$original" ]
+    check "not backed up" lacks "$OUT" "backed up ~/.gitconfig"
+    teardown
+  done
+}
+
+test_gitconfig_rename_race() {
+  setup "rename race: ~/.gitconfig.local becomes a dir symlink"
+  bazzite
+  dotfiles_fixture
+  user_gitconfig
+  mkdir -p "$HOME/victim"
+  STUB_GIT_ON='--null --get-all' STUB_GIT_DO='[ -e "$HOME/.gitconfig.local" ] || ln -s "$HOME/victim" "$HOME/.gitconfig.local"' run_linux
+  check "exits 0" [ "$RC" -eq 0 ]
+  check "nothing written into the link's target dir" [ -z "$(ls -A "$HOME/victim")" ]
+  check "the link is left as is" [ "$(readlink "$HOME/.gitconfig.local")" = "$HOME/victim" ]
+  check "no temp file left" no_temp_left
+  check "warns the write failed" has "$OUT" "could not write ~/.gitconfig.local \(left unchanged\)"
+  check "keeps ~/.gitconfig as a file" not_stowed_git
+  teardown
+}
+
+test_gitconfig_interrupted() {
+  setup "migration killed (TERM) while writing the temp file"
+  bazzite
+  dotfiles_fixture
+  user_gitconfig
+  local original; original="$(cat "$HOME/.gitconfig")"
+  STUB_GIT_ON='--add' STUB_GIT_DO='kill -TERM $PPID' run_linux
+  check "exits 143" [ "$RC" -eq 143 ]
+  check "temp file removed by the trap" no_temp_left
+  check "no ~/.gitconfig.local written" [ ! -e "$HOME/.gitconfig.local" ]
+  check "keeps ~/.gitconfig content" [ "$(cat "$HOME/.gitconfig")" = "$original" ]
+  teardown
+}
+
+test_gitconfig_xdg_identity() {
+  local mode
+  for mode in --dry-run run; do
+    setup "identity only in ~/.config/git/config ($mode)"
+    bazzite
+    dotfiles_fixture
+    mkdir -p "$HOME/.config/git"
+    printf '[user]\n\tname = Xdg User\n\temail = xdg@example.test\n' > "$HOME/.config/git/config"
+    if [ "$mode" = run ]; then run_linux; else run_linux --dry-run; fi
+    check "exits 0" [ "$RC" -eq 0 ]
+    check "no false missing-identity warning" lacks "$OUT" "git identity is not set"
+    check "reports it from the global git config" has "$OUT" "git identity (will be )?set via the global git config"
+    teardown
+  done
+
+  setup "XDG email, but ~/.gitconfig.local sets it empty"
+  bazzite
+  dotfiles_fixture
+  mkdir -p "$HOME/.config/git"
+  printf '[user]\n\tname = Xdg User\n\temail = xdg@example.test\n' > "$HOME/.config/git/config"
+  printf '[user]\n\temail =\n' > "$HOME/.gitconfig.local"
+  run_linux
+  check "empty effective email still counts as missing" has "$OUT" "git identity is not set \(missing user.email\)"
+  teardown
+}
+
+test_git_stub_includes() {
+  setup "git stub refuses includes that leave HOME"
+  mkdir -p "$SANDBOX/outside"
+  printf '[user]\n\tname = x\n' > "$SANDBOX/outside/cfg"
+  ln -s "$SANDBOX/outside" "$HOME/esc"
+  printf '[user]\n\tname = in\n' > "$HOME/in.cfg"
+  printf '[include]\n\tpath = %s\n' "$SANDBOX/outside/cfg" > "$HOME/abs.cfg"
+  printf '[include]\n\tpath = ../outside/cfg\n' > "$HOME/rel.cfg"
+  printf '[includeIf "gitdir:~/"]\n\tpath = ~/esc/cfg\n' > "$HOME/link.cfg"
+  printf '[include]\n\tpath = ~/rel.cfg\n' > "$HOME/nested.cfg"
+  printf '[include]\n\tpath = ~/in.cfg\n' > "$HOME/ok.cfg"
+  local f rc
+  for f in abs rel link nested; do
+    sandboxed "$STUBS/git" config --file "$HOME/$f.cfg" --includes --get user.name >/dev/null 2>&1; rc=$?
+    check "refuses --includes with a $f escape" [ "$rc" -eq 98 ]
+  done
+  cp "$HOME/abs.cfg" "$HOME/.gitconfig"
+  sandboxed "$STUBS/git" config --global --includes --get user.name >/dev/null 2>&1; rc=$?
+  check "refuses --global --includes with an escape in ~/.gitconfig" [ "$rc" -eq 98 ]
+  sandboxed "$STUBS/git" config --file "$HOME/ok.cfg" --includes --get user.name >/dev/null 2>&1; rc=$?
+  check "allows includes inside HOME" [ "$rc" -eq 0 ]
+  sandboxed "$STUBS/git" config --file "$HOME/abs.cfg" --list >/dev/null 2>&1; rc=$?
+  check "allows reading without following includes" [ "$rc" -eq 0 ]
+  teardown
+}
+
+# ── Tests: font detection ────────────────────────────────────────────────────
+
+test_font_detection() {
+  setup "font known to fontconfig, long fc-list output (SIGPIPE)"
+  bazzite
+  dotfiles_fixture
+  stub fc-list 'echo "/x/JetBrainsMonoNerdFont-Regular.ttf: JetBrainsMono Nerd Font:style=Regular"
+for ((i = 0; i < 50000; i++)); do echo "/usr/share/fonts/f$i.ttf: Some Other Font:style=Regular"; done'
+  run_linux --dry-run
+  check "reports the font installed" has "$OUT" "JetBrains Mono Nerd Font already installed"
+  check "plans no download" lacks "$OUT" "nerd-fonts"
+  check "no network" log_lacks '^curl'
+  teardown
+
+  setup "font files in ~/.local/share/fonts, fontconfig silent"
+  bazzite
+  dotfiles_fixture
+  stub fc-list 'exit 0'
+  mkdir -p "$HOME/.local/share/fonts/JetBrainsMono"
+  touch "$HOME/.local/share/fonts/JetBrainsMono/JetBrainsMonoNerdFont-Regular.ttf"
+  run_linux --dry-run
+  check "reports the font installed" has "$OUT" "JetBrains Mono Nerd Font already installed"
+  check "plans no download" lacks "$OUT" "nerd-fonts"
+  teardown
+
+  setup "font files present, no fc-list"
+  bazzite
+  dotfiles_fixture
+  rm -f "$STUBS/fc-list"
+  mkdir -p "$HOME/.local/share/fonts/JetBrainsMono"
+  touch "$HOME/.local/share/fonts/JetBrainsMono/JetBrainsMonoNerdFont-Bold.ttf"
+  run_linux --dry-run
+  check "reports the font installed" has "$OUT" "JetBrains Mono Nerd Font already installed"
+  teardown
+
+  setup "font absent"
+  bazzite
+  dotfiles_fixture
+  stub fc-list 'echo "/x/DejaVuSans.ttf: DejaVu Sans:style=Book"'
+  run_linux --dry-run
+  check "plans the download" has "$OUT" "\[dry-run\] tmp=.*nerd-fonts/releases/latest/download/JetBrainsMono.zip"
+  check "dry-run hits no network" log_lacks '^curl'
+  teardown
+}
+
 # ── Run ──────────────────────────────────────────────────────────────────────
 
 TESTS=(
@@ -1361,6 +1932,25 @@ TESTS=(
   test_mise_config_parsing
   test_mise_apt_failures
   test_hand_made_repo_links
+  test_gitconfig_carry_over
+  test_gitconfig_local_kept
+  test_gitconfig_missing_identity
+  test_gitconfig_dry_run
+  test_gitconfig_unreadable
+  test_gitconfig_includes_refused
+  test_gitconfig_write_failure_retry
+  test_gitconfig_local_not_regular
+  test_gitconfig_identity_final
+  test_gitconfig_bare_key
+  test_global_config_not_written_into_repo
+  test_git_stub_sandbox
+  test_gitconfig_local_includes_refused
+  test_gitconfig_listing_failure
+  test_gitconfig_rename_race
+  test_gitconfig_interrupted
+  test_gitconfig_xdg_identity
+  test_git_stub_includes
+  test_font_detection
 )
 
 for t in "${TESTS[@]}"; do
