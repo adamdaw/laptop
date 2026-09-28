@@ -69,6 +69,14 @@ BACKUPS=()
 WARNINGS=()
 REBOOT_PKGS=()
 
+# Machine-local git settings (identity, credentials) live here; the dotfiles
+# .gitconfig includes it.
+GIT_LOCAL="$HOME/.gitconfig.local"
+# Keys copied into $GIT_LOCAL this run (under --dry-run: would be copied).
+GIT_CARRIED=()
+# 1 once the dotfiles git package is stowed (under --dry-run: would be).
+GIT_STOWED=0
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 step() { printf "\n\033[1;34m==>\033[0m %s\n" "$1"; }
@@ -377,10 +385,22 @@ install_bun() {
   fi
 }
 
+# True if the font is already installed: its files are in the target dir, or
+# fontconfig knows it. fc-list is captured first: `fc-list | grep -q` fails
+# under pipefail when grep exits early and fc-list dies of SIGPIPE.
+font_installed() {
+  local font_dir="$1" f fonts
+  for f in "$font_dir"/JetBrainsMono/*.ttf; do
+    [ -f "$f" ] && return 0
+  done
+  fonts="$(fc-list 2>/dev/null)" || true
+  grep -qi "JetBrainsMono Nerd" <<<"$fonts"
+}
+
 install_font() {
   step "JetBrains Mono Nerd Font"
   local font_dir="$HOME/.local/share/fonts"
-  if fc-list 2>/dev/null | grep -qi "JetBrainsMono Nerd"; then
+  if font_installed "$font_dir"; then
     ok "JetBrains Mono Nerd Font already installed"
   else
     run_sh "tmp=\$(mktemp -d) && curl -fsSL https://github.com/ryanoasis/nerd-fonts/releases/latest/download/JetBrainsMono.zip -o \"\$tmp/JetBrainsMono.zip\" && mkdir -p '$font_dir' && unzip -o \"\$tmp/JetBrainsMono.zip\" -d '$font_dir/JetBrainsMono' '*.ttf' >/dev/null && fc-cache -f '$font_dir' && rm -rf \"\$tmp\""
@@ -388,19 +408,154 @@ install_font() {
   fi
 }
 
+# Runs after apply_dotfiles. Once ~/.gitconfig is the stowed dotfiles file,
+# its settings come from dotfiles: `git config --global` would write through
+# the link into the repo. Before, it would write into a file about to be
+# backed up. Only when the git package was not stowed are they set here.
 configure_git() {
   step "Configuring git"
-  run git config --global core.hooksPath "$HOME/.config/git/hooks"
-  run git config --global core.pager delta
-  run git config --global interactive.diffFilter "delta --color-only"
-  run git config --global delta.navigate true
-  run git config --global delta.side-by-side true
-  run git config --global pull.rebase true
-  run git config --global push.autoSetupRemote true
-  run git config --global init.defaultBranch main
-  run git config --global merge.conflictstyle diff3
-  run git config --global diff.colorMoved default
-  ok "git configured (identity set via ~/.gitconfig.local)"
+  if (( GIT_STOWED )) || in_repo "$HOME/.gitconfig"; then
+    ok "git settings come from the dotfiles .gitconfig (stowed; nothing written with --global)"
+  else
+    run git config --global core.hooksPath "$HOME/.config/git/hooks"
+    run git config --global core.pager delta
+    run git config --global interactive.diffFilter "delta --color-only"
+    run git config --global delta.navigate true
+    run git config --global delta.side-by-side true
+    run git config --global pull.rebase true
+    run git config --global push.autoSetupRemote true
+    run git config --global init.defaultBranch main
+    run git config --global merge.conflictstyle diff3
+    run git config --global diff.colorMoved default
+    did "git configured with --global (the dotfiles git package was not stowed)"
+  fi
+}
+
+# Machine-local git settings that belong in ~/.gitconfig.local, not dotfiles.
+is_local_git_key() {
+  case "$1" in
+    user.name|user.email|user.signingkey|credential.*) return 0 ;;
+  esac
+  return 1
+}
+
+# Print KEY's last value in FILE (nothing, and non-zero, if unset or unreadable).
+git_get() { # git_get FILE KEY [--includes]
+  [ -e "$1" ] && cmd_exists git || return 1
+  git config --file "$1" ${3:+"$3"} --get "$2" 2>/dev/null
+}
+
+# True if KEY is (or, under --dry-run, will be) in ~/.gitconfig.local, with
+# any value — an empty one included.
+git_local_has() {
+  local k
+  for k in "${GIT_CARRIED[@]}"; do
+    [ "$k" = "$1" ] && return 0
+  done
+  [ -e "$GIT_LOCAL" ] && cmd_exists git && git config --file "$GIT_LOCAL" --get-all "$1" >/dev/null 2>&1
+}
+
+# True if KEY has a non-empty value in ~/.gitconfig.local (under --dry-run,
+# also if it would be copied there).
+git_local_set() {
+  local k
+  for k in "${GIT_CARRIED[@]}"; do
+    [ "$k" = "$1" ] && return 0
+  done
+  [ -n "$(git_get "$GIT_LOCAL" "$1")" ]
+}
+
+# Say where the git identity comes from, or warn (into the summary) that it
+# is missing. Runs after ~/.laptop.local, which may set it. ~/.gitconfig only
+# counts if it was not backed up this run.
+check_git_identity() {
+  local key missing=() where=".gitconfig.local" hint=""
+  step "git identity"
+  for key in user.name user.email; do
+    if git_local_set "$key"; then
+      continue
+    elif [ -z "${BACKED_UP[$HOME/.gitconfig]:-}" ] && [ -n "$(git_get "$HOME/.gitconfig" "$key" --includes)" ]; then
+      where=".gitconfig"
+    else
+      missing+=("$key")
+    fi
+  done
+  if (( DRY_RUN )) && [ -f ~/.laptop.local ]; then
+    hint=" (unless ~/.laptop.local sets it)"
+  fi
+  if (( ${#missing[@]} )); then
+    warn "git identity is not set$hint (missing ${missing[*]}): set it with 'git config --file ~/.gitconfig.local user.name \"Your Name\"' and 'git config --file ~/.gitconfig.local user.email you@example.com'"
+  elif (( DRY_RUN )); then
+    ok "git identity will be set via ~/$where"
+  else
+    ok "git identity set via ~/$where"
+  fi
+}
+
+# Before ~/.gitconfig is moved out of the way of the dotfiles one, copy its
+# identity and credential settings into ~/.gitconfig.local, which the dotfiles
+# .gitconfig includes. Every value of a multi-valued key is copied in order,
+# empty values (a helper reset) included. A key already in ~/.gitconfig.local
+# is never touched. A new ~/.gitconfig.local is created mode 0600. Prints key
+# names only, never values. Returns non-zero, with a warning, if the settings
+# could not be read or written (~/.gitconfig must then stay where it is).
+carry_git_local() {
+  local src="$HOME/.gitconfig" entry key val i n
+  local -a keys=() vals=() order=()
+  local -A count=()
+  if ! cmd_exists git; then
+    warn "git not found; cannot copy identity/credentials from ~/.gitconfig to ~/.gitconfig.local — not moving ~/.gitconfig"
+    return 1
+  fi
+  if ! git config --file "$src" --list >/dev/null 2>&1; then
+    warn "could not read ~/.gitconfig; not moving it — copy your identity/credentials to ~/.gitconfig.local by hand"
+    return 1
+  fi
+  if [ -e "$GIT_LOCAL" ] && ! git config --file "$GIT_LOCAL" --list >/dev/null 2>&1; then
+    warn "could not read ~/.gitconfig.local; not moving ~/.gitconfig"
+    return 1
+  fi
+  # --null: entries end in NUL, key and value are split by a newline; a key
+  # with no newline has no value (boolean true).
+  while IFS= read -r -d '' entry; do
+    key="${entry%%$'\n'*}"
+    if [[ "$entry" == *$'\n'* ]]; then val="${entry#*$'\n'}"; else val=true; fi
+    is_local_git_key "$key" || continue
+    if [ -z "${count[$key]:-}" ]; then
+      order+=("$key")
+      count[$key]=0
+    fi
+    count[$key]=$((count[$key] + 1))
+    keys+=("$key")
+    vals+=("$val")
+  done < <(git config --file "$src" --null --list 2>/dev/null)
+
+  for key in "${order[@]}"; do
+    n="${count[$key]}"
+    if git_local_has "$key"; then
+      ok "kept existing $key in ~/.gitconfig.local (not copied from ~/.gitconfig)"
+      continue
+    fi
+    if (( DRY_RUN )); then
+      ok "would copy $key to ~/.gitconfig.local ($n value$([ "$n" -eq 1 ] || echo s))"
+    else
+      if [ ! -e "$GIT_LOCAL" ] && [ ! -L "$GIT_LOCAL" ]; then
+        if ! (umask 077 && : > "$GIT_LOCAL"); then
+          warn "could not create ~/.gitconfig.local; not moving ~/.gitconfig"
+          return 1
+        fi
+      fi
+      for i in "${!keys[@]}"; do
+        [ "${keys[$i]}" = "$key" ] || continue
+        if ! git config --file "$GIT_LOCAL" --add "$key" "${vals[$i]}"; then
+          warn "could not write $key to ~/.gitconfig.local; not moving ~/.gitconfig"
+          return 1
+        fi
+      done
+      ok "copied $key to ~/.gitconfig.local ($n value$([ "$n" -eq 1 ] || echo s))"
+    fi
+    GIT_CARRIED+=("$key")
+  done
 }
 
 setup_ssh() {
@@ -559,6 +714,17 @@ backup_conflicts() {
              -o \( -type f -o -type l \) -print0)
 }
 
+# True if the git package has a .gitconfig and ~/.gitconfig is a file in its
+# way (not already the stowed one, not a link into the repo), i.e. it would be
+# backed up.
+gitconfig_conflicts() {
+  local a="$HOME/.gitconfig"
+  [ -e "$DOTFILES_DIR/git/.gitconfig" ] || [ -L "$DOTFILES_DIR/git/.gitconfig" ] || return 1
+  [ -f "$a" ] || return 1
+  [ "$(realpath "$a" 2>/dev/null)" != "$(realpath "$DOTFILES_DIR/git/.gitconfig")" ] || return 1
+  ! in_repo "$a"
+}
+
 apply_dotfiles() {
   step "Cloning and applying dotfiles"
   if [ ! -d "$HOME_PROJECTS_DIR" ]; then
@@ -568,6 +734,7 @@ apply_dotfiles() {
   if [ ! -d "$DOTFILES_DIR" ]; then
     # Only reachable under --dry-run: conflicts are checked once cloned.
     run stow --dir="$DOTFILES_DIR" --target="$HOME" --restow "${STOW_PACKAGES[@]}"
+    GIT_STOWED=1
     return 0
   fi
 
@@ -578,12 +745,17 @@ apply_dotfiles() {
       warn "dotfiles has no '$pkg' package — skipping"
       continue
     fi
+    if [ "$pkg" = git ] && gitconfig_conflicts && ! carry_git_local; then
+      warn "skipped stowing $pkg"
+      continue
+    fi
     if ! backup_conflicts "$pkg"; then
       warn "skipped stowing $pkg"
       continue
     fi
     # Never --adopt: that would pull existing files into the dotfiles repo.
     if run stow --dir="$DOTFILES_DIR" --target="$HOME" --restow "$pkg"; then
+      if [ "$pkg" = git ]; then GIT_STOWED=1; fi
       did "stowed $pkg"
     else
       warn "stow failed for $pkg (see output above)"
@@ -725,9 +897,9 @@ install_debian() {
   npm_no_fund
   ok "telemetry disabled"
 
-  configure_git
   setup_ssh
   apply_dotfiles
+  configure_git
 
   step "Setting zsh as default shell"
   local zsh_path
@@ -864,9 +1036,9 @@ install_atomic() {
   npm_no_fund
   ok "telemetry disabled"
 
-  configure_git
   setup_ssh
   apply_dotfiles
+  configure_git
 
   step "Login shell"
   ok "login shell stays bash (no chsh on Bazzite); Ghostty starts zsh via its 'command =' setting"
@@ -907,6 +1079,7 @@ main() {
   esac
 
   run_local
+  check_git_identity
   summary
 
   if (( ! DRY_RUN )); then

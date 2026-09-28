@@ -109,6 +109,14 @@ All layered packages go into **one** `rpm-ostree install --idempotent` transacti
 
 A layered package is only usable after you reboot into the new deployment. The summary prints `Reboot required to use layered packages: ghostty` when that applies. **The script never reboots.** Run `systemctl reboot` when it suits you.
 
+### git identity and credentials
+
+The dotfiles `.gitconfig` carries the shared git settings and includes `~/.gitconfig.local` for machine-local ones. Before an existing `~/.gitconfig` is backed up to make way for it, the script copies its `user.name`, `user.email`, `user.signingkey` and every `credential.*` entry into `~/.gitconfig.local`. Multi-valued keys keep all their values in order, including the empty `helper =` reset that gh writes. A key already in `~/.gitconfig.local` is never changed. A new `~/.gitconfig.local` is created with mode 0600. `--dry-run` lists the key names it would copy, never their values. If `~/.gitconfig` can't be read, it is left in place and the git package is not stowed.
+
+`git config --global` is only used when the dotfiles git package was not stowed, because otherwise it would write through the link into the repo. The identity is checked after `~/.laptop.local` runs. If no `user.name`/`user.email` is found, the summary warns you.
+
+The font counts as installed when `~/.local/share/fonts/JetBrainsMono/` has `.ttf` files, or when `fc-list` lists "JetBrainsMono Nerd". Only then is the download skipped.
+
 ### Shell
 
 zsh comes from Homebrew, and the login shell stays bash: no `chsh`, no `usermod`. Ghostty starts zsh through its `command =` setting, which lives in the dotfiles Ghostty config (for example `command = /home/linuxbrew/.linuxbrew/bin/zsh`). If that line is missing, the script warns you.
@@ -120,12 +128,10 @@ Create `~/.laptop.local` before running. The script sources it at the end (under
 ```bash
 # ~/.laptop.local
 
-# git identity (also needed in ~/.gitconfig.local — see dotfiles README)
-git config --global user.name  "Your Name"
-git config --global user.email "you@example.com"
-git config --global credential."https://github.com".helper ""
-git config --global --add credential."https://github.com".helper \
-  "!/usr/bin/gh auth git-credential"
+# git identity goes in ~/.gitconfig.local, which the stowed dotfiles
+# .gitconfig includes. Not --global: ~/.gitconfig is a link into the repo.
+git config --file ~/.gitconfig.local user.name  "Your Name"
+git config --file ~/.gitconfig.local user.email "you@example.com"
 
 # Private repo clones
 clone_if_absent "https://github.com/you/your-repo.git" "$HOME_PROJECTS_DIR/your-repo"
