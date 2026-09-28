@@ -28,7 +28,7 @@ ALL_FORMULAE=(git git-delta stow neovim tmux jq ripgrep fd fzf bat wget gh stars
 ALL_PACKAGES=(agy bash bat bin ghostty git nvim ripgrep ssh starship tmux zsh)
 
 # Calls that would change the machine. None may appear during --dry-run.
-MUTATING='^(sudo|apt-get|chsh|usermod|ujust|ssh-keygen|npm|curl|stow|systemctl|ubuntu-report|unzip|fc-cache)( |$)|^brew install|^rpm-ostree (install|upgrade|reboot)|^flatpak install|^git (clone|config)|^mise (use|install)'
+MUTATING='^(sudo|apt-get|chsh|usermod|ujust|ssh-keygen|npm|curl|stow|systemctl|ubuntu-report|unzip|fc-cache)( |$)|^brew install|^rpm-ostree (install|upgrade|reboot)|^flatpak install|^git (clone|config)|^mise (use|install|reshim)|^mise-'
 
 # rpm-ostree status --json shapes. Deployments are listed newest first:
 # staged/pending, then booted, then rollback.
@@ -38,25 +38,64 @@ ROLLBACK_GHOSTTY='{"deployments":[{"booted":true,"requested-packages":[],"packag
 
 # A mise that models its filesystem side effects. Like real mise, every
 # invocation leaves state and cache dirs behind; `use -g node@lts` writes the
-# global config and installs node (plus shims); `install node` installs only.
-# It resolves its dirs from the same MISE_*/XDG_* variables as real mise.
+# global config and installs node; `install node` installs the pinned version;
+# `reshim` rewrites the shims. Installs and shims are made by node-install
+# (see write_node_install). It resolves its dirs from the same MISE_*/XDG_*
+# variables as real mise. STUB_MISE_RC makes use/install fail.
 MISE_SIDE_EFFECTS='
 data="${MISE_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/mise}"
 conf="${MISE_GLOBAL_CONFIG_FILE:-${MISE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/mise}/config.toml}"
 mkdir -p "${XDG_STATE_HOME:-$HOME/.local/state}/mise" "${XDG_CACHE_HOME:-$HOME/.cache}/mise"
-install_node() {
-  mkdir -p "$data/installs/node/22.12.0/bin" "$data/shims"
-  printf "#!/bin/sh\necho v22.12.0\n" > "$data/installs/node/22.12.0/bin/node"
-  chmod +x "$data/installs/node/22.12.0/bin/node"
-  ln -sfn 22.12.0 "$data/installs/node/lts"
-  touch "$data/shims/node" "$data/shims/npm" # not executable: the npm stub still answers
-}
+pinned() { sed -nE "s/^[[:space:]]*\"?(core:)?(node|version)\"?[[:space:]]*=[[:space:]]*\"([^\"]*)\".*/\3/p" "$conf" 2>/dev/null | head -1; }
 case "$*" in
-  --version)        echo "2026.9.0 linux-x64 (stub)" ;;
-  "use -g node@lts") mkdir -p "${conf%/*}"; printf "[tools]\nnode = \"lts\"\n" >> "$conf"; install_node ;;
-  "install node")   install_node ;;
-  *)                echo "stub mise: unexpected: $*" >&2; exit 2 ;;
+  --version)         echo "2026.9.0 linux-x64 (stub)" ;;
+  "use -g node@lts") [ "${STUB_MISE_RC:-0}" = 0 ] || exit "$STUB_MISE_RC"
+                     mkdir -p "${conf%/*}"; printf "[tools]\nnode = \"lts\"\n" >> "$conf"
+                     "$STUB_STATE/node-install" lts ;;
+  "install node")    [ "${STUB_MISE_RC:-0}" = 0 ] || exit "$STUB_MISE_RC"
+                     "$STUB_STATE/node-install" "$(pinned)" ;;
+  reshim)            "$STUB_STATE/node-install" --shims-only ;;
+  *)                 echo "stub mise: unexpected: $*" >&2; exit 2 ;;
 esac'
+
+# What `mise install` leaves on disk for node: installs/node/<version>/bin/
+# {node,npm}, the prefix and alias symlinks mise makes (22, 22.12, lts,
+# latest), and executable shims. Every node/npm logs as "mise-<where>-<tool>",
+# so a call through mise's shims is told apart from the PATH npm stub (which
+# fails). `npm install -g @anthropic-ai/claude-code` also adds a claude shim.
+write_node_install() {
+  cat > "$STATE/node-install" <<'EOF'
+#!@BASH@
+data="${MISE_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/mise}"
+dir="$data/installs/node"
+tool() { # tool PATH LABEL
+  cat > "$1" <<TOOL
+#!@BASH@
+printf '%s\n' "mise-$2 \$*" >> "\$STUB_LOG"
+if [ "\$*" = "install -g @anthropic-ai/claude-code" ]; then
+  printf '#!@BASH@\n' > "$data/shims/claude"; chmod +x "$data/shims/claude"
+fi
+TOOL
+  chmod +x "$1"
+}
+mkdir -p "$data/shims"
+tool "$data/shims/node" shim-node
+tool "$data/shims/npm" shim-npm
+[ "$1" = --shims-only ] && exit 0
+case "$1" in
+  ""|lts|latest|22|22.*) v=22.12.0 ;;
+  20|20.*)               v=20.18.1 ;;
+  *)                     v="$1" ;;
+esac
+mkdir -p "$dir/$v/bin"
+tool "$dir/$v/bin/node" "$v-node"
+tool "$dir/$v/bin/npm" "$v-npm"
+ln -sfn "$v" "$dir/${v%%.*}"; ln -sfn "$v" "$dir/${v%.*}"
+if [ "$v" = 22.12.0 ]; then ln -sfn "$v" "$dir/lts"; ln -sfn "$v" "$dir/latest"; fi
+EOF
+  sed -i "s|@BASH@|$SANDBOX/sysbin/bash|g" "$STATE/node-install"
+  chmod +x "$STATE/node-install"
+}
 
 # ── Assertions ───────────────────────────────────────────────────────────────
 
@@ -128,11 +167,14 @@ setup() { # setup TEST_NAME
   stub sudo '[ -p /dev/stdin ] && cat > /dev/null
 [ "$*" = "apt-get install -y mise" ] && cp "$STUB_STATE/mise-stub" "${0%/*}/mise"; exit 0'
   stub apt-get; stub chsh; stub usermod; stub ujust; stub flatpak
-  stub systemctl; stub npm; stub unzip; stub fc-cache
+  stub systemctl; stub unzip; stub fc-cache
+  # A competing npm on PATH: the script must only use mise's. It fails, loudly.
+  stub npm 'echo "stub: PATH npm used instead of mise-managed npm" >&2; exit 97'
+  write_node_install
   stub sh '[ -p /dev/stdin ] && cat > /dev/null; exit 0' # `curl ... | sh` installers
-  stub curl 'exit "${STUB_CURL_RC:-0}"' 
+  stub curl 'if [ -n "${STUB_CURL_FAIL:-}" ] && [[ "$*" == *"$STUB_CURL_FAIL"* ]]; then exit 22; fi; exit "${STUB_CURL_RC:-0}"'
   stub dpkg '[ "$1" = --print-architecture ] && echo amd64 || exit 1'
-  stub gpg
+  stub gpg 'exit "${STUB_GPG_RC:-0}"'
   stub fc-list 'echo "/x/JetBrainsMonoNerdFont-Regular.ttf: JetBrainsMono Nerd Font:style=Regular"'
   stub git 'if [ "$1" = clone ]; then mkdir -p "$3/.git"; fi'
   stub ssh-keygen 'while [ $# -gt 0 ]; do [ "$1" = -f ] && { touch "$2" "$2.pub"; break; }; shift; done'
@@ -228,12 +270,17 @@ dotfiles_fixture() {
 
 # mise on PATH, node pinned in its global config and installed, as
 # `mise use -g node@lts` leaves it. Made without running mise.
-mise_node_fixture() {
+mise_node_fixture() { # mise_node_fixture [PIN] [INSTALLED_VERSION]
   cp "$STATE/mise-stub" "$STUBS/mise"
-  mkdir -p "$HOME/.config/mise" "$HOME/.local/share/mise/installs/node/22.12.0/bin"
-  printf '[tools]\nnode = "lts"\n' > "$HOME/.config/mise/config.toml"
-  touch "$HOME/.local/share/mise/installs/node/22.12.0/bin/node"
+  mkdir -p "$HOME/.config/mise"
+  printf '[tools]\nnode = "%s"\n' "${1:-lts}" > "$HOME/.config/mise/config.toml"
+  sandboxed "$STATE/node-install" "${2:-${1:-lts}}"
 }
+
+# Line number of the first log entry matching $1 (0 if none).
+log_line() { local n; n="$(grep -nE -m1 -- "$1" "$LOG" | cut -d: -f1)"; echo "${n:-0}"; }
+# True if the first match of $1 is logged before the first match of $2.
+logged_before() { local a b; a="$(log_line "$1")"; b="$(log_line "$2")"; [ "$a" -gt 0 ] && [ "$b" -gt "$a" ]; }
 
 # Everything already in place, as after a successful run.
 all_done_fixture() {
@@ -295,7 +342,7 @@ sandboxed() {
     LAPTOP_YUM_REPOS_DIR="$LAPTOP_YUM_REPOS_DIR" LAPTOP_BREW_DIRS="$LAPTOP_BREW_DIRS"
     STUB_LOG="$STUB_LOG" STUB_STATE="$STUB_STATE"
   )
-  for v in STUB_CURL_RC STUB_OSTREE_RC; do
+  for v in STUB_CURL_RC STUB_CURL_FAIL STUB_GPG_RC STUB_MISE_RC STUB_OSTREE_RC; do
     if [ -n "${!v:-}" ]; then vars+=("$v=${!v}"); fi
   done
   "$SANDBOX/sysbin/env" -i "${vars[@]}" "$@"
@@ -619,8 +666,147 @@ test_folded_into_other_package() {
   check "mise config not written through the fold" [ ! -e "$d/agy/.config/mise" ]
   check "mise was not asked to pin node" log_lacks '^mise use'
   check "says why node was not pinned" has "$OUT" "mise's global config .* resolves into the dotfiles repo; not writing to it"
+  check "skips Claude with a clear warning" has "$OUT" "skipped Claude Code: no usable mise-managed Node"
+  check "competing PATH npm never used" log_lacks '^npm '
+  check "no npm through mise either" log_lacks '^mise-'
   check "no backups made" [ ! -e "$HOME/.local/state/laptop/backups" ]
   teardown
+}
+
+# Installed-Node detection must match the pin and need an executable node;
+# Claude must only ever be installed through mise's own npm.
+test_node_readiness() {
+  setup "pinned 20, only 22 installed"
+  bazzite
+  dotfiles_fixture
+  mise_node_fixture 20 22.12.0
+  local conf_before before; conf_before="$(cat "$HOME/.config/mise/config.toml")"
+  before="$(home_snapshot)"
+  run_linux --dry-run
+  check "dry run: 22 does not satisfy the pin" lacks "$OUT" "node already installed"
+  check "dry run: plans installing the pinned node" has "$OUT" "\[dry-run\] $STUBS/mise install node$"
+  check "dry run: does not re-pin" lacks "$OUT" "\[dry-run\] .*mise use"
+  check "dry run: mise not run" log_lacks '^mise '
+  check "dry run: HOME is untouched" [ "$before" = "$(home_snapshot)" ]
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "runs mise install node" log_has '^mise install node$'
+  check "node 20 is now installed" [ -x "$HOME/.local/share/mise/installs/node/20.18.1/bin/node" ]
+  check "pin unchanged" [ "$conf_before" = "$(cat "$HOME/.config/mise/config.toml")" ]
+  check "claude through mise's npm shim, after node" logged_before '^mise install node$' '^mise-shim-npm install -g @anthropic-ai/claude-code$'
+  check "PATH npm never used" log_lacks '^npm '
+  teardown
+
+  setup "pinned lts, installed node not executable"
+  bazzite
+  dotfiles_fixture
+  mise_node_fixture lts
+  chmod -x "$HOME/.local/share/mise/installs/node/22.12.0/bin/node"
+  run_linux --dry-run
+  check "dry run: not counted as installed" lacks "$OUT" "node already installed"
+  check "dry run: plans mise install node" has "$OUT" "\[dry-run\] $STUBS/mise install node$"
+  check "dry run: mise not run" log_lacks '^mise '
+  run_linux
+  check "run reinstalls through mise" log_has '^mise install node$'
+  check "node is executable afterwards" [ -x "$HOME/.local/share/mise/installs/node/22.12.0/bin/node" ]
+  teardown
+
+  setup "installed but shims missing"
+  bazzite
+  dotfiles_fixture
+  mise_node_fixture lts
+  rm -rf "$HOME/.local/share/mise/shims"
+  run_linux
+  check "not counted as ready" lacks "$OUT" "node already installed"
+  check "reshims after install" logged_before '^mise install node$' '^mise reshim$'
+  check "claude through the new shim" log_has '^mise-shim-npm install -g @anthropic-ai/claude-code$'
+  teardown
+
+  setup "[tools.node] table with version"
+  bazzite
+  dotfiles_fixture
+  mise_node_fixture 20
+  printf '[tools.node]\nversion = "20"\n' > "$HOME/.config/mise/config.toml"
+  stub claude
+  run_linux --dry-run
+  check "recognised as installed" has "$OUT" 'node already installed via mise \(\[tools.node\] version = "20" in '
+  check "mise not run" log_lacks '^mise '
+  teardown
+
+  setup "node entry that cannot be parsed"
+  bazzite
+  dotfiles_fixture
+  mise_node_fixture lts
+  printf '[tools]\nnode = ["22", "20"]\n' > "$HOME/.config/mise/config.toml"
+  conf_before="$(cat "$HOME/.config/mise/config.toml")"
+  run_linux --dry-run
+  check "dry run: never re-pins" lacks "$OUT" "\[dry-run\] .*mise use"
+  check "dry run: plans mise install node" has "$OUT" "\[dry-run\] $STUBS/mise install node$"
+  run_linux
+  check "run never re-pins" log_lacks '^mise use'
+  check "config unchanged" [ "$conf_before" = "$(cat "$HOME/.config/mise/config.toml")" ]
+  teardown
+
+  setup "config blocked, no npm anywhere"
+  bazzite
+  dotfiles_fixture
+  ln -s Projects/Home/dotfiles/agy/.config "$HOME/.config"
+  rm "$STUBS/npm"
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "skips Claude with a clear warning" has "$OUT" "skipped Claude Code: no usable mise-managed Node"
+  check "no npm call of any kind" log_lacks 'npm'
+  check "no command-not-found noise" lacks "$OUT" "npm: command not found"
+  teardown
+
+  setup "mise use fails"
+  bazzite
+  dotfiles_fixture
+  STUB_MISE_RC=1 run_linux
+  check "run completes" [ "$RC" -eq 0 ]
+  check "reports the failure" has "$OUT" "'mise use -g node@lts' failed"
+  check "skips Claude" has "$OUT" "skipped Claude Code"
+  check "competing PATH npm never used" log_lacks '^npm '
+  teardown
+
+  setup "config path cannot be canonicalised"
+  bazzite
+  dotfiles_fixture
+  stub realpath 'case "$*" in *config.toml*) exit 1 ;; esac; exec "$STUB_STATE/../sysbin/realpath" "$@"'
+  run_linux --dry-run
+  check "dry run: fails closed" has "$OUT" "could not resolve mise's global config"
+  check "dry run: no mise use planned" lacks "$OUT" "\[dry-run\] .*mise use"
+  run_linux
+  check "run: fails closed" has "$OUT" "could not resolve mise's global config"
+  check "run: mise use never ran" log_lacks '^mise use'
+  check "run: no config written" [ ! -e "$HOME/.config/mise/config.toml" ]
+  check "run: Claude skipped" has "$OUT" "skipped Claude Code"
+  teardown
+}
+
+# The mise apt key is dearmored to a temp file, so a failed download or
+# dearmor never leaves an empty keyring, and nothing after it runs.
+test_mise_apt_failures() {
+  local what
+  for what in download dearmor; do
+    setup "pop run (mise key $what fails)"
+    os_release pop "ubuntu debian"
+    dotfiles_fixture
+    if [ "$what" = download ]; then
+      STUB_CURL_FAIL=mise.jdx.dev/gpg-key.pub run_linux
+      check "download was attempted" log_has '^curl -fsSL https://mise.jdx.dev/gpg-key.pub$'
+    else
+      STUB_GPG_RC=2 run_linux
+      check "dearmor was attempted" log_has '^gpg --dearmor$'
+    fi
+    check "run fails" [ "$RC" -ne 0 ]
+    check "no keyring installed" log_lacks '^sudo install -m 644 .*mise-archive-keyring'
+    check "no mise apt source added" log_lacks 'mise\.list'
+    check "mise not installed" log_lacks '^sudo apt-get install -y mise$'
+    check "no mise, node or npm run" log_lacks '^mise|npm'
+    check "no temp file left" [ -z "$(ls -A "$SANDBOX/tmp")" ]
+    teardown
+  done
 }
 
 # The in_repo predicate is repository membership, not proof of a stow fold.
@@ -821,7 +1007,8 @@ test_bazzite_run_and_rerun() {
   check "mise wrote its global config" [ "$(cat "$HOME/.config/mise/config.toml" 2>/dev/null)" = "$(printf '[tools]\nnode = "lts"')" ]
   check "node is installed under mise" [ -x "$HOME/.local/share/mise/installs/node/22.12.0/bin/node" ]
   check "fnm never involved" log_lacks '^fnm |fnm'
-  check "claude installed with npm after node" log_has '^npm install -g @anthropic-ai/claude-code$'
+  check "claude installed through mise's npm shim, after node" logged_before '^mise use -g node@lts$' '^mise-shim-npm install -g @anthropic-ai/claude-code$'
+  check "PATH npm never used" log_lacks '^npm '
 
   : > "$LOG"
   local backups_before mise_conf_before
@@ -837,6 +1024,7 @@ test_bazzite_run_and_rerun() {
   check "re-run does not run mise" log_lacks '^mise '
   check "re-run reports node installed via mise" has "$OUT" "node already installed via mise"
   check "re-run leaves mise config unchanged" [ "$mise_conf_before" = "$(cat "$HOME/.config/mise/config.toml")" ]
+  check "re-run finds claude, installs nothing with npm" log_lacks 'npm install'
   teardown
 }
 
@@ -871,7 +1059,9 @@ test_debian_dry_run() {
   check "never uses --adopt" lacks "$OUT" "--adopt"
   check "backs up instead of adopting" has "$OUT" "would back up ~/.bashrc"
   check "no brew / rpm-ostree" lacks "$OUT" "(brew install|rpm-ostree)"
-  check "plans mise's apt signing key" has "$OUT" "\[dry-run\] curl -fsSL https://mise.jdx.dev/gpg-key.pub \| gpg --dearmor \| sudo tee /etc/apt/keyrings/mise-archive-keyring.gpg"
+  check "plans mise's apt signing key, 0644" has "$OUT" "\[dry-run\] .*curl -fsSL https://mise.jdx.dev/gpg-key.pub \| gpg --dearmor > \"\\\$tmp\" && sudo install -m 644 \"\\\$tmp\" /etc/apt/keyrings/mise-archive-keyring.gpg$"
+  check "plans an apt-readable sources file" has "$OUT" "\[dry-run\] sudo chmod 644 /etc/apt/sources.list.d/mise.list$"
+  check "plans claude through mise's npm shim" has "$OUT" "\[dry-run\] $HOME/.local/share/mise/shims/npm install -g @anthropic-ai/claude-code$"
   check "plans mise's apt repo" has "$OUT" "https://mise.jdx.dev/deb stable main.*sudo tee /etc/apt/sources.list.d/mise.list"
   check "plans apt install mise" has "$OUT" "\[dry-run\] sudo apt-get install -y mise$"
   check "plans node lts via mise" has "$OUT" "\[dry-run\] mise use -g node@lts$"
@@ -911,6 +1101,10 @@ test_debian_run_and_rerun() {
   check "node lts pinned via mise, once" [ "$(log_count '^mise use -g node@lts$')" -eq 1 ]
   check "mise wrote its global config" [ "$(cat "$HOME/.config/mise/config.toml" 2>/dev/null)" = "$(printf '[tools]\nnode = "lts"')" ]
   check "no fnm installer" log_lacks 'fnm'
+  check "keyring installed 0644" log_has '^sudo install -m 644 .* /etc/apt/keyrings/mise-archive-keyring.gpg$'
+  check "sources file made 0644" log_has '^sudo chmod 644 /etc/apt/sources.list.d/mise.list$'
+  check "claude installed through mise's npm shim, after node" logged_before '^mise use -g node@lts$' '^mise-shim-npm install -g @anthropic-ai/claude-code$'
+  check "PATH npm never used" log_lacks '^npm '
   local conf_before; conf_before="$(cat "$HOME/.config/mise/config.toml")"
   : > "$LOG"
   run_linux
@@ -934,7 +1128,7 @@ test_mise_edge_cases() {
   local conf_before; conf_before="$(cat "$HOME/.config/mise/config.toml")"
   run_linux --dry-run
   check "dry run plans installing the pinned node" has "$OUT" "\[dry-run\] $STUBS/mise install node$"
-  check "dry run does not re-pin to lts" lacks "$OUT" "mise use"
+  check "dry run does not re-pin to lts" lacks "$OUT" "\[dry-run\] .*mise use"
   check "dry run does not run mise" log_lacks '^mise '
   run_linux
   check "run installs the pinned node" log_has '^mise install node$'
@@ -999,6 +1193,8 @@ TESTS=(
   test_debian_dry_run
   test_debian_run_and_rerun
   test_mise_edge_cases
+  test_node_readiness
+  test_mise_apt_failures
   test_hand_made_repo_links
 )
 

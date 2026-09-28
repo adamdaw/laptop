@@ -190,20 +190,87 @@ find_mise() {
   fi
 }
 
-# Print the node entry (e.g. `node = "lts"`) of the [tools] table in mise's
-# global config file $1, or nothing. Plain text scan; mise is not run.
-mise_global_node() {
-  local file="$1" line in_tools=0
+# The value of a TOML string (`"x"` or `'x'`), or of `version = "x"` inside an
+# inline table, from the text after `=` ($1). Prints nothing for any other form.
+toml_version() {
+  local v="$1"
+  local dq='^[[:space:]]*"([^"]*)"[[:space:]]*(#.*)?$' sq="^[[:space:]]*'([^']*)'[[:space:]]*(#.*)?\$"
+  local tbl='^[[:space:]]*\{.*(^|[{,[:space:]])version[[:space:]]*=[[:space:]]*["'"'"']([^"'"'"']*)["'"'"']'
+  if [[ "$v" =~ $dq || "$v" =~ $sq ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+  elif [[ "$v" =~ $tbl ]]; then
+    printf '%s\n' "${BASH_REMATCH[2]}"
+  fi
+}
+
+# Read the node pin from mise's global config file $1 (plain text scan; mise
+# is not run). Sets NODE_PIN_FOUND=1 if any node entry exists, NODE_PIN to its
+# version selection when it can be parsed (else empty), and NODE_PIN_LINE for
+# messages. Recognises `node = ...` in [tools], a [tools.node] table with
+# `version = ...`, and a root-level `tools.node = ...`, with optional quotes
+# and a `core:` prefix. Any other node entry counts as found but unparsed.
+read_node_pin() {
+  NODE_PIN_FOUND=0 NODE_PIN="" NODE_PIN_LINE=""
+  local file="$1" line trimmed section=root
+  local key='["'"'"']?(core:)?node["'"'"']?'
+  local tools_hdr='^[[:space:]]*\[[[:space:]]*tools[[:space:]]*\][[:space:]]*(#.*)?$'
+  local node_hdr='^[[:space:]]*\[[[:space:]]*tools[[:space:]]*\.[[:space:]]*'"$key"'[[:space:]]*\][[:space:]]*(#.*)?$'
+  local other_node_hdr='^[[:space:]]*\[.*tools[[:space:]]*\.[[:space:]]*'"$key"'[^A-Za-z0-9_-]'
+  local node_kv='^[[:space:]]*'"$key"'[[:space:]]*='
+  local root_kv='^[[:space:]]*tools[[:space:]]*\.[[:space:]]*'"$key"'[[:space:]]*='
+  local version_kv='^[[:space:]]*["'"'"']?version["'"'"']?[[:space:]]*='
   [ -r "$file" ] || return 0
   while IFS= read -r line || [ -n "$line" ]; do
+    trimmed="${line#"${line%%[![:space:]]*}"}"
     if [[ "$line" =~ ^[[:space:]]*\[ ]]; then
-      in_tools=0
-      if [[ "$line" =~ ^[[:space:]]*\[tools\][[:space:]]*(#.*)?$ ]]; then in_tools=1; fi
-    elif (( in_tools )) && [[ "$line" =~ ^[[:space:]]*[\"\']?(core:)?node[\"\']?[[:space:]]*= ]]; then
-      printf '%s\n' "${line#"${line%%[![:space:]]*}"}"
-      return 0
+      section=other
+      if [[ "$line" =~ $tools_hdr ]]; then
+        section=tools
+      elif [[ "$line" =~ $node_hdr ]]; then
+        section=node NODE_PIN_FOUND=1 NODE_PIN_LINE="$trimmed"
+      elif [[ "$line" =~ $other_node_hdr ]]; then
+        NODE_PIN_FOUND=1 NODE_PIN_LINE="$trimmed" # e.g. [[tools.node]]: not parsed
+      fi
+    elif { [ "$section" = tools ] && [[ "$line" =~ $node_kv ]]; } ||
+         { [ "$section" = root ] && [[ "$line" =~ $root_kv ]]; }; then
+      NODE_PIN_FOUND=1 NODE_PIN_LINE="$trimmed"
+      NODE_PIN="$(toml_version "${line#*=}")"
+    elif [ "$section" = node ] && [[ "$line" =~ $version_kv ]]; then
+      NODE_PIN_LINE="$NODE_PIN_LINE $trimmed"
+      NODE_PIN="$(toml_version "${line#*=}")"
     fi
   done < "$file"
+}
+
+# True if mise's data dir $1 holds an executable node for version selection $2,
+# found the way mise lays out installs: installs/node/<selection> (a version,
+# or a prefix/alias symlink such as 22 or lts that mise makes), or for a
+# numeric prefix, installs/node/<prefix>.*. Anything else is not proven.
+node_installed() {
+  local dir="$1/installs/node" sel="$2" d
+  [[ "$sel" =~ ^[A-Za-z0-9._-]+$ && "$sel" != *..* ]] || return 1
+  [ -x "$dir/$sel/bin/node" ] && return 0
+  if [[ "$sel" =~ ^v?[0-9]+(\.[0-9]+)*$ ]]; then
+    sel="${sel#v}"
+    for d in "$dir/$sel".*; do
+      [ -x "$d/bin/node" ] && return 0
+    done
+  fi
+  return 1
+}
+
+# Why `mise use -g` must not write config file $1, or nothing if it may.
+# Fails closed: a path that cannot be canonicalised is never written.
+config_write_blocked() {
+  local cfg repo
+  if ! cfg="$(realpath -m -- "$1" 2>/dev/null)" || ! repo="$(realpath -m -- "$DOTFILES_DIR" 2>/dev/null)" ||
+     [ -z "$cfg" ] || [ -z "$repo" ]; then
+    echo "could not resolve mise's global config $1 or the dotfiles repo; not writing to it"
+  elif [[ "$cfg" == "$repo"/* ]]; then
+    # e.g. ~/.config is a link into the repo (a stow fold, or a dotfiles mise
+    # package): `mise use -g` would write into the repo.
+    echo "mise's global config $1 resolves into the dotfiles repo; not writing to it"
+  fi
 }
 
 # Note (don't remove) a Node manager this script no longer installs.
@@ -215,38 +282,60 @@ note_old_fnm() {
   printf "  \033[2mnote:\033[0m fnm is still installed (%s). Node now comes from mise; this script leaves fnm alone — remove it by hand when you no longer need it.\n" "$where"
 }
 
+# npm of the mise-managed Node, once that Node is known to be usable (under
+# --dry-run: once it is installed or planned). Empty means no usable Node, so
+# nothing that needs npm runs — never some other npm on PATH.
+NODE_NPM=""
+
 # Node LTS through mise. `mise use -g node@lts` pins it in mise's global config
-# (~/.config/mise/config.toml by default) and installs it.
+# (~/.config/mise/config.toml by default) and installs it. An existing pin, of
+# any form, is never changed.
 install_node() {
   step "Installing Node LTS via mise"
-  local mise config data entry
+  local mise config data shims reason mise_ok=0
+  NODE_NPM=""
   mise="$(find_mise)"
   config="$(mise_config_file)"
   data="$(mise_data_dir)"
+  shims="$data/shims"
   if (( ! DRY_RUN )) && [ -z "$mise" ]; then
     die "mise not found after installing it; cannot install Node"
   fi
+  mise="${mise:-mise}"
   # Decided from files on disk, never by running mise (it creates state, so a
   # --dry-run must not run it), so a dry run and a real run agree.
-  entry="$(mise_global_node "$config")"
-  if [ -n "$entry" ] && compgen -G "$data/installs/node/*/bin/node" >/dev/null; then
-    ok "node already installed via mise ($entry in $config)"
-  elif [ -n "$entry" ]; then
-    # Already pinned (maybe not to lts): install what is pinned, don't re-pin.
-    run "${mise:-mise}" install node
-    did "installed node ($entry in $config)"
-  elif [[ "$(realpath -m "$config")" == "$(realpath -m "$DOTFILES_DIR")"/* ]]; then
-    # e.g. ~/.config is a link into the repo (a stow fold, or a dotfiles mise
-    # package): `mise use -g` would write into the repo. Leave that to you.
-    warn "mise's global config $config resolves into the dotfiles repo; not writing to it. Add node = \"lts\" under [tools] there (or run 'mise use -g node@lts' yourself) and re-run"
-  else
-    run "${mise:-mise}" use -g node@lts
+  read_node_pin "$config"
+  if (( NODE_PIN_FOUND )) && node_installed "$data" "$NODE_PIN" && [ -x "$shims/node" ] && [ -x "$shims/npm" ]; then
+    ok "node already installed via mise ($NODE_PIN_LINE in $config)"
+    mise_ok=1
+  elif (( NODE_PIN_FOUND )); then
+    # Pinned, but disk can't prove a matching, usable install (other version,
+    # unparsed entry, no shims): install what is pinned, don't re-pin.
+    if run "$mise" install node && run "$mise" reshim; then
+      mise_ok=1
+      did "installed node ($NODE_PIN_LINE in $config)"
+    else
+      warn "'mise install node' failed ($NODE_PIN_LINE in $config)"
+    fi
+  elif reason="$(config_write_blocked "$config")" && [ -n "$reason" ]; then
+    warn "$reason. Add node = \"lts\" under [tools] there (or run 'mise use -g node@lts' yourself) and re-run"
+  elif run "$mise" use -g node@lts; then
+    mise_ok=1
     did "installed node lts with mise (pinned in $config)"
+  else
+    warn "'mise use -g node@lts' failed"
   fi
   note_old_fnm
-  if (( ! DRY_RUN )); then
-    # Make mise's node and npm usable by the following steps of this run.
-    export PATH="$data/shims:$PATH"
+  if (( ! mise_ok )); then
+    return 0
+  elif (( DRY_RUN )); then
+    NODE_NPM="$shims/npm"
+  elif [ -x "$shims/node" ] && [ -x "$shims/npm" ]; then
+    NODE_NPM="$shims/npm"
+    # Put mise's node first for the following steps (npm's scripts run node).
+    export PATH="$shims:$PATH"
+  else
+    warn "mise's node/npm shims are missing from $shims; Node is not usable"
   fi
 }
 
@@ -254,9 +343,18 @@ install_claude() {
   step "Installing Claude Code"
   if cmd_exists claude; then
     ok "claude already installed"
+  elif [ -z "$NODE_NPM" ]; then
+    warn "skipped Claude Code: no usable mise-managed Node (see above). Once Node works: npm install -g @anthropic-ai/claude-code"
   else
-    run npm install -g @anthropic-ai/claude-code
+    run "$NODE_NPM" install -g @anthropic-ai/claude-code
     did "installed claude"
+  fi
+}
+
+# npm settings, only through the mise-managed npm.
+npm_no_fund() {
+  if [ -n "$NODE_NPM" ]; then
+    run "$NODE_NPM" config set fund false 2>/dev/null || true
   fi
 }
 
@@ -565,8 +663,11 @@ install_debian() {
     # mise's official apt repo: signed packages that `apt-get upgrade` keeps
     # current, set up the same way as the gh repo above.
     run sudo install -dm 755 /etc/apt/keyrings
-    run_sh "curl -fsSL https://mise.jdx.dev/gpg-key.pub | gpg --dearmor | sudo tee /etc/apt/keyrings/mise-archive-keyring.gpg > /dev/null"
+    # The key is dearmored to a temp file first, so a failed download never
+    # leaves an empty keyring behind; both files are made apt-readable (0644).
+    run_sh "tmp=\$(mktemp) && trap 'rm -f \"\$tmp\"' EXIT && curl -fsSL https://mise.jdx.dev/gpg-key.pub | gpg --dearmor > \"\$tmp\" && sudo install -m 644 \"\$tmp\" /etc/apt/keyrings/mise-archive-keyring.gpg"
     run_sh "echo \"deb [signed-by=/etc/apt/keyrings/mise-archive-keyring.gpg arch=\$(dpkg --print-architecture)] https://mise.jdx.dev/deb stable main\" | sudo tee /etc/apt/sources.list.d/mise.list > /dev/null"
+    run sudo chmod 644 /etc/apt/sources.list.d/mise.list
     run sudo apt-get update -qq
     run sudo apt-get install -y mise
     did "installed mise"
@@ -612,7 +713,7 @@ install_debian() {
   if cmd_exists go; then
     run go telemetry off 2>/dev/null || true
   fi
-  run npm config set fund false 2>/dev/null || true
+  npm_no_fund
   ok "telemetry disabled"
 
   configure_git
@@ -751,7 +852,7 @@ install_atomic() {
   if cmd_exists go; then
     run go telemetry off 2>/dev/null || true
   fi
-  run npm config set fund false 2>/dev/null || true
+  npm_no_fund
   ok "telemetry disabled"
 
   configure_git

@@ -23,7 +23,7 @@ bash laptop/linux
 
 | Option | Effect |
 |---|---|
-| `-n`, `--dry-run` | Print every command that would run (installs, backups, stow, git config). Read-only checks (`brew list`, `rpm -q`, `rpm-ostree status`, `fc-list`, `dpkg -s`) still run so the plan is accurate. `mise` is never executed during a dry run on either platform, not even `mise --version`, because mise creates state and cache directories whenever it runs. Whether mise and Node are already installed is read from disk instead: mise on `PATH` or in `~/.local/bin`, a `node` entry in the `[tools]` table of mise's global config, and an installed `node` under mise's data dir. Nothing is changed. |
+| `-n`, `--dry-run` | Print every command that would run (installs, backups, stow, git config). Read-only checks (`brew list`, `rpm -q`, `rpm-ostree status`, `fc-list`, `dpkg -s`) still run so the plan is accurate. `mise` is never executed during a dry run on either platform, not even `mise --version`, because mise creates state and cache directories whenever it runs. Whether mise and Node are already installed is read from disk instead: mise on `PATH` or in `~/.local/bin`, the `node` pin in mise's global config, an executable `node` installed under mise's data dir that matches that pin, and mise's `node`/`npm` shims. Nothing is changed. |
 | `--print-os` | Print the detected platform (`debian` or `atomic`) and exit |
 | `-h`, `--help` | Usage |
 
@@ -46,9 +46,13 @@ On Bazzite, a Homebrew formula is skipped when the command is already on `PATH` 
 
 ### Node comes from mise
 
-[mise](https://mise.jdx.dev) manages Node; the dotfiles already activate it in bash and zsh. mise is installed from the first source in the install-order rule: the Homebrew formula on Bazzite, and mise's official apt repo (`mise.jdx.dev/deb`, signed with mise's key) on Ubuntu/Pop!_OS. The apt repo was chosen over the `mise.run` installer because apt verifies signatures and `apt-get upgrade` keeps mise current, the same way the gh repo works. A mise that is already on `PATH` or in `~/.local/bin` (where `mise.run` puts it) is used as is.
+[mise](https://mise.jdx.dev) manages Node; the dotfiles already activate it in bash and zsh. mise is installed from the first source in the install-order rule: the Homebrew formula on Bazzite, and mise's official apt repo (`mise.jdx.dev/deb`, signed with mise's key) on Ubuntu/Pop!_OS. The key is dearmored into a temp file and installed with mode 0644, and the sources file is made 0644, so both are always readable by apt. If the key download or the dearmor fails, the run stops before any repo is added, and no empty keyring is left behind. The apt repo was chosen over the `mise.run` installer because apt verifies signatures and `apt-get upgrade` keeps mise current, the same way the gh repo works. A mise that is already on `PATH` or in `~/.local/bin` (where `mise.run` puts it) is used as is.
 
-Node LTS is installed with `mise use -g node@lts`. **That writes `~/.config/mise/config.toml`** (mise's global config; `MISE_GLOBAL_CONFIG_FILE` / `MISE_CONFIG_DIR` / `XDG_CONFIG_HOME` move it). The dotfiles don't manage that file today. If a dotfiles `mise` package takes it over later, pin Node there. The script never writes the file when its path resolves into the dotfiles repo; it warns instead. If the global config already pins `node` (to any version), the script runs `mise install node` and doesn't re-pin it.
+Node LTS is installed with `mise use -g node@lts`. **That writes `~/.config/mise/config.toml`** (mise's global config; `MISE_GLOBAL_CONFIG_FILE` / `MISE_CONFIG_DIR` / `XDG_CONFIG_HOME` move it). The dotfiles don't manage that file today. If a dotfiles `mise` package takes it over later, pin Node there. The script never writes the file when its path resolves into the dotfiles repo, or when that path can't be resolved; it warns instead.
+
+An existing `node` pin is never changed. The script recognises `node = "…"` (optionally quoted or `core:node`, or an inline table with `version = "…"`) under `[tools]`, a `[tools.node]` table with `version = "…"`, and a top-level `tools.node = "…"`. Node counts as installed only when an **executable** `node` exists for the pinned selection: `installs/node/<pin>` (a version, or the prefix/alias links mise makes, such as `22` or `lts`), or `installs/node/<pin>.*` for a numeric prefix. mise's shims must exist too. If the disk can't prove that, for example a pin of `20` with only 22 installed, a pin in a form the script doesn't parse, or a missing shim, the script runs `mise install node` and `mise reshim` and leaves the pin alone.
+
+Claude Code is installed only with mise's own npm shim (`~/.local/share/mise/shims/npm`), and only once that Node is known to work. If Node isn't ready (the config write was blocked, mise failed, or the shims are missing), the script skips Claude Code with a warning. It never falls back to another `npm` on `PATH`. The same applies to the npm `fund` setting.
 
 fnm is no longer installed. An existing fnm (`~/.local/share/fnm`, or `fnm` on `PATH`) is left alone and only noted in the output. Remove it yourself when you no longer need it.
 
@@ -153,13 +157,14 @@ shellcheck linux tests/run.sh
 tests/run.sh
 ```
 
-`tests/run.sh` is a plain-bash harness that installs nothing. The script runs under `env -i` with an allowlisted environment: sandbox `PATH`, `HOME`, `XDG_*`, `HOMEBREW_*` and `FNM_*`; no host `MISE_*`, exported functions or `BASH_ENV`/`ENV`. A guard refuses to start if any path it passes (including every `LAPTOP_BREW_DIRS` entry) is outside the sandbox once symlinks are resolved. It runs `linux` with a throwaway `HOME` and a `PATH` of logging stubs (brew, rpm-ostree, stow, mise, apt-get, sudo, …). The mise stub models mise's side effects on disk (state/cache dirs on every run, the global config, installs), so any mise call during a dry run changes the `HOME` snapshot. The tests cover:
+`tests/run.sh` is a plain-bash harness that installs nothing. The script runs under `env -i` with an allowlisted environment: sandbox `PATH`, `HOME`, `XDG_*`, `HOMEBREW_*` and `FNM_*`; no host `MISE_*`, exported functions or `BASH_ENV`/`ENV`. A guard refuses to start if any path it passes (including every `LAPTOP_BREW_DIRS` entry) is outside the sandbox once symlinks are resolved. It runs `linux` with a throwaway `HOME` and a `PATH` of logging stubs (brew, rpm-ostree, stow, mise, apt-get, sudo, …). The mise stub models mise's side effects on disk: state/cache dirs on every run, the global config, versioned installs with the prefix/alias links, and executable node/npm shims that log their own calls. Any mise call during a dry run therefore changes the `HOME` snapshot. The `npm` on `PATH` is a stub that fails, so the tests prove that Claude Code goes through mise's shim. The tests cover:
 
 - platform detection;
 - the `--dry-run` plan on Bazzite and Pop!_OS, including checks that nothing was executed, mise was never run, and `HOME` is unchanged;
 - conflict backups and the bling-line warning, and hand-made links into the repo (no data loss, conflict reported);
 - stubbed real runs on Bazzite and Pop!_OS, each followed by a re-run, to confirm idempotence (mise installed once, Node pinned once, config unchanged);
-- mise edge cases: Node pinned but not installed, `node` outside `[tools]`, a leftover fnm, and a global config that resolves into the repo;
+- mise edge cases: a pin matching no installed version (pin 20, only 22 installed), a non-executable `node`, missing shims, `[tools.node]` tables, unparsed pins (never re-pinned), `node` outside `[tools]`, a leftover fnm, a global config that resolves into the repo or can't be resolved, and a failing mise, with Claude Code skipped and no `npm` used when Node isn't ready;
+- apt key download or dearmor failures on Pop!_OS;
 - sandbox guards, including brew prefixes and `HOME` that escape the sandbox through a symlink;
 - an rpm-ostree failure.
 
