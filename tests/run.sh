@@ -20,13 +20,28 @@ FAIL=0
 CURRENT=""
 
 # Core utilities the script (and the stubs) legitimately need.
-CORE_UTILS=(bash env cat grep sed find realpath dirname basename date mkdir mv cp rm ln chmod head tr sort mktemp touch readlink ls wc)
+CORE_UTILS=(bash env cat grep sed find realpath dirname basename date mkdir mv cp rm ln chmod head tr sort mktemp touch readlink ls wc python3)
 
 ALL_FORMULAE=(git git-delta stow neovim tmux jq ripgrep fd fzf bat wget gh starship zsh zsh-autosuggestions zsh-syntax-highlighting uv fnm)
 ALL_PACKAGES=(agy bash bat bin ghostty git nvim ripgrep ssh starship tmux zsh)
 
 # Calls that would change the machine. None may appear during --dry-run.
 MUTATING='^(sudo|apt-get|chsh|usermod|ujust|ssh-keygen|npm|curl|stow|systemctl|ubuntu-report|unzip|fc-cache)( |$)|^brew install|^rpm-ostree (install|upgrade|reboot)|^flatpak install|^git (clone|config)|^fnm (install|default)'
+
+# rpm-ostree status --json shapes. Deployments are listed newest first:
+# staged/pending, then booted, then rollback.
+BOOTED_ONLY='{"deployments":[{"booted":true,"requested-packages":[],"packages":[]}]}'
+PENDING_GHOSTTY='{"deployments":[{"booted":false,"staged":true,"requested-packages":["ghostty"],"packages":["ghostty"]},{"booted":true,"requested-packages":[]}]}'
+ROLLBACK_GHOSTTY='{"deployments":[{"booted":true,"requested-packages":[],"packages":[]},{"booted":false,"requested-packages":["ghostty"],"packages":["ghostty"]}]}'
+
+# Like real fnm, the stub leaves state behind whenever it runs (except --version):
+# env creates a multishell link, anything else creates its data dir.
+FNM_SIDE_EFFECTS='
+if [ "$1" != --version ]; then
+  mkdir -p "$HOME/.local/share/fnm/node-versions"
+  if [ "$1" = env ]; then mkdir -p "$HOME/.local/state/fnm_multishells"; ln -sfn / "$HOME/.local/state/fnm_multishells/$$"; fi
+fi
+'
 
 # ── Assertions ───────────────────────────────────────────────────────────────
 
@@ -71,12 +86,14 @@ setup() { # setup TEST_NAME
   export HOME="$SANDBOX/home" STUB_LOG="$LOG" STUB_STATE="$STATE"
   export LAPTOP_OSTREE_BOOTED="$SANDBOX/ostree-booted"
   export LAPTOP_YUM_REPOS_DIR="$SANDBOX/yum.repos.d"
+  # Never let the script find the host's Homebrew by its well-known paths.
+  export LAPTOP_BREW_DIRS="$SANDBOX/linuxbrew"
   export LAPTOP_OS_RELEASE="$SANDBOX/os-release"
   mkdir -p "$STUBS" "$STATE" "$SANDBOX/sysbin" "$HOME" "$LAPTOP_YUM_REPOS_DIR"
   : > "$LOG"
   : > "$STATE/brew-installed"
   : > "$STATE/rpm-installed"
-  echo '{"deployments":[{"booted":true,"requested-packages":[]}]}' > "$STATE/ostree-status"
+  echo "$BOOTED_ONLY" > "$STATE/ostree-status"
   touch "$LAPTOP_YUM_REPOS_DIR/terra.repo"
 
   local u
@@ -85,12 +102,13 @@ setup() { # setup TEST_NAME
   done
 
   stub sudo; stub apt-get; stub chsh; stub usermod; stub ujust; stub flatpak
-  stub systemctl; stub npm; stub curl; stub unzip; stub fc-cache
+  stub systemctl; stub npm; stub unzip; stub fc-cache
+  stub curl 'exit "${STUB_CURL_RC:-0}"' 
   stub dpkg 'exit 1'
   stub fc-list 'echo "/x/JetBrainsMonoNerdFont-Regular.ttf: JetBrainsMono Nerd Font:style=Regular"'
   stub git 'if [ "$1" = clone ]; then mkdir -p "$3/.git"; fi'
   stub ssh-keygen 'while [ $# -gt 0 ]; do [ "$1" = -f ] && { touch "$2" "$2.pub"; break; }; shift; done'
-  stub fnm 'case "$1" in --version) echo "fnm 1.0";; esac'
+  stub fnm "$FNM_SIDE_EFFECTS"'case "$1" in --version) echo "fnm 1.0";; esac'
   stub brew '
 case "$1" in
   list)     grep -qx -- "${!#}" "$STUB_STATE/brew-installed" ;;
@@ -103,7 +121,8 @@ esac'
 case "$1" in
   status)  cat "$STUB_STATE/ostree-status" ;;
   install) [ "${STUB_OSTREE_RC:-0}" = 0 ] || { echo "error: Checksum mismatch (terra)" >&2; exit 1; }
-           shift; for p; do [ "$p" = --idempotent ] || echo "{\"requested-packages\":[\"$p\"]}" >> "$STUB_STATE/ostree-status"; done ;;
+           shift; pkgs=""; for p; do [ "$p" = --idempotent ] || pkgs="${pkgs:+$pkgs,}\"$p\""; done
+           echo "{\"deployments\":[{\"staged\":true,\"booted\":false,\"requested-packages\":[$pkgs]},{\"booted\":true,\"requested-packages\":[]}]}" > "$STUB_STATE/ostree-status" ;;
 esac'
   # A minimal stow: links each file, and like real stow refuses to overwrite.
   stub stow '
@@ -160,7 +179,9 @@ all_done_fixture() {
   touch "$HOME/.ssh/id_ed25519"
   printf '#!%s\necho 1.1.0\n' "$SANDBOX/sysbin/bash" > "$HOME/.bun/bin/bun"; chmod +x "$HOME/.bun/bin/bun"
   stub claude
-  stub fnm 'case "$1" in list) echo "* v22.0.0 default, lts-latest";; --version) echo "fnm 1.0";; esac'
+  stub fnm "$FNM_SIDE_EFFECTS"'case "$1" in list) echo "* v22.0.0 default, lts-latest";; --version) echo "fnm 1.0";; esac'
+  mkdir -p "$HOME/.local/share/fnm/aliases"
+  touch "$HOME/.local/share/fnm/aliases/lts-latest"
   "$STUBS/stow" --dir="$HOME/Projects/Home/dotfiles" --target="$HOME" --restow "${ALL_PACKAGES[@]}"
   : > "$LOG"
 }
@@ -171,6 +192,10 @@ home_snapshot() {
 }
 
 run_linux() { # run_linux ARGS... — sets OUT and RC
+  case "${LAPTOP_BREW_DIRS:-}" in
+    "$SANDBOX"/*) ;;
+    *) echo "refusing to run: LAPTOP_BREW_DIRS is not inside the sandbox" >&2; exit 2 ;;
+  esac
   OUT="$(PATH="$STUBS:$SANDBOX/sysbin" SHELL=/bin/bash "$SANDBOX/sysbin/bash" "$SCRIPT" "$@" 2>&1)"
   RC=$?
   # shellcheck disable=SC2001 # a regex, not a fixed string
@@ -250,7 +275,7 @@ test_bazzite_dry_run_fresh() {
   check "stows every package" [ "$(grep -c '\[dry-run\] stow ' <<<"$OUT")" -eq "${#ALL_PACKAGES[@]}" ]
   check "never uses --adopt" lacks "$OUT" "--adopt"
   check "plans backup of conflicting ~/.bashrc" has "$OUT" "would back up ~/.bashrc"
-  check "backup is timestamped" has "$OUT" "\[dry-run\] mv $HOME/.bashrc $HOME/.local/state/laptop/backups/[0-9]{8}-[0-9]{6}/.bashrc"
+  check "backup is timestamped" has "$OUT" "\[dry-run\] mv -n $HOME/.bashrc $HOME/.local/state/laptop/backups/[0-9]{8}-[0-9]{6}\.X{6}/.bashrc"
   check "warns about the bling line" has "$OUT" ".bashrc contains the 'ujust bazzite-cli' bling line"
   check "no bling warning for clean ~/.zshrc" lacks "$OUT" ".zshrc contains the"
   check "does not back up a stow-ignored README" lacks "$OUT" "README"
@@ -258,6 +283,8 @@ test_bazzite_dry_run_fresh() {
   check "keeps bash as login shell" has "$OUT" "login shell stays bash"
   check "no apt/sudo/chsh/ujust/flatpak in plan" lacks "$OUT" "\[dry-run\] (sudo|apt-get|chsh|usermod|ujust|flatpak)"
   check "no mutating command was executed" log_lacks "$MUTATING"
+  check "fnm is not run at all (it creates state)" log_lacks '^fnm '
+  check "plans the LTS install instead" has "$OUT" "\[dry-run\] .*fnm install --lts"
   check "HOME is untouched" [ "$before" = "$(home_snapshot)" ]
   check "says nothing was changed" has "$OUT" "Dry run complete"
   teardown
@@ -276,6 +303,8 @@ test_bazzite_dry_run_all_done() {
   check "no reboot needed" lacks "$OUT" "Reboot required"
   check "no backups" lacks "$OUT" "back up"
   check "no ssh-keygen" lacks "$OUT" "ssh-keygen"
+  check "fnm is not run; LTS found on disk" [ "$(log_count '^fnm ')" -eq 0 ]
+  check "reports node lts installed" has "$OUT" "node lts already installed"
   check "no mutating command was executed" log_lacks "$MUTATING"
   teardown
 }
@@ -284,7 +313,7 @@ test_bazzite_dry_run_layered_pending() {
   setup "bazzite dry-run (ghostty layered, not rebooted)"
   bazzite
   dotfiles_fixture
-  echo '{"deployments":[{"booted":false,"requested-packages":["ghostty"]}]}' > "$STATE/ostree-status"
+  echo "$PENDING_GHOSTTY" > "$STATE/ostree-status"
   run_linux --dry-run
   check "does not layer again" lacks "$OUT" "rpm-ostree install"
   check "reports pending layer" has "$OUT" "ghostty already layered"
@@ -320,6 +349,134 @@ test_bazzite_symlinked_dirs() {
   check "refuses to move a file through a foreign dir link" has "$OUT" "\.config/nvim is a symlink to somewhere else"
   check "skips that package" has "$OUT" "skipped stowing nvim"
   check "does not plan stow for nvim" lacks "$OUT" "--restow nvim$"
+  teardown
+}
+
+test_bazzite_rollback_only() {
+  setup "bazzite dry-run (ghostty only in rollback)"
+  bazzite
+  dotfiles_fixture
+  echo "$ROLLBACK_GHOSTTY" > "$STATE/ostree-status"
+  run_linux --dry-run
+  check "rollback does not count as installed" lacks "$OUT" "ghostty already (installed|layered)"
+  check "plans layering ghostty" has "$OUT" '\[dry-run\] rpm-ostree install --idempotent ghostty$'
+  teardown
+
+  setup "bazzite dry-run (ghostty in booted deployment)"
+  bazzite
+  dotfiles_fixture
+  echo '{"deployments":[{"booted":true,"requested-packages":["ghostty"]}]}' > "$STATE/ostree-status"
+  run_linux --dry-run
+  check "booted layer counts as installed" has "$OUT" "ghostty already installed"
+  check "no rpm-ostree install" lacks "$OUT" "rpm-ostree install"
+  check "no reboot needed" lacks "$OUT" "Reboot required"
+  teardown
+
+  setup "bazzite dry-run (no python3 to read status)"
+  bazzite
+  dotfiles_fixture
+  rm "$SANDBOX/sysbin/python3"
+  echo "$PENDING_GHOSTTY" > "$STATE/ostree-status"
+  run_linux --dry-run
+  check "falls back to an idempotent install" has "$OUT" '\[dry-run\] rpm-ostree install --idempotent ghostty$'
+  teardown
+}
+
+test_bazzite_no_brew() {
+  setup "bazzite dry-run (no Homebrew)"
+  bazzite
+  dotfiles_fixture
+  rm "$STUBS/brew"
+  run_linux --dry-run
+  check "dry run does not stop" [ "$RC" -eq 0 ]
+  check "warns Homebrew is missing" has "$OUT" "Homebrew not found — a real run stops here"
+  check "still prints the brew plan" has "$OUT" "\[dry-run\] brew install git git-delta stow"
+  check "reaches the end" has "$OUT" "Dry run complete"
+  teardown
+
+  setup "bazzite dry-run (brew not on PATH, found in its prefix)"
+  bazzite
+  dotfiles_fixture
+  mkdir -p "$LAPTOP_BREW_DIRS/bin"
+  mv "$STUBS/brew" "$LAPTOP_BREW_DIRS/bin/brew"
+  run_linux --dry-run
+  check "loads brew shellenv from the prefix" log_has '^brew shellenv$'
+  check "no Homebrew warning" lacks "$OUT" "Homebrew not found"
+  teardown
+
+  setup "bazzite run (no Homebrew)"
+  bazzite
+  dotfiles_fixture
+  rm "$STUBS/brew"
+  run_linux
+  check "real run stops" [ "$RC" -ne 0 ]
+  check "says why" has "$OUT" "error: Homebrew not found"
+  check "changed nothing first" log_lacks "$MUTATING"
+  teardown
+}
+
+test_backup_timestamp_collision() {
+  setup "backups in the same second"
+  bazzite
+  dotfiles_fixture
+  stub date 'echo 20260101-000000'   # every run gets the same timestamp
+  echo "first bashrc" > "$HOME/.bashrc"
+  run_linux
+  rm "$HOME/.bashrc"
+  echo "second bashrc" > "$HOME/.bashrc"
+  run_linux
+  local dirs
+  dirs="$(find "$HOME/.local/state/laptop/backups" -mindepth 1 -maxdepth 1 -type d | wc -l)"
+  check "two runs get two backup dirs" [ "$dirs" -eq 2 ]
+  check "first backup survives" [ "$(grep -rlx 'first bashrc' "$HOME/.local/state/laptop/backups" | wc -l)" -eq 1 ]
+  check "second backup is kept too" [ "$(grep -rlx 'second bashrc' "$HOME/.local/state/laptop/backups" | wc -l)" -eq 1 ]
+  check "dirs are named after the timestamp" [ "$(find "$HOME/.local/state/laptop/backups" -maxdepth 1 -name '20260101-000000.*' | wc -l)" -eq 2 ]
+  teardown
+}
+
+test_backup_move_failure() {
+  setup "backup move fails"
+  bazzite
+  dotfiles_fixture
+  stub mv 'exit 1'
+  echo "keep me" > "$HOME/.bashrc"
+  run_linux
+  check "run completes" [ "$RC" -eq 0 ]
+  check "reports the failed move" has "$OUT" "could not move $HOME/.bashrc"
+  check "skips stowing that package" has "$OUT" "skipped stowing bash"
+  check "stow never ran for bash" log_lacks '^stow .* bash$'
+  check "other packages still stowed" log_has '^stow .* zsh$'
+  check "original file untouched" grep -qx "keep me" "$HOME/.bashrc"
+  check "not listed as backed up" lacks "$OUT" "backed up ~/.bashrc"
+  teardown
+}
+
+test_ancestor_file_conflict() {
+  setup "file where the package needs a directory"
+  bazzite
+  dotfiles_fixture
+  mkdir -p "$HOME/.config"
+  echo "a file, not a dir" > "$HOME/.config/nvim"
+  run_linux --dry-run
+  check "dry run plans backing up the ancestor" has "$OUT" "would back up ~/.config/nvim \("
+  check "only once" [ "$(grep -c 'would back up ~/.config/nvim ' <<<"$OUT")" -eq 1 ]
+  check "does not try the file below it" lacks "$OUT" "init.lua"
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "ancestor file backed up" [ "$(grep -rlx 'a file, not a dir' "$HOME/.local/state/laptop/backups" | wc -l)" -eq 1 ]
+  check "nvim is stowed" [ -L "$HOME/.config/nvim/init.lua" ]
+  check "no stow failure" lacks "$OUT" "stow failed"
+  teardown
+}
+
+test_run_sh_pipefail() {
+  setup "failed download piped into a shell"
+  bazzite
+  dotfiles_fixture
+  STUB_CURL_RC=22 run_linux   # curl fails, the `| bash` consumer succeeds
+  check "run fails" [ "$RC" -ne 0 ]
+  check "bun is not reported as installed" lacks "$OUT" "installed bun"
+  check "curl was attempted" log_has '^curl -fsSL https://bun.sh/install'
   teardown
 }
 
@@ -406,6 +563,12 @@ TESTS=(
   test_bazzite_dry_run_layered_pending
   test_bazzite_dry_run_no_terra
   test_bazzite_symlinked_dirs
+  test_bazzite_rollback_only
+  test_bazzite_no_brew
+  test_backup_timestamp_collision
+  test_backup_move_failure
+  test_ancestor_file_conflict
+  test_run_sh_pipefail
   test_bazzite_run_and_rerun
   test_bazzite_layer_failure
   test_debian_dry_run

@@ -17,12 +17,16 @@ HOME_PROJECTS_DIR="$HOME/Projects/Home"
 OS_RELEASE_FILE="${LAPTOP_OS_RELEASE:-/etc/os-release}"
 OSTREE_BOOTED_FILE="${LAPTOP_OSTREE_BOOTED:-/run/ostree-booted}"
 YUM_REPOS_DIR="${LAPTOP_YUM_REPOS_DIR:-/etc/yum.repos.d}"
+# Where to look for Homebrew when `brew` is not on PATH (space-separated).
+BREW_DIRS="${LAPTOP_BREW_DIRS:-/home/linuxbrew/.linuxbrew $HOME/.linuxbrew}"
 
 # Dotfiles packages to stow (one directory each in the dotfiles repo).
 STOW_PACKAGES=(agy bash bat bin ghostty git nvim ripgrep ssh starship tmux zsh)
 
-# Existing files that conflict with a stowed file are moved here, never adopted.
-BACKUP_DIR="$HOME/.local/state/laptop/backups/$(date +%Y%m%d-%H%M%S)"
+# Existing files that conflict with a stowed file are moved into a fresh,
+# uniquely named directory under here (created on first use), never adopted.
+BACKUP_ROOT="$HOME/.local/state/laptop/backups"
+BACKUP_DIR=""
 
 # The line `ujust bazzite-cli` appends to ~/.bashrc / ~/.zshrc.
 BLING_PATTERN='ublue-os/bling|bling\.sh'
@@ -60,6 +64,7 @@ LAYERED_PACKAGES=(
 )
 
 DRY_RUN=0
+BREW_MISSING=0
 BACKUPS=()
 WARNINGS=()
 REBOOT_PKGS=()
@@ -82,13 +87,14 @@ run() {
   "$@"
 }
 
-# Same as run, for a shell pipeline passed as one string.
+# Same as run, for a shell pipeline passed as one string. The child shell gets
+# the same -e -u -o pipefail as this script, so `curl ... | sh` fails when curl does.
 run_sh() {
   if (( DRY_RUN )); then
     printf "  \033[2m[dry-run]\033[0m %s\n" "$1"
     return 0
   fi
-  bash -c "$1"
+  bash -euo pipefail -c "$1"
 }
 
 # Print a success message only when something actually happened.
@@ -167,10 +173,16 @@ detect_os() {
 install_node() {
   local fnm="$1"
   step "Installing Node LTS via fnm"
-  if [ ! -x "$fnm" ]; then
-    # Only reachable under --dry-run, before fnm has been installed.
-    run "$fnm" install --lts
-    run "$fnm" default lts-latest
+  if (( DRY_RUN )); then
+    # fnm creates state (multishell links, its data dir) even for env/list, so
+    # under --dry-run it is not run at all; look for its lts alias on disk.
+    local fnm_dir="${FNM_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/fnm}"
+    if [ -e "$fnm_dir/aliases/lts-latest" ]; then
+      ok "node lts already installed via fnm ($fnm_dir)"
+    else
+      run "$fnm" install --lts
+      run "$fnm" default lts-latest
+    fi
     return 0
   fi
   eval "$("$fnm" env --shell bash)"
@@ -247,11 +259,65 @@ setup_ssh() {
   fi
 }
 
+# Create this run's backup directory on first use. mktemp makes it unique even
+# when two runs start in the same second.
+ensure_backup_dir() {
+  if [ -n "$BACKUP_DIR" ]; then
+    return 0
+  fi
+  local stamp
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  if (( DRY_RUN )); then
+    BACKUP_DIR="$BACKUP_ROOT/$stamp.XXXXXX"
+    return 0
+  fi
+  mkdir -p "$BACKUP_ROOT" || return 1
+  BACKUP_DIR="$(mktemp -d "$BACKUP_ROOT/$stamp.XXXXXX")" || { BACKUP_DIR=""; return 1; }
+}
+
+# Paths moved to the backup dir this run (under --dry-run: would be moved).
+declare -A BACKED_UP=()
+
+# True if $1 or one of its ancestors has been backed up this run.
+backed_up() {
+  local path="$1"
+  while [ "$path" != "$HOME" ] && [ "$path" != / ] && [ "$path" != . ]; do
+    [ -n "${BACKED_UP[$path]:-}" ] && return 0
+    path="$(dirname "$path")"
+  done
+  return 1
+}
+
 # Move an existing file out of stow's way into $BACKUP_DIR, keeping its path.
+# Never overwrites anything already in the backup dir. Returns non-zero, with a
+# warning, if the file could not be moved.
 backup_file() {
-  local target="$1" rel="$2" dest="$BACKUP_DIR/$2"
-  run mkdir -p "$(dirname "$dest")"
-  run mv "$target" "$dest"
+  local target="$1" rel="$2" dest
+  if ! ensure_backup_dir; then
+    warn "could not create a backup directory under $BACKUP_ROOT; not moving $target"
+    return 1
+  fi
+  dest="$BACKUP_DIR/$rel"
+  if [ -e "$dest" ] || [ -L "$dest" ]; then
+    warn "backup destination $dest already exists; not moving $target"
+    return 1
+  fi
+  if grep -Eqs "$BLING_PATTERN" "$target"; then
+    warn "$target contains the 'ujust bazzite-cli' bling line; it stays in the backup and will NOT be in the stowed file — add it to dotfiles if you want it"
+  fi
+  if ! run mkdir -p "$(dirname "$dest")"; then
+    warn "could not create $(dirname "$dest"); not moving $target"
+    return 1
+  fi
+  if ! run mv -n "$target" "$dest"; then
+    warn "could not move $target to $dest"
+    return 1
+  fi
+  if (( ! DRY_RUN )) && { [ -e "$target" ] || [ -L "$target" ] || { [ ! -e "$dest" ] && [ ! -L "$dest" ]; }; }; then
+    warn "moving $target to $dest did not take effect"
+    return 1
+  fi
+  BACKED_UP[$target]=1
   BACKUPS+=("$target -> $dest")
   if (( DRY_RUN )); then
     ok "would back up ~/$rel (conflicts with dotfiles)"
@@ -260,29 +326,52 @@ backup_file() {
   fi
 }
 
+# Check one file of a package: back up whatever in $HOME is in its way — the
+# target itself, or an ancestor that is a file where the package needs a
+# directory. Returns non-zero if the conflict cannot be resolved safely.
+resolve_conflict() {
+  local pkg_dir="$1" rel="$2" prefix="" part a
+  local -a parts
+  IFS=/ read -ra parts <<<"$rel"
+  for part in "${parts[@]:0:${#parts[@]}-1}"; do
+    prefix="${prefix:+$prefix/}$part"
+    a="$HOME/$prefix"
+    if backed_up "$a"; then
+      return 0 # already out of the way (under --dry-run it still exists)
+    fi
+    if [ -L "$a" ]; then
+      if [ "$(realpath "$a" 2>/dev/null)" = "$(realpath "$pkg_dir/$prefix")" ]; then
+        return 0 # folded by stow into this package
+      elif [ -d "$a" ]; then
+        warn "$a is a symlink to somewhere else; not touching $HOME/$rel — resolve by hand"
+        return 1
+      fi
+      backup_file "$a" "$prefix" || return 1 # link to a file, or dangling
+      return 0
+    elif [ -e "$a" ] && [ ! -d "$a" ]; then
+      backup_file "$a" "$prefix" || return 1 # file where a directory must go
+      return 0
+    elif [ ! -e "$a" ]; then
+      return 0 # nothing below here exists
+    fi
+  done
+
+  a="$HOME/$rel"
+  if [ ! -e "$a" ] && [ ! -L "$a" ]; then
+    return 0
+  fi
+  if backed_up "$a" || [ "$(realpath "$a" 2>/dev/null)" = "$(realpath "$pkg_dir/$rel")" ]; then
+    return 0 # already moved, or already stowed
+  fi
+  backup_file "$a" "$rel" || return 1
+}
+
 # Back up every file in $HOME that a package would be stowed over. Returns
-# non-zero if a conflict cannot be resolved safely (the package is skipped).
+# non-zero if any conflict could not be resolved (the package is then skipped).
 backup_conflicts() {
-  local pkg_dir="$DOTFILES_DIR/$1" home_real src rel target parent_rel
-  home_real=$(realpath "$HOME")
+  local pkg_dir="$DOTFILES_DIR/$1" src
   while IFS= read -r -d '' src; do
-    rel="${src#"$pkg_dir"/}"
-    target="$HOME/$rel"
-    if [ ! -e "$target" ] && [ ! -L "$target" ]; then
-      continue
-    fi
-    if [ "$(realpath "$target" 2>/dev/null)" = "$(realpath "$src")" ]; then
-      continue # already stowed
-    fi
-    parent_rel=$(dirname "$rel")
-    if [ "$parent_rel" != . ] && [ "$(realpath "$HOME/$parent_rel")" != "$home_real/$parent_rel" ]; then
-      warn "$HOME/$parent_rel is a symlink to somewhere else; not touching $target — resolve by hand"
-      return 1
-    fi
-    if grep -Eqs "$BLING_PATTERN" "$target"; then
-      warn "$target contains the 'ujust bazzite-cli' bling line; it stays in the backup and will NOT be in the stowed file — add it to dotfiles if you want it"
-    fi
-    backup_file "$target" "$rel"
+    resolve_conflict "$pkg_dir" "${src#"$pkg_dir"/}" || return 1
   done < <(find "$pkg_dir" \( -name .git -o -name 'README*' -o -name 'LICENSE*' -o -name COPYING -o -name .stow-local-ignore -o -name .gitignore \) -prune \
              -o \( -type f -o -type l \) -print0)
 }
@@ -469,12 +558,17 @@ ensure_brew() {
     return 0
   fi
   local dir
-  for dir in /home/linuxbrew/.linuxbrew "$HOME/.linuxbrew"; do
+  for dir in $BREW_DIRS; do
     if [ -x "$dir/bin/brew" ]; then
       eval "$("$dir/bin/brew" shellenv)"
       return 0
     fi
   done
+  if (( DRY_RUN )); then
+    warn "Homebrew not found — a real run stops here. Bazzite ships it; otherwise install it from https://brew.sh first"
+    BREW_MISSING=1
+    return 0
+  fi
   die "Homebrew not found. Bazzite ships it; otherwise install it from https://brew.sh and re-run."
 }
 
@@ -484,7 +578,9 @@ install_brew_formulae() {
   for entry in "${BREW_FORMULAE[@]}"; do
     formula="${entry%%:*}"
     bin="${entry#*:}"
-    if brew list --formula --versions "$formula" &>/dev/null; then
+    if (( BREW_MISSING )); then
+      missing+=("$formula") # only reachable under --dry-run
+    elif brew list --formula --versions "$formula" &>/dev/null; then
       ok "$formula already installed (brew)"
     elif [ -n "$bin" ] && cmd_exists "$bin"; then
       ok "$formula provided by the system ($(command -v "$bin")) — skipping"
@@ -498,15 +594,42 @@ install_brew_formulae() {
   fi
 }
 
+# Which deployment in `rpm-ostree status --json` ($2) layers package $1:
+# prints "booted", "pending" (a staged/pending deployment newer than the booted
+# one) or nothing. Rollback deployments (older than the booted one) don't count.
+# If the JSON cannot be read, prints nothing, so the caller falls back to
+# `rpm-ostree install --idempotent`, which is a no-op for requested packages.
+deployment_with() {
+  cmd_exists python3 || return 0
+  python3 -c '
+import json, sys
+pkg = sys.argv[1]
+try:
+    deps = json.load(sys.stdin).get("deployments") or []
+except ValueError:
+    sys.exit(0)
+booted = next((i for i, d in enumerate(deps) if d.get("booted")), None)
+if booted is None:
+    sys.exit(0)
+def has(d):
+    return pkg in (d.get("requested-packages") or []) + (d.get("packages") or [])
+if has(deps[booted]):
+    print("booted")
+elif any(has(d) for d in deps[:booted]):
+    print("pending")
+' "$1" <<<"$2" 2>/dev/null || true
+}
+
 # Layer LAYERED_PACKAGES in one rpm-ostree transaction. Never reboots.
 layer_packages() {
   step "Layering packages with rpm-ostree (${LAYERED_PACKAGES[*]})"
-  local pkg status_json pending=()
+  local pkg status_json where pending=()
   status_json="$(rpm-ostree status --json 2>/dev/null || true)"
   for pkg in "${LAYERED_PACKAGES[@]}"; do
-    if rpm -q "$pkg" &>/dev/null || cmd_exists "$pkg"; then
+    where="$(deployment_with "$pkg" "$status_json")"
+    if rpm -q "$pkg" &>/dev/null || cmd_exists "$pkg" || [ "$where" = booted ]; then
       ok "$pkg already installed"
-    elif grep -q "\"$pkg\"" <<<"$status_json"; then
+    elif [ "$where" = pending ]; then
       ok "$pkg already layered — active after the next reboot"
       REBOOT_PKGS+=("$pkg")
     else
@@ -559,7 +682,7 @@ install_atomic() {
   local ghostty_conf
   for ghostty_conf in "$DOTFILES_DIR"/ghostty/.config/ghostty/config*; do
     if [ -f "$ghostty_conf" ] && ! grep -Eq '^[[:space:]]*command[[:space:]]*=' "$ghostty_conf"; then
-      warn "${ghostty_conf#"$DOTFILES_DIR"/} has no 'command =' line — add 'command = $(brew --prefix)/bin/zsh' in dotfiles"
+      warn "${ghostty_conf#"$DOTFILES_DIR"/} has no 'command =' line — add 'command = ${HOMEBREW_PREFIX:-/home/linuxbrew/.linuxbrew}/bin/zsh' in dotfiles"
     fi
   done
 }

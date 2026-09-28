@@ -23,7 +23,7 @@ bash laptop/linux
 
 | Option | Effect |
 |---|---|
-| `-n`, `--dry-run` | Print every command that would run (installs, backups, stow, git config). Read-only checks still run so the plan is accurate. Nothing is changed. |
+| `-n`, `--dry-run` | Print every command that would run (installs, backups, stow, git config). Read-only checks (`brew list`, `rpm -q`, `rpm-ostree status`, `fc-list`, `dpkg -s`) still run so the plan is accurate. `fnm` is not run at all, because even `fnm env` creates state; the LTS check reads fnm's alias directory instead. Nothing is changed. |
 | `--print-os` | Print the detected platform (`debian` or `atomic`) and exit |
 | `-h`, `--help` | Usage |
 
@@ -55,16 +55,18 @@ On Bazzite, a Homebrew formula is skipped when the command is already on `PATH` 
 
 `--adopt` moves existing files *into* the dotfiles repo, which silently replaces your tracked configs with whatever the distro shipped. Instead, before stowing each package the script finds any existing file in `$HOME` that the package would replace, and:
 
-1. moves it to `~/.local/state/laptop/backups/<YYYYmmdd-HHMMSS>/<same path>`;
+1. moves it to `~/.local/state/laptop/backups/<YYYYmmdd-HHMMSS>.<random>/<same path>`. Each run gets its own directory (made with `mktemp -d`), so two runs in the same second never share one. The move uses `mv -n` and refuses a destination that already exists;
 2. lists it in the summary at the end of the run.
 
-Files that are already symlinks into the dotfiles repo are left alone. If a file sits under a directory that is a symlink to somewhere else, the script touches nothing and skips that package with a warning, so you can sort it out by hand. A package that fails to stow is reported as a warning; the script doesn't hide it.
+A conflict can also be an *ancestor*: for example `~/.config/nvim` is a regular file while the package needs `~/.config/nvim/init.lua`. The script backs up that file. Files that are already symlinks into the dotfiles repo, or directories stow has folded into the package, are left alone. If a backup fails (the directory can't be created, or the move fails or has no effect), the script warns and skips stowing that package. If a file sits under a directory that is a symlink to somewhere else, the script touches nothing and skips that package with a warning, so you can sort it out by hand. A package that fails to stow is reported as a warning; the script doesn't hide it.
 
 This applies to both platforms. The Ubuntu path used to run `stow --adopt ... 2>/dev/null || true`.
 
 ## Bazzite / Fedora Atomic
 
 Detected when `/etc/os-release` has `ID=bazzite`, or when `/run/ostree-booted` exists and the OS is Fedora (or `ID_LIKE` contains `fedora`). `/usr` is read-only there, so this path never uses `sudo`, apt, system keyrings or `chsh`.
+
+**Prerequisite: Homebrew.** Bazzite ships Homebrew in the image (`/home/linuxbrew/.linuxbrew`), so the script expects it and does not install it. If `brew` isn't on `PATH`, the script looks in the standard prefixes and loads `brew shellenv`. If it still can't find Homebrew, a real run stops with an error before changing anything. A `--dry-run` warns and prints the full plan anyway. On a Fedora Atomic image without Homebrew, install it from [brew.sh](https://brew.sh) first.
 
 ### Install-order rule
 
@@ -81,7 +83,7 @@ Every tool comes from the first source in this list that can provide it:
 |---|---|
 | `ghostty` | No Flatpak exists, and the Homebrew formula is macOS-only. Bazzite ships the [Terra](https://terra.fyralabs.com/) repo enabled, and Terra packages Ghostty. |
 
-All layered packages go into **one** `rpm-ostree install --idempotent` transaction. A package is skipped if it's already installed, or if it's already layered and waiting for a reboot. If `rpm-ostree` fails (Terra mirrors have served bad metadata or checksums before), the script says so, suggests `rpm-ostree refresh-md --force`, and moves on. It doesn't retry in a loop.
+All layered packages go into **one** `rpm-ostree install --idempotent` transaction. A package is skipped if it's already installed, or if it's already layered and waiting for a reboot. `rpm-ostree status --json` is read structurally with `python3`: a package counts only if it's in `requested-packages` or `packages` of the **booted** deployment or a **staged/pending** one (listed before the booted one). A package that exists only in the rollback deployment doesn't count. If the status can't be read, the script falls back to `rpm-ostree install --idempotent`, which does nothing for a package that's already requested. If `rpm-ostree` fails (Terra mirrors have served bad metadata or checksums before), the script says so, suggests `rpm-ostree refresh-md --force`, and moves on. It doesn't retry in a loop.
 
 ### Reboot
 
