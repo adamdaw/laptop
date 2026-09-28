@@ -326,6 +326,15 @@ backup_file() {
   fi
 }
 
+# True if $1 resolves to a path inside the dotfiles repo, i.e. a link stow owns
+# (possibly a directory it folded into another package of this repo).
+in_repo() {
+  local real repo
+  real="$(realpath "$1" 2>/dev/null)" || return 1
+  repo="$(realpath "$DOTFILES_DIR")"
+  [[ "$real" == "$repo"/* ]]
+}
+
 # Check one file of a package: back up whatever in $HOME is in its way — the
 # target itself, or an ancestor that is a file where the package needs a
 # directory. Returns non-zero if the conflict cannot be resolved safely.
@@ -342,6 +351,10 @@ resolve_conflict() {
     if [ -L "$a" ]; then
       if [ "$(realpath "$a" 2>/dev/null)" = "$(realpath "$pkg_dir/$prefix")" ]; then
         return 0 # folded by stow into this package
+      elif in_repo "$a"; then
+        # Folded into another package of this repo: stow unfolds it itself.
+        # Anything below it lives in the repo, so never move it.
+        return 0
       elif [ -d "$a" ]; then
         warn "$a is a symlink to somewhere else; not touching $HOME/$rel — resolve by hand"
         return 1
@@ -362,6 +375,9 @@ resolve_conflict() {
   fi
   if backed_up "$a" || [ "$(realpath "$a" 2>/dev/null)" = "$(realpath "$pkg_dir/$rel")" ]; then
     return 0 # already moved, or already stowed
+  fi
+  if [ -L "$a" ] && in_repo "$a"; then
+    return 0 # another package's link: stow's to resolve (it reports real clashes)
   fi
   backup_file "$a" "$rel" || return 1
 }
@@ -484,7 +500,11 @@ install_debian() {
   step "Installing fnm"
   local fnm_bin="$HOME/.local/share/fnm/fnm"
   if [ -x "$fnm_bin" ]; then
-    ok "fnm already installed ($("$fnm_bin" --version))"
+    if (( DRY_RUN )); then
+      ok "fnm already installed" # not run under --dry-run: fnm creates state
+    else
+      ok "fnm already installed ($("$fnm_bin" --version))"
+    fi
   else
     run_sh "curl -fsSL https://fnm.vercel.app/install | bash -s -- --skip-shell"
     did "installed fnm"
@@ -605,8 +625,9 @@ deployment_with() {
 import json, sys
 pkg = sys.argv[1]
 try:
-    deps = json.load(sys.stdin).get("deployments") or []
-except ValueError:
+    deps = json.load(sys.stdin)["deployments"]
+    assert isinstance(deps, list) and all(isinstance(d, dict) for d in deps)
+except Exception:
     sys.exit(0)
 booted = next((i for i, d in enumerate(deps) if d.get("booted")), None)
 if booted is None:

@@ -4,7 +4,9 @@
 #
 # Nothing real is installed: every external command the script can call is a
 # stub that logs its arguments, and PATH holds only those stubs plus a sandbox
-# of core utilities. HOME is a throwaway directory.
+# of core utilities. HOME is a throwaway directory. The script runs under
+# `env -i` with an allowlisted environment (see sandboxed), so exported shell
+# functions, BASH_ENV/ENV and host HOMEBREW_*/FNM_*/XDG_* settings never reach it.
 #
 # Usage: tests/run.sh
 
@@ -96,9 +98,13 @@ setup() { # setup TEST_NAME
   echo "$BOOTED_ONLY" > "$STATE/ostree-status"
   touch "$LAPTOP_YUM_REPOS_DIR/terra.repo"
 
-  local u
+  SANDBOX_REAL="$(realpath "$SANDBOX")"
+  mkdir -p "$SANDBOX/tmp"
+  # Resolve core utilities from the system dirs only, never from Homebrew.
+  local u path
   for u in "${CORE_UTILS[@]}"; do
-    ln -s "$(command -v "$u")" "$SANDBOX/sysbin/$u"
+    path="$(PATH=/usr/bin:/bin type -P "$u")" || { echo "missing core utility: $u" >&2; exit 2; }
+    ln -s "$path" "$SANDBOX/sysbin/$u"
   done
 
   stub sudo; stub apt-get; stub chsh; stub usermod; stub ujust; stub flatpak
@@ -113,8 +119,9 @@ setup() { # setup TEST_NAME
 case "$1" in
   list)     grep -qx -- "${!#}" "$STUB_STATE/brew-installed" ;;
   install)  shift; printf "%s\n" "$@" >> "$STUB_STATE/brew-installed" ;;
-  --prefix) echo /home/linuxbrew/.linuxbrew ;;
-  shellenv) : ;;
+  --prefix) cd "$(dirname "$0")/.." && pwd ;;
+  shellenv) p="$(cd "$(dirname "$0")/.." && pwd)"
+            echo "export HOMEBREW_PREFIX=\"$p\"; export PATH=\"$p/bin:\$PATH\";" ;;
 esac'
   stub rpm '[ "$1" = -q ] && grep -qx -- "$2" "$STUB_STATE/rpm-installed"'
   stub rpm-ostree '
@@ -124,7 +131,11 @@ case "$1" in
            shift; pkgs=""; for p; do [ "$p" = --idempotent ] || pkgs="${pkgs:+$pkgs,}\"$p\""; done
            echo "{\"deployments\":[{\"staged\":true,\"booted\":false,\"requested-packages\":[$pkgs]},{\"booted\":true,\"requested-packages\":[]}]}" > "$STUB_STATE/ostree-status" ;;
 esac'
-  # A minimal stow: links each file, and like real stow refuses to overwrite.
+  # A minimal stow that models folding: a directory missing from the target
+  # becomes one symlink into the package; a folded link owned by another
+  # package of the same stow dir is unfolded into a real directory. Like real
+  # stow it never overwrites anything it does not own, and never writes into
+  # the stow dir.
   stub stow '
 dir="" target="" pkgs=()
 for a; do
@@ -136,14 +147,36 @@ for a; do
     *) pkgs+=("$a") ;;
   esac
 done
-for p in "${pkgs[@]}"; do
-  while IFS= read -r f; do
-    f="${f#./}"; t="$target/$f"; s="$dir/$p/$f"
-    if [ -L "$t" ] && [ "$(readlink "$t")" = "$s" ]; then continue; fi
-    if [ -e "$t" ] || [ -L "$t" ]; then echo "stub stow: conflict on $t" >&2; exit 1; fi
-    mkdir -p "$(dirname "$t")"; ln -s "$s" "$t"
-  done < <(cd "$dir/$p" && find . \( -type f -o -type l \))
-done'
+repo="$(realpath "$dir")"
+conflict() { echo "stub stow: conflict on $1" >&2; exit 1; }
+same()  { [ "$(realpath "$1" 2>/dev/null)" = "$(realpath "$2")" ]; }
+owned() { local r; r="$(realpath "$1" 2>/dev/null)" || return 1; [[ "$r" == "$repo"/* ]]; }
+link_children() { # link_children REAL_DIR TARGET_DIR
+  local c
+  for c in "$1"/* "$1"/.[!.]*; do
+    if [ -e "$c" ] || [ -L "$c" ]; then ln -s "$c" "$2/${c##*/}"; fi
+  done
+}
+stow_dir() { # stow_dir SOURCE_DIR TARGET_DIR
+  local s t n old
+  for s in "$1"/* "$1"/.[!.]*; do
+    [ -e "$s" ] || [ -L "$s" ] || continue
+    n="${s##*/}"
+    case "$n" in README*|LICENSE*|COPYING|.git|.gitignore|.stow-local-ignore) continue ;; esac
+    t="$2/$n"
+    if [ -d "$s" ] && [ ! -L "$s" ]; then
+      if [ ! -e "$t" ] && [ ! -L "$t" ]; then ln -s "$s" "$t"          # fold
+      elif [ -L "$t" ] && same "$t" "$s"; then :
+      elif [ -L "$t" ] && [ -d "$t" ] && owned "$t"; then            # unfold
+        old="$(realpath "$t")"; rm "$t"; mkdir "$t"; link_children "$old" "$t"; stow_dir "$s" "$t"
+      elif [ -d "$t" ] && [ ! -L "$t" ]; then stow_dir "$s" "$t"
+      else conflict "$t"; fi
+    elif [ -L "$t" ] && same "$t" "$s"; then :
+    elif [ -e "$t" ] || [ -L "$t" ]; then conflict "$t"
+    else ln -s "$s" "$t"; fi
+  done
+}
+for p in "${pkgs[@]}"; do stow_dir "$dir/$p" "$target"; done'
 }
 
 teardown() { rm -rf "$SANDBOX"; }
@@ -182,7 +215,7 @@ all_done_fixture() {
   stub fnm "$FNM_SIDE_EFFECTS"'case "$1" in list) echo "* v22.0.0 default, lts-latest";; --version) echo "fnm 1.0";; esac'
   mkdir -p "$HOME/.local/share/fnm/aliases"
   touch "$HOME/.local/share/fnm/aliases/lts-latest"
-  "$STUBS/stow" --dir="$HOME/Projects/Home/dotfiles" --target="$HOME" --restow "${ALL_PACKAGES[@]}"
+  sandboxed "$STUBS/stow" --dir="$HOME/Projects/Home/dotfiles" --target="$HOME" --restow "${ALL_PACKAGES[@]}"
   : > "$LOG"
 }
 
@@ -191,12 +224,57 @@ home_snapshot() {
    find . -type f -exec cat {} + 2>/dev/null)
 }
 
+repo_snapshot() {
+  (cd "$HOME/Projects/Home/dotfiles" && find . -printf '%p %y %s %l\n' | sort
+   find . -type f -exec cat {} + 2>/dev/null)
+}
+
+# True if $1 is a path inside the sandbox once canonicalised. Rejects any
+# ".." component outright rather than trusting it to resolve inwards.
+inside_sandbox() {
+  case "/$1/" in */../*) return 1 ;; esac
+  [ -n "$1" ] && [[ "$(realpath -m -- "$1")" == "$SANDBOX_REAL"/* ]]
+}
+
+# Every path the script is told about must be inside the sandbox.
+guard_sandbox() {
+  local entry n=0
+  for entry in ${LAPTOP_BREW_DIRS:-}; do
+    n=$((n + 1))
+    inside_sandbox "$entry" || { echo "guard: LAPTOP_BREW_DIRS entry outside sandbox: $entry" >&2; return 1; }
+  done
+  [ "$n" -ge 1 ] || { echo "guard: LAPTOP_BREW_DIRS is empty" >&2; return 1; }
+  for entry in "$HOME" "$LAPTOP_OS_RELEASE" "$LAPTOP_OSTREE_BOOTED" "$LAPTOP_YUM_REPOS_DIR" "$STUB_LOG" "$STUB_STATE"; do
+    inside_sandbox "$entry" || { echo "guard: path outside sandbox: $entry" >&2; return 1; }
+  done
+}
+
+# Run a command with only the allowlisted environment: no inherited
+# variables, exported functions, BASH_ENV/ENV, or host tool settings.
+sandboxed() {
+  guard_sandbox || { echo "refusing to run outside the sandbox" >&2; exit 2; }
+  local v
+  local -a vars=(
+    PATH="$STUBS:$SANDBOX/sysbin" HOME="$HOME" USER=tester LOGNAME=tester
+    LANG=C.UTF-8 TERM=dumb SHELL=/bin/bash TMPDIR="$SANDBOX/tmp"
+    XDG_CONFIG_HOME="$HOME/.config" XDG_DATA_HOME="$HOME/.local/share"
+    XDG_STATE_HOME="$HOME/.local/state" XDG_CACHE_HOME="$HOME/.cache"
+    HOMEBREW_PREFIX="$SANDBOX/homebrew-env" HOMEBREW_CELLAR="$SANDBOX/homebrew-env/Cellar"
+    HOMEBREW_REPOSITORY="$SANDBOX/homebrew-env" HOMEBREW_NO_AUTO_UPDATE=1
+    FNM_DIR="$HOME/.local/share/fnm"
+    LAPTOP_OS_RELEASE="$LAPTOP_OS_RELEASE" LAPTOP_OSTREE_BOOTED="$LAPTOP_OSTREE_BOOTED"
+    LAPTOP_YUM_REPOS_DIR="$LAPTOP_YUM_REPOS_DIR" LAPTOP_BREW_DIRS="$LAPTOP_BREW_DIRS"
+    STUB_LOG="$STUB_LOG" STUB_STATE="$STUB_STATE"
+  )
+  for v in STUB_CURL_RC STUB_OSTREE_RC; do
+    if [ -n "${!v:-}" ]; then vars+=("$v=${!v}"); fi
+  done
+  "$SANDBOX/sysbin/env" -i "${vars[@]}" "$@"
+}
+
 run_linux() { # run_linux ARGS... — sets OUT and RC
-  case "${LAPTOP_BREW_DIRS:-}" in
-    "$SANDBOX"/*) ;;
-    *) echo "refusing to run: LAPTOP_BREW_DIRS is not inside the sandbox" >&2; exit 2 ;;
-  esac
-  OUT="$(PATH="$STUBS:$SANDBOX/sysbin" SHELL=/bin/bash "$SANDBOX/sysbin/bash" "$SCRIPT" "$@" 2>&1)"
+  guard_sandbox || { echo "refusing to run outside the sandbox" >&2; exit 2; }
+  OUT="$(sandboxed "$SANDBOX/sysbin/bash" "$SCRIPT" "$@" 2>&1)"
   RC=$?
   # shellcheck disable=SC2001 # a regex, not a fixed string
   OUT="$(sed $'s/\x1b\\[[0-9;]*m//g' <<<"$OUT")" # drop colours
@@ -399,9 +477,13 @@ test_bazzite_no_brew() {
   dotfiles_fixture
   mkdir -p "$LAPTOP_BREW_DIRS/bin"
   mv "$STUBS/brew" "$LAPTOP_BREW_DIRS/bin/brew"
+  echo git > "$STATE/brew-installed"
   run_linux --dry-run
+  check "brew list answered via PATH" has "$OUT" "git already installed \(brew\)"
   check "loads brew shellenv from the prefix" log_has '^brew shellenv$'
   check "no Homebrew warning" lacks "$OUT" "Homebrew not found"
+  check "shellenv PATH is applied (brew found on PATH)" log_has '^brew list'
+  check "shellenv HOMEBREW_PREFIX is applied" has "$OUT" "command = $LAPTOP_BREW_DIRS/bin/zsh"
   teardown
 
   setup "bazzite run (no Homebrew)"
@@ -464,7 +546,7 @@ test_ancestor_file_conflict() {
   run_linux
   check "run exits 0" [ "$RC" -eq 0 ]
   check "ancestor file backed up" [ "$(grep -rlx 'a file, not a dir' "$HOME/.local/state/laptop/backups" | wc -l)" -eq 1 ]
-  check "nvim is stowed" [ -L "$HOME/.config/nvim/init.lua" ]
+  check "nvim is stowed" [ "$(realpath "$HOME/.config/nvim/init.lua")" = "$(realpath "$HOME/Projects/Home/dotfiles/nvim/.config/nvim/init.lua")" ]
   check "no stow failure" lacks "$OUT" "stow failed"
   teardown
 }
@@ -478,6 +560,144 @@ test_run_sh_pipefail() {
   check "bun is not reported as installed" lacks "$OUT" "installed bun"
   check "curl was attempted" log_has '^curl -fsSL https://bun.sh/install'
   teardown
+}
+
+test_folded_into_other_package() {
+  setup ".config folded into agy (other package)"
+  bazzite
+  dotfiles_fixture
+  local d="$HOME/Projects/Home/dotfiles"
+  ln -s Projects/Home/dotfiles/agy/.config "$HOME/.config"   # relative, as stow makes it
+  local repo_before; repo_before="$(repo_snapshot)"
+  run_linux --dry-run
+  check "dry run: not treated as foreign" lacks "$OUT" "is a symlink to somewhere else"
+  check "dry run: no package skipped" lacks "$OUT" "skipped stowing"
+  check "dry run: nothing to back up" lacks "$OUT" "back up"
+  check "dry run: bat planned" has "$OUT" "\[dry-run\] stow .* --restow bat$"
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "no package skipped" lacks "$OUT" "skipped stowing"
+  check "no stow failure" lacks "$OUT" "stow failed"
+  check "stow ran for bat" log_has '^stow .* bat$'
+  check "bat config resolves into bat" [ "$(realpath "$HOME/.config/bat/config")" = "$(realpath "$d/bat/.config/bat/config")" ]
+  check "agy config still resolves into agy" [ "$(realpath "$HOME/.config/agy/permissions.json")" = "$(realpath "$d/agy/.config/agy/permissions.json")" ]
+  check ".config was unfolded into a real dir" [ -d "$HOME/.config" ] && [ ! -L "$HOME/.config" ]
+  check "repo contents unchanged" [ "$repo_before" = "$(repo_snapshot)" ]
+  check "no backups made" [ ! -e "$HOME/.local/state/laptop/backups" ]
+  teardown
+}
+
+test_isolation_sentinels() {
+  setup "exported brew function cannot bypass stubs"
+  bazzite
+  dotfiles_fixture
+  # If isolation failed, these would run instead of the stubs; they only
+  # write a sentinel file, so a failure here is harmless.
+  eval "brew() { echo exported-function >> '$SANDBOX/bypass'; }"
+  export -f brew
+  run_linux --dry-run
+  unset -f brew
+  check "exported function never ran" [ ! -e "$SANDBOX/bypass" ]
+  check "the brew stub ran instead" log_has '^brew list'
+  teardown
+
+  setup "BASH_ENV / ENV cannot bypass stubs"
+  bazzite
+  dotfiles_fixture
+  printf 'echo sourced >> %q\nbrew() { echo bash-env >> %q; }\n' "$SANDBOX/bypass" "$SANDBOX/bypass" > "$SANDBOX/startup.sh"
+  BASH_ENV="$SANDBOX/startup.sh" ENV="$SANDBOX/startup.sh" run_linux --dry-run
+  check "startup file never sourced" [ ! -e "$SANDBOX/bypass" ]
+  check "the brew stub ran instead" log_has '^brew list'
+  teardown
+
+  setup "host tool settings do not leak"
+  bazzite
+  dotfiles_fixture
+  HOMEBREW_PREFIX=/home/linuxbrew/.linuxbrew FNM_DIR=/nonexistent/fnm XDG_DATA_HOME=/nonexistent run_linux --dry-run
+  check "HOMEBREW_PREFIX is the sandbox one" has "$OUT" "command = $SANDBOX/homebrew-env/bin/zsh"
+  check "no host prefix in output" lacks "$OUT" "/home/linuxbrew"
+  teardown
+
+  setup "guard rejects paths outside the sandbox"
+  bazzite
+  local bad
+  for bad in "/home/linuxbrew/.linuxbrew" "$SANDBOX/linuxbrew /home/linuxbrew/.linuxbrew" \
+             "$SANDBOX/../escape" "$SANDBOX/linuxbrew $HOME/../../x" ""; do
+    ( LAPTOP_BREW_DIRS="$bad"; guard_sandbox 2>/dev/null )
+    check "rejects LAPTOP_BREW_DIRS='${bad//$SANDBOX/<sandbox>}'" [ $? -ne 0 ]
+  done
+  ( LAPTOP_BREW_DIRS="$SANDBOX/a $SANDBOX/b"; guard_sandbox )
+  check "accepts several sandbox entries" [ $? -eq 0 ]
+  HOME=/var/home/somebody guard_sandbox 2>/dev/null
+  check "rejects a host HOME" [ $? -ne 0 ]
+  ( LAPTOP_BREW_DIRS=/home/linuxbrew/.linuxbrew; run_linux --dry-run ) >/dev/null 2>&1
+  check "run_linux refuses to start" [ $? -eq 2 ]
+  check "script never ran" [ ! -s "$LOG" ]
+  teardown
+}
+
+test_backup_edge_cases() {
+  setup "mv reports success without moving"
+  bazzite
+  dotfiles_fixture
+  stub mv 'exit 0'
+  echo "keep me" > "$HOME/.bashrc"
+  run_linux
+  check "detects the no-op move" has "$OUT" "moving $HOME/.bashrc to .* did not take effect"
+  check "skips stowing bash" has "$OUT" "skipped stowing bash"
+  check "original untouched" grep -qx "keep me" "$HOME/.bashrc"
+  check "not listed as backed up" lacks "$OUT" "backed up ~/.bashrc"
+  teardown
+
+  setup "backup destination already occupied"
+  bazzite
+  dotfiles_fixture
+  mkdir -p "$STATE/fixed-backup"
+  echo "older backup" > "$STATE/fixed-backup/.bashrc"
+  stub mktemp 'if [ "$1" = -d ]; then echo "$STUB_STATE/fixed-backup"; else exec "$STUB_STATE/../sysbin/mktemp" "$@"; fi'
+  echo "current" > "$HOME/.bashrc"
+  run_linux
+  check "refuses the occupied destination" has "$OUT" "backup destination $STATE/fixed-backup/.bashrc already exists"
+  check "skips stowing bash" has "$OUT" "skipped stowing bash"
+  check "older backup untouched" grep -qx "older backup" "$STATE/fixed-backup/.bashrc"
+  check "current file untouched" grep -qx "current" "$HOME/.bashrc"
+  teardown
+
+  setup "backup dir cannot be created"
+  bazzite
+  dotfiles_fixture
+  mkdir -p "$HOME/.local/state/laptop"
+  echo "not a dir" > "$HOME/.local/state/laptop/backups"
+  echo "current" > "$HOME/.bashrc"
+  run_linux
+  check "reports it" has "$OUT" "could not create a backup directory"
+  check "skips stowing bash" has "$OUT" "skipped stowing bash"
+  check "current file untouched" grep -qx "current" "$HOME/.bashrc"
+  check "run still completes" [ "$RC" -eq 0 ]
+  teardown
+}
+
+test_rpm_ostree_status_shapes() {
+  setup "bazzite dry-run (pending, not staged)"
+  bazzite
+  dotfiles_fixture
+  echo '{"deployments":[{"booted":false,"staged":false,"requested-packages":["ghostty"]},{"booted":true,"requested-packages":[]}]}' > "$STATE/ostree-status"
+  run_linux --dry-run
+  check "unstaged pending counts as layered" has "$OUT" "ghostty already layered"
+  check "no rpm-ostree install" lacks "$OUT" "rpm-ostree install"
+  teardown
+
+  local shape
+  for shape in 'not json {' '[]' '{"deployments":"x"}' '{"deployments":[1,2]}'; do
+    setup "bazzite dry-run (malformed status: $shape)"
+    bazzite
+    dotfiles_fixture
+    echo "$shape" > "$STATE/ostree-status"
+    run_linux --dry-run
+    check "exits 0" [ "$RC" -eq 0 ]
+    check "falls back to an idempotent install" has "$OUT" '\[dry-run\] rpm-ostree install --idempotent ghostty$'
+    teardown
+  done
 }
 
 # ── Tests: Bazzite stubbed run ───────────────────────────────────────────────
@@ -569,6 +789,10 @@ TESTS=(
   test_backup_move_failure
   test_ancestor_file_conflict
   test_run_sh_pipefail
+  test_folded_into_other_package
+  test_isolation_sentinels
+  test_backup_edge_cases
+  test_rpm_ostree_status_shapes
   test_bazzite_run_and_rerun
   test_bazzite_layer_failure
   test_debian_dry_run

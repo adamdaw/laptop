@@ -23,7 +23,7 @@ bash laptop/linux
 
 | Option | Effect |
 |---|---|
-| `-n`, `--dry-run` | Print every command that would run (installs, backups, stow, git config). Read-only checks (`brew list`, `rpm -q`, `rpm-ostree status`, `fc-list`, `dpkg -s`) still run so the plan is accurate. `fnm` is not run at all, because even `fnm env` creates state; the LTS check reads fnm's alias directory instead. Nothing is changed. |
+| `-n`, `--dry-run` | Print every command that would run (installs, backups, stow, git config). Read-only checks (`brew list`, `rpm -q`, `rpm-ostree status`, `fc-list`, `dpkg -s`) still run so the plan is accurate. `fnm` is never executed during a dry run on either platform, not even `fnm env` or `fnm --version`, because fnm creates state. The LTS check reads fnm's alias directory instead. Nothing is changed. |
 | `--print-os` | Print the detected platform (`debian` or `atomic`) and exit |
 | `-h`, `--help` | Usage |
 
@@ -58,7 +58,7 @@ On Bazzite, a Homebrew formula is skipped when the command is already on `PATH` 
 1. moves it to `~/.local/state/laptop/backups/<YYYYmmdd-HHMMSS>.<random>/<same path>`. Each run gets its own directory (made with `mktemp -d`), so two runs in the same second never share one. The move uses `mv -n` and refuses a destination that already exists;
 2. lists it in the summary at the end of the run.
 
-A conflict can also be an *ancestor*: for example `~/.config/nvim` is a regular file while the package needs `~/.config/nvim/init.lua`. The script backs up that file. Files that are already symlinks into the dotfiles repo, or directories stow has folded into the package, are left alone. If a backup fails (the directory can't be created, or the move fails or has no effect), the script warns and skips stowing that package. If a file sits under a directory that is a symlink to somewhere else, the script touches nothing and skips that package with a warning, so you can sort it out by hand. A package that fails to stow is reported as a warning; the script doesn't hide it.
+A conflict can also be an *ancestor*: for example `~/.config/nvim` is a regular file while the package needs `~/.config/nvim/init.lua`. The script backs up that file. Files that are already symlinks into the dotfiles repo are left alone. So are directories stow has folded into this package or into *another* package of the same repo (e.g. `~/.config` → `agy/.config`); stow unfolds those itself, and nothing inside the repo is ever moved. If a backup fails (the directory can't be created, or the move fails or has no effect), the script warns and skips stowing that package. If a file sits under a directory that is a symlink to somewhere else, the script touches nothing and skips that package with a warning, so you can sort it out by hand. A package that fails to stow is reported as a warning; the script doesn't hide it.
 
 This applies to both platforms. The Ubuntu path used to run `stow --adopt ... 2>/dev/null || true`.
 
@@ -145,7 +145,7 @@ shellcheck linux tests/run.sh
 tests/run.sh
 ```
 
-`tests/run.sh` is a plain-bash harness that installs nothing. It runs `linux` with a throwaway `HOME` and a `PATH` of logging stubs (brew, rpm-ostree, stow, apt-get, sudo, …). The tests cover:
+`tests/run.sh` is a plain-bash harness that installs nothing. The script runs under `env -i` with an allowlisted environment: sandbox `PATH`, `HOME`, `XDG_*`, `HOMEBREW_*` and `FNM_*`, and no exported functions or `BASH_ENV`/`ENV`. A guard refuses to start if any path it passes (including every `LAPTOP_BREW_DIRS` entry) is outside the sandbox. It runs `linux` with a throwaway `HOME` and a `PATH` of logging stubs (brew, rpm-ostree, stow, apt-get, sudo, …). The tests cover:
 
 - platform detection;
 - the `--dry-run` plan on Bazzite and Pop!_OS, including checks that nothing was executed and that `HOME` is unchanged;
