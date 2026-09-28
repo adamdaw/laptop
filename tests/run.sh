@@ -38,60 +38,102 @@ ROLLBACK_GHOSTTY='{"deployments":[{"booted":true,"requested-packages":[],"packag
 
 # A mise that models its filesystem side effects. Like real mise, every
 # invocation leaves state and cache dirs behind; `use -g node@lts` writes the
-# global config and installs node; `install node` installs the pinned version;
-# `reshim` rewrites the shims. Installs and shims are made by node-install
-# (see write_node_install). It resolves its dirs from the same MISE_*/XDG_*
-# variables as real mise. STUB_MISE_RC makes use/install fail.
+# global config and installs node; `install node` installs the pinned version
+# (a no-op if it is already installed, shims included); `reshim` rebuilds the
+# shims from what is installed. Installs and shims come from node-install (see
+# write_node_install). It resolves its dirs from the same MISE_*/XDG_*
+# variables as real mise. STUB_MISE_RC makes use/install fail and
+# STUB_RESHIM_RC makes reshim fail.
 MISE_SIDE_EFFECTS='
-data="${MISE_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/mise}"
 conf="${MISE_GLOBAL_CONFIG_FILE:-${MISE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/mise}/config.toml}"
 mkdir -p "${XDG_STATE_HOME:-$HOME/.local/state}/mise" "${XDG_CACHE_HOME:-$HOME/.cache}/mise"
-pinned() { sed -nE "s/^[[:space:]]*\"?(core:)?(node|version)\"?[[:space:]]*=[[:space:]]*\"([^\"]*)\".*/\3/p" "$conf" 2>/dev/null | head -1; }
 case "$*" in
   --version)         echo "2026.9.0 linux-x64 (stub)" ;;
   "use -g node@lts") [ "${STUB_MISE_RC:-0}" = 0 ] || exit "$STUB_MISE_RC"
                      mkdir -p "${conf%/*}"; printf "[tools]\nnode = \"lts\"\n" >> "$conf"
                      "$STUB_STATE/node-install" lts ;;
   "install node")    [ "${STUB_MISE_RC:-0}" = 0 ] || exit "$STUB_MISE_RC"
-                     "$STUB_STATE/node-install" "$(pinned)" ;;
-  reshim)            "$STUB_STATE/node-install" --shims-only ;;
+                     "$STUB_STATE/node-install" "$("$STUB_STATE/node-install" --pin)" ;;
+  reshim)            [ "${STUB_RESHIM_RC:-0}" = 0 ] || exit "$STUB_RESHIM_RC"
+                     "$STUB_STATE/node-install" --reshim ;;
   *)                 echo "stub mise: unexpected: $*" >&2; exit 2 ;;
 esac'
 
-# What `mise install` leaves on disk for node: installs/node/<version>/bin/
-# {node,npm}, the prefix and alias symlinks mise makes (22, 22.12, lts,
-# latest), and executable shims. Every node/npm logs as "mise-<where>-<tool>",
-# so a call through mise's shims is told apart from the PATH npm stub (which
-# fails). `npm install -g @anthropic-ai/claude-code` also adds a claude shim.
+# node-install models what mise leaves on disk for node:
+#   node-install SEL   install the version SEL resolves to (installs/node/<v>/bin
+#                      with node and npm, plus the prefix/alias links mise makes:
+#                      22, 22.12, and lts/latest for 22.12.0), then reshim — only
+#                      if that version wasn't installed yet. NODE_NO_ALIAS=1 skips
+#                      the lts/latest links.
+#   --reshim           one shim per executable in any installed version's bin
+#   --pin / --which    the config's node selection / the version it resolves to
+# Each tool logs as "mise-<version>-<tool>" and each shim as "mise-shim-<tool>";
+# a shim runs the pinned version's tool, as mise's shims do. The versioned
+# npm's `install -g @anthropic-ai/claude-code` adds claude to that bin dir, not
+# a shim: only reshim exposes it.
 write_node_install() {
   cat > "$STATE/node-install" <<'EOF'
 #!@BASH@
 data="${MISE_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/mise}"
+conf="${MISE_GLOBAL_CONFIG_FILE:-${MISE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/mise}/config.toml}"
 dir="$data/installs/node"
+resolve() {
+  case "$1" in
+    ""|lts|latest|22|22.*) echo 22.12.0 ;;
+    20|20.*)               echo 20.18.1 ;;
+    *)                     echo "$1" ;;
+  esac
+}
+pin() {
+  python3 -I -c '
+import sys, tomllib
+try:
+    v = tomllib.load(open(sys.argv[1], "rb")).get("tools", {}).get("node", "")
+except Exception:
+    v = ""
+if isinstance(v, dict): v = v.get("version", "")
+if isinstance(v, list): v = v[0] if v else ""
+print(v)' "$conf"
+}
 tool() { # tool PATH LABEL
   cat > "$1" <<TOOL
 #!@BASH@
 printf '%s\n' "mise-$2 \$*" >> "\$STUB_LOG"
 if [ "\$*" = "install -g @anthropic-ai/claude-code" ]; then
-  printf '#!@BASH@\n' > "$data/shims/claude"; chmod +x "$data/shims/claude"
+  printf '#!@BASH@\nexit 0\n' > "\${0%/*}/claude"; chmod +x "\${0%/*}/claude"
 fi
 TOOL
   chmod +x "$1"
 }
-mkdir -p "$data/shims"
-tool "$data/shims/node" shim-node
-tool "$data/shims/npm" shim-npm
-[ "$1" = --shims-only ] && exit 0
+reshim() {
+  local b n
+  rm -rf "$data/shims"; mkdir -p "$data/shims"
+  for b in "$dir"/*/bin/*; do
+    [ -x "$b" ] && [ ! -L "${b%/bin/*}" ] || continue
+    n="${b##*/}"
+    cat > "$data/shims/$n" <<SHIM
+#!@BASH@
+printf '%s\n' "mise-shim-$n \$*" >> "\$STUB_LOG"
+v="\$("$0" --which)"
+[ -x "$dir/\$v/bin/$n" ] || { echo "mise: $n is not installed for node \$v" >&2; exit 127; }
+exec "$dir/\$v/bin/$n" "\$@"
+SHIM
+    chmod +x "$data/shims/$n"
+  done
+}
 case "$1" in
-  ""|lts|latest|22|22.*) v=22.12.0 ;;
-  20|20.*)               v=20.18.1 ;;
-  *)                     v="$1" ;;
+  --pin)    pin; exit 0 ;;
+  --which)  resolve "$(pin)"; exit 0 ;;
+  --reshim) reshim; exit 0 ;;
 esac
+v="$(resolve "$1")"
+[ -x "$dir/$v/bin/node" ] && exit 0 # already installed: nothing to do
 mkdir -p "$dir/$v/bin"
 tool "$dir/$v/bin/node" "$v-node"
 tool "$dir/$v/bin/npm" "$v-npm"
 ln -sfn "$v" "$dir/${v%%.*}"; ln -sfn "$v" "$dir/${v%.*}"
-if [ "$v" = 22.12.0 ]; then ln -sfn "$v" "$dir/lts"; ln -sfn "$v" "$dir/latest"; fi
+if [ "$v" = 22.12.0 ] && [ -z "${NODE_NO_ALIAS:-}" ]; then ln -sfn "$v" "$dir/lts"; ln -sfn "$v" "$dir/latest"; fi
+reshim
 EOF
   sed -i "s|@BASH@|$SANDBOX/sysbin/bash|g" "$STATE/node-install"
   chmod +x "$STATE/node-install"
@@ -342,7 +384,7 @@ sandboxed() {
     LAPTOP_YUM_REPOS_DIR="$LAPTOP_YUM_REPOS_DIR" LAPTOP_BREW_DIRS="$LAPTOP_BREW_DIRS"
     STUB_LOG="$STUB_LOG" STUB_STATE="$STUB_STATE"
   )
-  for v in STUB_CURL_RC STUB_CURL_FAIL STUB_GPG_RC STUB_MISE_RC STUB_OSTREE_RC; do
+  for v in STUB_CURL_RC STUB_CURL_FAIL STUB_GPG_RC STUB_MISE_RC STUB_RESHIM_RC STUB_OSTREE_RC; do
     if [ -n "${!v:-}" ]; then vars+=("$v=${!v}"); fi
   done
   "$SANDBOX/sysbin/env" -i "${vars[@]}" "$@"
@@ -461,7 +503,7 @@ test_bazzite_dry_run_all_done() {
   check "no backups" lacks "$OUT" "back up"
   check "no ssh-keygen" lacks "$OUT" "ssh-keygen"
   check "mise is not run; node found on disk" [ "$(log_count '^mise ')" -eq 0 ]
-  check "reports node installed via mise" has "$OUT" 'node already installed via mise \(node = "lts" in '
+  check "reports node installed via mise" has "$OUT" 'node already installed via mise \(tools.node = lts in '
   check "no mise use/install planned" lacks "$OUT" "\[dry-run\] mise "
   check "no mutating command was executed" log_lacks "$MUTATING"
   teardown
@@ -719,7 +761,40 @@ test_node_readiness() {
   run_linux
   check "not counted as ready" lacks "$OUT" "node already installed"
   check "reshims after install" logged_before '^mise install node$' '^mise reshim$'
-  check "claude through the new shim" log_has '^mise-shim-npm install -g @anthropic-ai/claude-code$'
+  check "shims restored (install alone is a no-op)" [ -x "$HOME/.local/share/mise/shims/npm" ]
+  check "claude through the restored shim" log_has '^mise-shim-npm install -g @anthropic-ai/claude-code$'
+  teardown
+
+  setup "shims missing, reshim fails"
+  bazzite
+  dotfiles_fixture
+  mise_node_fixture lts
+  rm -rf "$HOME/.local/share/mise/shims"
+  STUB_RESHIM_RC=1 run_linux
+  check "run completes" [ "$RC" -eq 0 ]
+  check "reshim failure has its own warning" has "$OUT" "'mise reshim' failed after installing node"
+  check "not reported as an install failure" lacks "$OUT" "'mise install node' failed"
+  check "skips Claude" has "$OUT" "skipped Claude Code"
+  check "no npm of any kind" log_lacks 'npm'
+  teardown
+
+  setup "no installs/node/lts link"
+  bazzite
+  dotfiles_fixture
+  mise_node_fixture lts
+  rm "$HOME/.local/share/mise/installs/node/lts"
+  stub claude
+  local conf_before; conf_before="$(cat "$HOME/.config/mise/config.toml")"
+  run_linux --dry-run
+  check "dry run: lts not proven without the link" lacks "$OUT" "node already installed"
+  check "dry run: plans reconciling with mise" has "$OUT" "\[dry-run\] $STUBS/mise install node$"
+  check "dry run: mise not run" log_lacks '^mise '
+  run_linux
+  : > "$LOG"
+  run_linux
+  check "every run reconciles again" [ "$(log_count '^mise (install node|reshim)$')" -eq 2 ]
+  check "never re-pins" log_lacks '^mise use'
+  check "config unchanged" [ "$conf_before" = "$(cat "$HOME/.config/mise/config.toml")" ]
   teardown
 
   setup "[tools.node] table with version"
@@ -729,7 +804,7 @@ test_node_readiness() {
   printf '[tools.node]\nversion = "20"\n' > "$HOME/.config/mise/config.toml"
   stub claude
   run_linux --dry-run
-  check "recognised as installed" has "$OUT" 'node already installed via mise \(\[tools.node\] version = "20" in '
+  check "recognised as installed" has "$OUT" 'node already installed via mise \(tools.node = 20 in '
   check "mise not run" log_lacks '^mise '
   teardown
 
@@ -759,6 +834,16 @@ test_node_readiness() {
   check "no command-not-found noise" lacks "$OUT" "npm: command not found"
   teardown
 
+  setup "reshim after the claude install fails"
+  bazzite
+  dotfiles_fixture
+  STUB_RESHIM_RC=1 run_linux
+  check "run completes" [ "$RC" -eq 0 ]
+  check "claude was installed by npm" log_has '^mise-shim-npm install -g @anthropic-ai/claude-code$'
+  check "warns claude has no shim" has "$OUT" "installed Claude Code, but 'mise reshim' failed"
+  check "no shim was made" [ ! -e "$HOME/.local/share/mise/shims/claude" ]
+  teardown
+
   setup "mise use fails"
   bazzite
   dotfiles_fixture
@@ -782,6 +867,80 @@ test_node_readiness() {
   check "run: no config written" [ ! -e "$HOME/.config/mise/config.toml" ]
   check "run: Claude skipped" has "$OUT" "skipped Claude Code"
   teardown
+}
+
+# mise's global config is read with python3's tomllib. A node entry in any
+# valid TOML form is a pin (never re-pinned); an unreadable config, or no way to
+# parse it, is uncertain (never written, Node not installed).
+pin_fixture() { # pin_fixture NAME TOML — the pin (20) differs from what is installed (22)
+  setup "$1"
+  bazzite
+  dotfiles_fixture
+  mise_node_fixture lts 22.12.0
+  printf '%b' "$2" > "$HOME/.config/mise/config.toml"
+  cp "$HOME/.config/mise/config.toml" "$SANDBOX/config.before"
+}
+same_config() { cmp -s "$SANDBOX/config.before" "$HOME/.config/mise/config.toml"; }
+
+test_mise_config_parsing() {
+  local name toml
+  for name in quoted-table dotted-key multiline-fake-header; do
+    case "$name" in
+      quoted-table)          toml='["tools"]\nnode = "20"\n' ;;
+      dotted-key)            toml='[tools]\nnode.version = "20"\n' ;;
+      multiline-fake-header) toml='[env]\nBANNER = """\n[tools]\nnode = "lts"\n"""\n\n[tools.node]\nversion = "20"\n' ;;
+    esac
+    pin_fixture "pin 20 as $name" "$toml"
+    run_linux --dry-run
+    check "dry run: sees the pin (not installed: 22 only)" lacks "$OUT" "node already installed"
+    check "dry run: no mise use planned" lacks "$OUT" "\[dry-run\] .*mise use"
+    check "dry run: plans mise install node" has "$OUT" "\[dry-run\] $STUBS/mise install node$"
+    check "dry run: mise not run" log_lacks '^mise '
+    check "dry run: config byte-identical" same_config
+    run_linux
+    check "run exits 0" [ "$RC" -eq 0 ]
+    check "run: never mise use" log_lacks '^mise use'
+    check "run: installs the pinned 20" [ -x "$HOME/.local/share/mise/installs/node/20.18.1/bin/node" ]
+    check "run: config byte-identical" same_config
+    teardown
+  done
+
+  pin_fixture "node only inside a multiline string" '[env]\nBANNER = """\n[tools]\nnode = "20"\n"""\n'
+  rm -rf "$HOME/.local/share/mise"
+  run_linux --dry-run
+  check "a string is not a pin: plans pinning lts" has "$OUT" "\[dry-run\] $STUBS/mise use -g node@lts$"
+  teardown
+
+  for name in invalid-toml no-python3 no-tomllib; do
+    pin_fixture "uncertain config: $name" '[tools]\nnode = "20"\n'
+    case "$name" in
+      invalid-toml) printf '[tools\nnode = \n' > "$HOME/.config/mise/config.toml"
+                    cp "$HOME/.config/mise/config.toml" "$SANDBOX/config.before" ;;
+      no-python3)   rm "$SANDBOX/sysbin/python3" ;;
+      # A real python3 whose `import tomllib` raises ImportError (as on 3.10).
+      no-tomllib)   stub python3 'if [ "$1" = -I ] && [ "$2" = -c ]; then
+  code="import sys; sys.modules[\"tomllib\"] = None
+$3"; shift 3; exec "$STUB_STATE/../sysbin/python3" -I -c "$code" "$@"
+fi
+exec "$STUB_STATE/../sysbin/python3" "$@"' ;;
+    esac
+    run_linux --dry-run
+    check "dry run: warns it can't tell" has "$OUT" "can't tell whether mise's global config .* pins node"
+    case "$name" in
+      invalid-toml) check "dry run: says it can't parse it" has "$OUT" "pins node \(cannot parse it: " ;;
+      no-python3)   check "dry run: says python3 is missing" has "$OUT" "pins node \(python3 not found\)" ;;
+      no-tomllib)   check "dry run: says tomllib is missing" has "$OUT" "pins node \(python3 has no tomllib" ;;
+    esac
+    check "dry run: no mise planned" lacks "$OUT" "\[dry-run\] .*mise (use|install)"
+    check "dry run: config byte-identical" same_config
+    run_linux
+    check "run exits 0" [ "$RC" -eq 0 ]
+    check "run: no mise use or install" log_lacks '^mise (use|install)'
+    check "run: config byte-identical" same_config
+    check "run: Claude skipped" has "$OUT" "skipped Claude Code"
+    check "run: no npm of any kind" log_lacks 'npm'
+    teardown
+  done
 }
 
 # The mise apt key is dearmored to a temp file, so a failed download or
@@ -1008,6 +1167,9 @@ test_bazzite_run_and_rerun() {
   check "node is installed under mise" [ -x "$HOME/.local/share/mise/installs/node/22.12.0/bin/node" ]
   check "fnm never involved" log_lacks '^fnm |fnm'
   check "claude installed through mise's npm shim, after node" logged_before '^mise use -g node@lts$' '^mise-shim-npm install -g @anthropic-ai/claude-code$'
+  check "the shim ran the pinned node's npm" log_has '^mise-22.12.0-npm install -g @anthropic-ai/claude-code$'
+  check "reshim after the claude install" logged_before '^mise-shim-npm install -g' '^mise reshim$'
+  check "reshim exposed claude" [ -x "$HOME/.local/share/mise/shims/claude" ]
   check "PATH npm never used" log_lacks '^npm '
 
   : > "$LOG"
@@ -1104,6 +1266,8 @@ test_debian_run_and_rerun() {
   check "keyring installed 0644" log_has '^sudo install -m 644 .* /etc/apt/keyrings/mise-archive-keyring.gpg$'
   check "sources file made 0644" log_has '^sudo chmod 644 /etc/apt/sources.list.d/mise.list$'
   check "claude installed through mise's npm shim, after node" logged_before '^mise use -g node@lts$' '^mise-shim-npm install -g @anthropic-ai/claude-code$'
+  check "reshim after the claude install" logged_before '^mise-shim-npm install -g' '^mise reshim$'
+  check "reshim exposed claude" [ -x "$HOME/.local/share/mise/shims/claude" ]
   check "PATH npm never used" log_lacks '^npm '
   local conf_before; conf_before="$(cat "$HOME/.config/mise/config.toml")"
   : > "$LOG"
@@ -1194,6 +1358,7 @@ TESTS=(
   test_debian_run_and_rerun
   test_mise_edge_cases
   test_node_readiness
+  test_mise_config_parsing
   test_mise_apt_failures
   test_hand_made_repo_links
 )

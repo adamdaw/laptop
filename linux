@@ -190,56 +190,51 @@ find_mise() {
   fi
 }
 
-# The value of a TOML string (`"x"` or `'x'`), or of `version = "x"` inside an
-# inline table, from the text after `=` ($1). Prints nothing for any other form.
-toml_version() {
-  local v="$1"
-  local dq='^[[:space:]]*"([^"]*)"[[:space:]]*(#.*)?$' sq="^[[:space:]]*'([^']*)'[[:space:]]*(#.*)?\$"
-  local tbl='^[[:space:]]*\{.*(^|[{,[:space:]])version[[:space:]]*=[[:space:]]*["'"'"']([^"'"'"']*)["'"'"']'
-  if [[ "$v" =~ $dq || "$v" =~ $sq ]]; then
-    printf '%s\n' "${BASH_REMATCH[1]}"
-  elif [[ "$v" =~ $tbl ]]; then
-    printf '%s\n' "${BASH_REMATCH[2]}"
+# What mise's global config file $1 says about node, parsed as real TOML with
+# python3's tomllib (mise is not run). Prints one line, fields split by "|":
+#   absent                  no file, or no tools.node entry: node may be pinned
+#   pinned|VERSION|KEY      a tools.node (or tools."core:node") entry exists; VERSION
+#                           is its version when it is one string, else empty
+#   uncertain|REASON        can't tell (no python3/tomllib, unreadable or
+#                           invalid file): never write the config
+mise_node_pin() {
+  local out
+  if ! cmd_exists python3; then
+    echo "uncertain|python3 not found"
+    return 0
   fi
-}
-
-# Read the node pin from mise's global config file $1 (plain text scan; mise
-# is not run). Sets NODE_PIN_FOUND=1 if any node entry exists, NODE_PIN to its
-# version selection when it can be parsed (else empty), and NODE_PIN_LINE for
-# messages. Recognises `node = ...` in [tools], a [tools.node] table with
-# `version = ...`, and a root-level `tools.node = ...`, with optional quotes
-# and a `core:` prefix. Any other node entry counts as found but unparsed.
-read_node_pin() {
-  NODE_PIN_FOUND=0 NODE_PIN="" NODE_PIN_LINE=""
-  local file="$1" line trimmed section=root
-  local key='["'"'"']?(core:)?node["'"'"']?'
-  local tools_hdr='^[[:space:]]*\[[[:space:]]*tools[[:space:]]*\][[:space:]]*(#.*)?$'
-  local node_hdr='^[[:space:]]*\[[[:space:]]*tools[[:space:]]*\.[[:space:]]*'"$key"'[[:space:]]*\][[:space:]]*(#.*)?$'
-  local other_node_hdr='^[[:space:]]*\[.*tools[[:space:]]*\.[[:space:]]*'"$key"'[^A-Za-z0-9_-]'
-  local node_kv='^[[:space:]]*'"$key"'[[:space:]]*='
-  local root_kv='^[[:space:]]*tools[[:space:]]*\.[[:space:]]*'"$key"'[[:space:]]*='
-  local version_kv='^[[:space:]]*["'"'"']?version["'"'"']?[[:space:]]*='
-  [ -r "$file" ] || return 0
-  while IFS= read -r line || [ -n "$line" ]; do
-    trimmed="${line#"${line%%[![:space:]]*}"}"
-    if [[ "$line" =~ ^[[:space:]]*\[ ]]; then
-      section=other
-      if [[ "$line" =~ $tools_hdr ]]; then
-        section=tools
-      elif [[ "$line" =~ $node_hdr ]]; then
-        section=node NODE_PIN_FOUND=1 NODE_PIN_LINE="$trimmed"
-      elif [[ "$line" =~ $other_node_hdr ]]; then
-        NODE_PIN_FOUND=1 NODE_PIN_LINE="$trimmed" # e.g. [[tools.node]]: not parsed
-      fi
-    elif { [ "$section" = tools ] && [[ "$line" =~ $node_kv ]]; } ||
-         { [ "$section" = root ] && [[ "$line" =~ $root_kv ]]; }; then
-      NODE_PIN_FOUND=1 NODE_PIN_LINE="$trimmed"
-      NODE_PIN="$(toml_version "${line#*=}")"
-    elif [ "$section" = node ] && [[ "$line" =~ $version_kv ]]; then
-      NODE_PIN_LINE="$NODE_PIN_LINE $trimmed"
-      NODE_PIN="$(toml_version "${line#*=}")"
-    fi
-  done < "$file"
+  out="$(python3 -I -c '
+import os, sys
+path = sys.argv[1]
+def say(*fields):
+    print("|".join(" ".join(str(f).split()) for f in fields))
+    sys.exit(0)
+if not os.path.lexists(path):
+    say("absent")
+try:
+    import tomllib
+except ImportError:
+    say("uncertain", "python3 has no tomllib (needs Python 3.11+)")
+try:
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+except Exception as e:
+    say("uncertain", "cannot parse it: %s" % e)
+tools = data.get("tools", {})
+if not isinstance(tools, dict):
+    say("uncertain", "tools is not a table")
+for key in ("node", "core:node"):
+    if key in tools:
+        v = tools[key]
+        if isinstance(v, dict):
+            v = v.get("version")
+        say("pinned", v if isinstance(v, str) else "", key)
+say("absent")
+' "$1" 2>/dev/null)" || out=""
+  case "$out" in
+    absent|pinned\|*|uncertain\|*) echo "$out" ;;
+    *) echo "uncertain|python3 could not read it" ;;
+  esac
 }
 
 # True if mise's data dir $1 holds an executable node for version selection $2,
@@ -289,37 +284,46 @@ NODE_NPM=""
 
 # Node LTS through mise. `mise use -g node@lts` pins it in mise's global config
 # (~/.config/mise/config.toml by default) and installs it. An existing pin, of
-# any form, is never changed.
+# any form, is never changed, and the config is only written when it is
+# confirmed to have no node entry.
+MISE_BIN=""
 install_node() {
   step "Installing Node LTS via mise"
-  local mise config data shims reason mise_ok=0
+  local config data shims pin state version key reason pinned mise_ok=0
   NODE_NPM=""
-  mise="$(find_mise)"
+  MISE_BIN="$(find_mise)"
   config="$(mise_config_file)"
   data="$(mise_data_dir)"
   shims="$data/shims"
-  if (( ! DRY_RUN )) && [ -z "$mise" ]; then
+  if (( ! DRY_RUN )) && [ -z "$MISE_BIN" ]; then
     die "mise not found after installing it; cannot install Node"
   fi
-  mise="${mise:-mise}"
+  MISE_BIN="${MISE_BIN:-mise}"
   # Decided from files on disk, never by running mise (it creates state, so a
   # --dry-run must not run it), so a dry run and a real run agree.
-  read_node_pin "$config"
-  if (( NODE_PIN_FOUND )) && node_installed "$data" "$NODE_PIN" && [ -x "$shims/node" ] && [ -x "$shims/npm" ]; then
-    ok "node already installed via mise ($NODE_PIN_LINE in $config)"
+  pin="$(mise_node_pin "$config")"
+  IFS='|' read -r state version key <<<"$pin"
+  pinned="tools.$key = ${version:-(version not derived)}"
+  if [ "$state" = uncertain ]; then
+    reason="$version"
+    warn "can't tell whether mise's global config $config pins node ($reason); not changing it or installing Node. Fix it (or pin node yourself) and re-run"
+  elif [ "$state" = pinned ] && node_installed "$data" "$version" && [ -x "$shims/node" ] && [ -x "$shims/npm" ]; then
+    ok "node already installed via mise ($pinned in $config)"
     mise_ok=1
-  elif (( NODE_PIN_FOUND )); then
+  elif [ "$state" = pinned ]; then
     # Pinned, but disk can't prove a matching, usable install (other version,
-    # unparsed entry, no shims): install what is pinned, don't re-pin.
-    if run "$mise" install node && run "$mise" reshim; then
-      mise_ok=1
-      did "installed node ($NODE_PIN_LINE in $config)"
+    # version not derived, no shims): reconcile through mise, don't re-pin.
+    if ! run "$MISE_BIN" install node; then
+      warn "'mise install node' failed ($pinned in $config)"
+    elif ! run "$MISE_BIN" reshim; then
+      warn "'mise reshim' failed after installing node; its node/npm shims may be missing"
     else
-      warn "'mise install node' failed ($NODE_PIN_LINE in $config)"
+      mise_ok=1
+      did "reconciled node with mise ($pinned in $config)"
     fi
   elif reason="$(config_write_blocked "$config")" && [ -n "$reason" ]; then
     warn "$reason. Add node = \"lts\" under [tools] there (or run 'mise use -g node@lts' yourself) and re-run"
-  elif run "$mise" use -g node@lts; then
+  elif run "$MISE_BIN" use -g node@lts; then
     mise_ok=1
     did "installed node lts with mise (pinned in $config)"
   else
@@ -347,7 +351,12 @@ install_claude() {
     warn "skipped Claude Code: no usable mise-managed Node (see above). Once Node works: npm install -g @anthropic-ai/claude-code"
   else
     run "$NODE_NPM" install -g @anthropic-ai/claude-code
-    did "installed claude"
+    # npm put claude in node's own bin dir; a shim makes it reachable on PATH.
+    if run "$MISE_BIN" reshim; then
+      did "installed claude"
+    else
+      warn "installed Claude Code, but 'mise reshim' failed, so claude has no shim; run 'mise reshim'"
+    fi
   fi
 }
 
