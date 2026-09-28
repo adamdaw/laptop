@@ -23,7 +23,7 @@ bash laptop/linux
 
 | Option | Effect |
 |---|---|
-| `-n`, `--dry-run` | Print every command that would run (installs, backups, stow, git config). Read-only checks (`brew list`, `rpm -q`, `rpm-ostree status`, `fc-list`, `dpkg -s`) still run so the plan is accurate. `fnm` is never executed during a dry run on either platform, not even `fnm env` or `fnm --version`, because fnm creates state. The LTS check reads fnm's alias directory instead. Nothing is changed. |
+| `-n`, `--dry-run` | Print every command that would run (installs, backups, stow, git config). Read-only checks (`brew list`, `rpm -q`, `rpm-ostree status`, `fc-list`, `dpkg -s`) still run so the plan is accurate. `mise` is never executed during a dry run on either platform, not even `mise --version`, because mise creates state and cache directories whenever it runs. Whether mise and Node are already installed is read from disk instead: mise on `PATH` or in `~/.local/bin`, a `node` entry in the `[tools]` table of mise's global config, and an installed `node` under mise's data dir. Nothing is changed. |
 | `--print-os` | Print the detected platform (`debian` or `atomic`) and exit |
 | `-h`, `--help` | Usage |
 
@@ -32,17 +32,25 @@ bash laptop/linux
 | Category | Ubuntu / Pop!_OS (apt unless noted) | Bazzite (Homebrew unless noted) |
 |---|---|---|
 | Shell | zsh, zsh-autosuggestions, zsh-syntax-highlighting, Starship (installer) | zsh, zsh-autosuggestions, zsh-syntax-highlighting, starship |
-| Core | git, git-delta, curl, wget, build-essential, stow | git, git-delta, wget, stow (skipped when the image already has them) |
+| Core | git, git-delta, curl, gpg, wget, build-essential, stow | git, git-delta, wget, stow (skipped when the image already has them) |
 | Terminal | neovim, xclip, Ghostty (ghostty-ubuntu installer) | neovim, tmux (image), Ghostty (**rpm-ostree**, Terra) |
 | Search | ripgrep, fd-find, fzf, bat | ripgrep, fd, fzf, bat |
 | Data | jq | jq |
 | GitHub | gh CLI (GitHub apt repo) | gh |
-| Node | fnm (installer) + Node LTS, Claude Code | fnm + Node LTS, Claude Code |
+| Node | mise (mise's apt repo) + Node LTS, Claude Code | mise + Node LTS, Claude Code |
 | Python | uv (installer) | uv |
 | JavaScript runtime | Bun (installer, `~/.bun`) | Bun (installer, `~/.bun`) |
 | Font | JetBrains Mono Nerd Font (`~/.local/share/fonts`) | checked; installed to `~/.local/share/fonts` only if missing |
 
 On Bazzite, a Homebrew formula is skipped when the command is already on `PATH` from the image (for example `tmux` and `git`).
+
+### Node comes from mise
+
+[mise](https://mise.jdx.dev) manages Node; the dotfiles already activate it in bash and zsh. mise is installed from the first source in the install-order rule: the Homebrew formula on Bazzite, and mise's official apt repo (`mise.jdx.dev/deb`, signed with mise's key) on Ubuntu/Pop!_OS. The apt repo was chosen over the `mise.run` installer because apt verifies signatures and `apt-get upgrade` keeps mise current, the same way the gh repo works. A mise that is already on `PATH` or in `~/.local/bin` (where `mise.run` puts it) is used as is.
+
+Node LTS is installed with `mise use -g node@lts`. **That writes `~/.config/mise/config.toml`** (mise's global config; `MISE_GLOBAL_CONFIG_FILE` / `MISE_CONFIG_DIR` / `XDG_CONFIG_HOME` move it). The dotfiles don't manage that file today. If a dotfiles `mise` package takes it over later, pin Node there. The script never writes the file when its path resolves into the dotfiles repo; it warns instead. If the global config already pins `node` (to any version), the script runs `mise install node` and doesn't re-pin it.
+
+fnm is no longer installed. An existing fnm (`~/.local/share/fnm`, or `fnm` on `PATH`) is left alone and only noted in the output. Remove it yourself when you no longer need it.
 
 ## What it configures
 
@@ -58,7 +66,7 @@ On Bazzite, a Homebrew formula is skipped when the command is already on `PATH` 
 1. moves it to `~/.local/state/laptop/backups/<YYYYmmdd-HHMMSS>.<random>/<same path>`. Each run gets its own directory (made with `mktemp -d`), so two runs in the same second never share one. The move uses `mv -n` and refuses a destination that already exists;
 2. lists it in the summary at the end of the run.
 
-A conflict can also be an *ancestor*: for example `~/.config/nvim` is a regular file while the package needs `~/.config/nvim/init.lua`. The script backs up that file. Files that are already symlinks into the dotfiles repo are left alone. So are directories stow has folded into this package or into *another* package of the same repo (e.g. `~/.config` → `agy/.config`); stow unfolds those itself, and nothing inside the repo is ever moved. If a backup fails (the directory can't be created, or the move fails or has no effect), the script warns and skips stowing that package. If a file sits under a directory that is a symlink to somewhere else, the script touches nothing and skips that package with a warning, so you can sort it out by hand. A package that fails to stow is reported as a warning; the script doesn't hide it.
+A conflict can also be an *ancestor*: for example `~/.config/nvim` is a regular file while the package needs `~/.config/nvim/init.lua`. The script backs up that file. Anything that already resolves into the dotfiles repo is left alone and handed to stow. This test is repository membership: it doesn't prove that stow made the link. It covers directories stow folded into this package or into *another* package of the same repo (e.g. `~/.config` → `agy/.config`), and it also covers links you made into the repo by hand. Nothing inside the repo is ever moved. Stow unfolds a directory link into one of its packages. It reports any other clash, such as a hand-made `~/.tmux.conf` → `bash/.bashrc`, as a conflict, and the script lists that package as a failed stow. If a backup fails (the directory can't be created, or the move fails or has no effect), the script warns and skips stowing that package. If a file sits under a directory that is a symlink to somewhere else, the script touches nothing and skips that package with a warning, so you can sort it out by hand. A package that fails to stow is reported as a warning; the script doesn't hide it.
 
 This applies to both platforms. The Ubuntu path used to run `stow --adopt ... 2>/dev/null || true`.
 
@@ -145,12 +153,14 @@ shellcheck linux tests/run.sh
 tests/run.sh
 ```
 
-`tests/run.sh` is a plain-bash harness that installs nothing. The script runs under `env -i` with an allowlisted environment: sandbox `PATH`, `HOME`, `XDG_*`, `HOMEBREW_*` and `FNM_*`, and no exported functions or `BASH_ENV`/`ENV`. A guard refuses to start if any path it passes (including every `LAPTOP_BREW_DIRS` entry) is outside the sandbox. It runs `linux` with a throwaway `HOME` and a `PATH` of logging stubs (brew, rpm-ostree, stow, apt-get, sudo, …). The tests cover:
+`tests/run.sh` is a plain-bash harness that installs nothing. The script runs under `env -i` with an allowlisted environment: sandbox `PATH`, `HOME`, `XDG_*`, `HOMEBREW_*` and `FNM_*`; no host `MISE_*`, exported functions or `BASH_ENV`/`ENV`. A guard refuses to start if any path it passes (including every `LAPTOP_BREW_DIRS` entry) is outside the sandbox once symlinks are resolved. It runs `linux` with a throwaway `HOME` and a `PATH` of logging stubs (brew, rpm-ostree, stow, mise, apt-get, sudo, …). The mise stub models mise's side effects on disk (state/cache dirs on every run, the global config, installs), so any mise call during a dry run changes the `HOME` snapshot. The tests cover:
 
 - platform detection;
-- the `--dry-run` plan on Bazzite and Pop!_OS, including checks that nothing was executed and that `HOME` is unchanged;
-- conflict backups and the bling-line warning;
-- a stubbed real run followed by a re-run, to confirm idempotence;
+- the `--dry-run` plan on Bazzite and Pop!_OS, including checks that nothing was executed, mise was never run, and `HOME` is unchanged;
+- conflict backups and the bling-line warning, and hand-made links into the repo (no data loss, conflict reported);
+- stubbed real runs on Bazzite and Pop!_OS, each followed by a re-run, to confirm idempotence (mise installed once, Node pinned once, config unchanged);
+- mise edge cases: Node pinned but not installed, `node` outside `[tools]`, a leftover fnm, and a global config that resolves into the repo;
+- sandbox guards, including brew prefixes and `HOME` that escape the sandbox through a symlink;
 - an rpm-ostree failure.
 
 CI (`.github/workflows/ci.yml`) runs both commands on every push and pull request.

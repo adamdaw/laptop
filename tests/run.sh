@@ -6,7 +6,7 @@
 # stub that logs its arguments, and PATH holds only those stubs plus a sandbox
 # of core utilities. HOME is a throwaway directory. The script runs under
 # `env -i` with an allowlisted environment (see sandboxed), so exported shell
-# functions, BASH_ENV/ENV and host HOMEBREW_*/FNM_*/XDG_* settings never reach it.
+# functions, BASH_ENV/ENV and host HOMEBREW_*/MISE_*/FNM_*/XDG_* settings never reach it.
 #
 # Usage: tests/run.sh
 
@@ -24,11 +24,11 @@ CURRENT=""
 # Core utilities the script (and the stubs) legitimately need.
 CORE_UTILS=(bash env cat grep sed find realpath dirname basename date mkdir mv cp rm ln chmod head tr sort mktemp touch readlink ls wc python3)
 
-ALL_FORMULAE=(git git-delta stow neovim tmux jq ripgrep fd fzf bat wget gh starship zsh zsh-autosuggestions zsh-syntax-highlighting uv fnm)
+ALL_FORMULAE=(git git-delta stow neovim tmux jq ripgrep fd fzf bat wget gh starship zsh zsh-autosuggestions zsh-syntax-highlighting uv mise)
 ALL_PACKAGES=(agy bash bat bin ghostty git nvim ripgrep ssh starship tmux zsh)
 
 # Calls that would change the machine. None may appear during --dry-run.
-MUTATING='^(sudo|apt-get|chsh|usermod|ujust|ssh-keygen|npm|curl|stow|systemctl|ubuntu-report|unzip|fc-cache)( |$)|^brew install|^rpm-ostree (install|upgrade|reboot)|^flatpak install|^git (clone|config)|^fnm (install|default)'
+MUTATING='^(sudo|apt-get|chsh|usermod|ujust|ssh-keygen|npm|curl|stow|systemctl|ubuntu-report|unzip|fc-cache)( |$)|^brew install|^rpm-ostree (install|upgrade|reboot)|^flatpak install|^git (clone|config)|^mise (use|install)'
 
 # rpm-ostree status --json shapes. Deployments are listed newest first:
 # staged/pending, then booted, then rollback.
@@ -36,14 +36,27 @@ BOOTED_ONLY='{"deployments":[{"booted":true,"requested-packages":[],"packages":[
 PENDING_GHOSTTY='{"deployments":[{"booted":false,"staged":true,"requested-packages":["ghostty"],"packages":["ghostty"]},{"booted":true,"requested-packages":[]}]}'
 ROLLBACK_GHOSTTY='{"deployments":[{"booted":true,"requested-packages":[],"packages":[]},{"booted":false,"requested-packages":["ghostty"],"packages":["ghostty"]}]}'
 
-# Like real fnm, the stub leaves state behind whenever it runs (except --version):
-# env creates a multishell link, anything else creates its data dir.
-FNM_SIDE_EFFECTS='
-if [ "$1" != --version ]; then
-  mkdir -p "$HOME/.local/share/fnm/node-versions"
-  if [ "$1" = env ]; then mkdir -p "$HOME/.local/state/fnm_multishells"; ln -sfn / "$HOME/.local/state/fnm_multishells/$$"; fi
-fi
-'
+# A mise that models its filesystem side effects. Like real mise, every
+# invocation leaves state and cache dirs behind; `use -g node@lts` writes the
+# global config and installs node (plus shims); `install node` installs only.
+# It resolves its dirs from the same MISE_*/XDG_* variables as real mise.
+MISE_SIDE_EFFECTS='
+data="${MISE_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/mise}"
+conf="${MISE_GLOBAL_CONFIG_FILE:-${MISE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/mise}/config.toml}"
+mkdir -p "${XDG_STATE_HOME:-$HOME/.local/state}/mise" "${XDG_CACHE_HOME:-$HOME/.cache}/mise"
+install_node() {
+  mkdir -p "$data/installs/node/22.12.0/bin" "$data/shims"
+  printf "#!/bin/sh\necho v22.12.0\n" > "$data/installs/node/22.12.0/bin/node"
+  chmod +x "$data/installs/node/22.12.0/bin/node"
+  ln -sfn 22.12.0 "$data/installs/node/lts"
+  touch "$data/shims/node" "$data/shims/npm" # not executable: the npm stub still answers
+}
+case "$*" in
+  --version)        echo "2026.9.0 linux-x64 (stub)" ;;
+  "use -g node@lts") mkdir -p "${conf%/*}"; printf "[tools]\nnode = \"lts\"\n" >> "$conf"; install_node ;;
+  "install node")   install_node ;;
+  *)                echo "stub mise: unexpected: $*" >&2; exit 2 ;;
+esac'
 
 # ── Assertions ───────────────────────────────────────────────────────────────
 
@@ -56,6 +69,7 @@ check() { # check "description" command...
 }
 
 has()      { grep -qE -- "$2" <<<"$1"; }
+is_real_dir() { [ -d "$1" ] && [ ! -L "$1" ]; }
 lacks()    { ! grep -qE -- "$2" <<<"$1"; }
 log_has()  { grep -qE -- "$1" "$LOG"; }
 log_lacks(){ ! grep -qE -- "$1" "$LOG"; }
@@ -107,18 +121,26 @@ setup() { # setup TEST_NAME
     ln -s "$path" "$SANDBOX/sysbin/$u"
   done
 
-  stub sudo; stub apt-get; stub chsh; stub usermod; stub ujust; stub flatpak
+  # mise is absent until something installs it: `brew install mise` or
+  # `sudo apt-get install -y mise` puts this stub on PATH.
+  stub mise "$MISE_SIDE_EFFECTS"; mv "$STUBS/mise" "$STATE/mise-stub"
+  # Like `sudo tee` / `sudo dd`, read piped input, so the writer never gets SIGPIPE.
+  stub sudo '[ -p /dev/stdin ] && cat > /dev/null
+[ "$*" = "apt-get install -y mise" ] && cp "$STUB_STATE/mise-stub" "${0%/*}/mise"; exit 0'
+  stub apt-get; stub chsh; stub usermod; stub ujust; stub flatpak
   stub systemctl; stub npm; stub unzip; stub fc-cache
+  stub sh '[ -p /dev/stdin ] && cat > /dev/null; exit 0' # `curl ... | sh` installers
   stub curl 'exit "${STUB_CURL_RC:-0}"' 
-  stub dpkg 'exit 1'
+  stub dpkg '[ "$1" = --print-architecture ] && echo amd64 || exit 1'
+  stub gpg
   stub fc-list 'echo "/x/JetBrainsMonoNerdFont-Regular.ttf: JetBrainsMono Nerd Font:style=Regular"'
   stub git 'if [ "$1" = clone ]; then mkdir -p "$3/.git"; fi'
   stub ssh-keygen 'while [ $# -gt 0 ]; do [ "$1" = -f ] && { touch "$2" "$2.pub"; break; }; shift; done'
-  stub fnm "$FNM_SIDE_EFFECTS"'case "$1" in --version) echo "fnm 1.0";; esac'
   stub brew '
 case "$1" in
   list)     grep -qx -- "${!#}" "$STUB_STATE/brew-installed" ;;
-  install)  shift; printf "%s\n" "$@" >> "$STUB_STATE/brew-installed" ;;
+  install)  shift; printf "%s\n" "$@" >> "$STUB_STATE/brew-installed"
+            for f; do [ "$f" = mise ] && cp "$STUB_STATE/mise-stub" "${0%/*}/mise"; done; exit 0 ;;
   --prefix) cd "$(dirname "$0")/.." && pwd ;;
   shellenv) p="$(cd "$(dirname "$0")/.." && pwd)"
             echo "export HOMEBREW_PREFIX=\"$p\"; export PATH=\"$p/bin:\$PATH\";" ;;
@@ -204,6 +226,15 @@ dotfiles_fixture() {
   echo "README — must not be stowed" > "$d/bash/README.md"
 }
 
+# mise on PATH, node pinned in its global config and installed, as
+# `mise use -g node@lts` leaves it. Made without running mise.
+mise_node_fixture() {
+  cp "$STATE/mise-stub" "$STUBS/mise"
+  mkdir -p "$HOME/.config/mise" "$HOME/.local/share/mise/installs/node/22.12.0/bin"
+  printf '[tools]\nnode = "lts"\n' > "$HOME/.config/mise/config.toml"
+  touch "$HOME/.local/share/mise/installs/node/22.12.0/bin/node"
+}
+
 # Everything already in place, as after a successful run.
 all_done_fixture() {
   printf "%s\n" "${ALL_FORMULAE[@]}" > "$STATE/brew-installed"
@@ -212,9 +243,7 @@ all_done_fixture() {
   touch "$HOME/.ssh/id_ed25519"
   printf '#!%s\necho 1.1.0\n' "$SANDBOX/sysbin/bash" > "$HOME/.bun/bin/bun"; chmod +x "$HOME/.bun/bin/bun"
   stub claude
-  stub fnm "$FNM_SIDE_EFFECTS"'case "$1" in list) echo "* v22.0.0 default, lts-latest";; --version) echo "fnm 1.0";; esac'
-  mkdir -p "$HOME/.local/share/fnm/aliases"
-  touch "$HOME/.local/share/fnm/aliases/lts-latest"
+  mise_node_fixture
   sandboxed "$STUBS/stow" --dir="$HOME/Projects/Home/dotfiles" --target="$HOME" --restow "${ALL_PACKAGES[@]}"
   : > "$LOG"
 }
@@ -274,7 +303,7 @@ sandboxed() {
 
 run_linux() { # run_linux ARGS... — sets OUT and RC
   guard_sandbox || { echo "refusing to run outside the sandbox" >&2; exit 2; }
-  OUT="$(sandboxed "$SANDBOX/sysbin/bash" "$SCRIPT" "$@" 2>&1)"
+  OUT="$(sandboxed "$SANDBOX/sysbin/bash" "$SCRIPT" "$@" 2>&1 </dev/null)"
   RC=$?
   # shellcheck disable=SC2001 # a regex, not a fixed string
   OUT="$(sed $'s/\x1b\\[[0-9;]*m//g' <<<"$OUT")" # drop colours
@@ -340,7 +369,7 @@ test_bazzite_dry_run_fresh() {
   check "detects Bazzite" has "$OUT" "Detected Bazzite"
   check "plans exactly one brew install" [ "$(grep -cF '[dry-run] brew install' <<<"$OUT")" -eq 1 ]
   local f
-  for f in zsh zsh-autosuggestions zsh-syntax-highlighting git-delta neovim ripgrep fd fzf bat jq gh starship uv wget; do
+  for f in zsh zsh-autosuggestions zsh-syntax-highlighting git-delta neovim ripgrep fd fzf bat jq gh starship uv wget mise; do
     check "brew installs $f" has "$brew_line" " $f( |$)"
   done
   check "skips image-provided tmux" lacks "$brew_line" " tmux( |$)"
@@ -361,8 +390,9 @@ test_bazzite_dry_run_fresh() {
   check "keeps bash as login shell" has "$OUT" "login shell stays bash"
   check "no apt/sudo/chsh/ujust/flatpak in plan" lacks "$OUT" "\[dry-run\] (sudo|apt-get|chsh|usermod|ujust|flatpak)"
   check "no mutating command was executed" log_lacks "$MUTATING"
-  check "fnm is not run at all (it creates state)" log_lacks '^fnm '
-  check "plans the LTS install instead" has "$OUT" "\[dry-run\] .*fnm install --lts"
+  check "mise is not run at all (it creates state)" log_lacks '^mise '
+  check "plans node lts via mise" has "$OUT" "\[dry-run\] mise use -g node@lts$"
+  check "no fnm anywhere in the plan" lacks "$OUT" "fnm"
   check "HOME is untouched" [ "$before" = "$(home_snapshot)" ]
   check "says nothing was changed" has "$OUT" "Dry run complete"
   teardown
@@ -373,16 +403,19 @@ test_bazzite_dry_run_all_done() {
   bazzite
   dotfiles_fixture
   all_done_fixture
+  local before; before="$(home_snapshot)"
   run_linux --dry-run
   check "exits 0" [ "$RC" -eq 0 ]
+  check "HOME is untouched" [ "$before" = "$(home_snapshot)" ]
   check "no brew install" lacks "$OUT" "brew install"
   check "no rpm-ostree install" lacks "$OUT" "rpm-ostree install"
   check "ghostty already installed" has "$OUT" "ghostty already installed"
   check "no reboot needed" lacks "$OUT" "Reboot required"
   check "no backups" lacks "$OUT" "back up"
   check "no ssh-keygen" lacks "$OUT" "ssh-keygen"
-  check "fnm is not run; LTS found on disk" [ "$(log_count '^fnm ')" -eq 0 ]
-  check "reports node lts installed" has "$OUT" "node lts already installed"
+  check "mise is not run; node found on disk" [ "$(log_count '^mise ')" -eq 0 ]
+  check "reports node installed via mise" has "$OUT" 'node already installed via mise \(node = "lts" in '
+  check "no mise use/install planned" lacks "$OUT" "\[dry-run\] mise "
   check "no mutating command was executed" log_lacks "$MUTATING"
   teardown
 }
@@ -581,9 +614,53 @@ test_folded_into_other_package() {
   check "stow ran for bat" log_has '^stow .* bat$'
   check "bat config resolves into bat" [ "$(realpath "$HOME/.config/bat/config")" = "$(realpath "$d/bat/.config/bat/config")" ]
   check "agy config still resolves into agy" [ "$(realpath "$HOME/.config/agy/permissions.json")" = "$(realpath "$d/agy/.config/agy/permissions.json")" ]
-  check ".config was unfolded into a real dir" [ -d "$HOME/.config" ] && [ ! -L "$HOME/.config" ]
+  check ".config was unfolded into a real dir" is_real_dir "$HOME/.config"
   check "repo contents unchanged" [ "$repo_before" = "$(repo_snapshot)" ]
+  check "mise config not written through the fold" [ ! -e "$d/agy/.config/mise" ]
+  check "mise was not asked to pin node" log_lacks '^mise use'
+  check "says why node was not pinned" has "$OUT" "mise's global config .* resolves into the dotfiles repo; not writing to it"
   check "no backups made" [ ! -e "$HOME/.local/state/laptop/backups" ]
+  teardown
+}
+
+# The in_repo predicate is repository membership, not proof of a stow fold.
+# A link made by hand into the repo must never lose data: the script leaves it
+# (and the repo) alone, and stow reports the clash.
+test_hand_made_repo_links() {
+  setup "hand-made file link into the repo (not a fold)"
+  bazzite
+  dotfiles_fixture
+  local d="$HOME/Projects/Home/dotfiles"
+  ln -s "$d/bash/.bashrc" "$HOME/.tmux.conf"   # points at the wrong package's file
+  local repo_before; repo_before="$(repo_snapshot)"
+  run_linux --dry-run
+  check "dry run: not backed up" lacks "$OUT" "back up ~/.tmux.conf"
+  check "dry run: not called foreign" lacks "$OUT" "is a symlink to somewhere else"
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "stow reports the conflict" has "$OUT" "stub stow: conflict on $HOME/.tmux.conf"
+  check "the package is reported as failed" has "$OUT" "stow failed for tmux"
+  check "the hand-made link is untouched" [ "$(readlink "$HOME/.tmux.conf")" = "$d/bash/.bashrc" ]
+  check "repo contents unchanged" [ "$repo_before" = "$(repo_snapshot)" ]
+  check "nothing backed up" [ ! -e "$HOME/.local/state/laptop/backups" ]
+  check "other packages still stowed" [ "$(realpath "$HOME/.zshrc")" = "$(realpath "$d/zsh/.zshrc")" ]
+  teardown
+
+  setup "hand-made dir link into the repo (not a fold)"
+  bazzite
+  dotfiles_fixture
+  d="$HOME/Projects/Home/dotfiles"
+  mkdir -p "$HOME/.config"
+  ln -s "$d/agy/.config/agy" "$HOME/.config/nvim"   # nvim's dir, pointed into agy
+  repo_before="$(repo_snapshot)"
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "nothing inside the repo was moved" [ "$repo_before" = "$(repo_snapshot)" ]
+  check "agy's file still in the repo" grep -qx "{}" "$d/agy/.config/agy/permissions.json"
+  check "nothing backed up" [ ! -e "$HOME/.local/state/laptop/backups" ]
+  check "no package skipped" lacks "$OUT" "skipped stowing"
+  check "stow unfolded it into a real dir" is_real_dir "$HOME/.config/nvim"
+  check "nvim resolves into nvim" [ "$(realpath "$HOME/.config/nvim/init.lua")" = "$(realpath "$d/nvim/.config/nvim/init.lua")" ]
   teardown
 }
 
@@ -613,9 +690,12 @@ test_isolation_sentinels() {
   setup "host tool settings do not leak"
   bazzite
   dotfiles_fixture
-  HOMEBREW_PREFIX=/home/linuxbrew/.linuxbrew FNM_DIR=/nonexistent/fnm XDG_DATA_HOME=/nonexistent run_linux --dry-run
+  HOMEBREW_PREFIX=/home/linuxbrew/.linuxbrew FNM_DIR=/nonexistent/fnm XDG_DATA_HOME=/nonexistent \
+    MISE_DATA_DIR=/nonexistent/mise MISE_CONFIG_DIR=/nonexistent/mise MISE_GLOBAL_CONFIG_FILE=/nonexistent/mise.toml \
+    run_linux --dry-run
   check "HOMEBREW_PREFIX is the sandbox one" has "$OUT" "command = $SANDBOX/homebrew-env/bin/zsh"
   check "no host prefix in output" lacks "$OUT" "/home/linuxbrew"
+  check "no host MISE_*/XDG_* paths in output" lacks "$OUT" "/nonexistent"
   teardown
 
   setup "guard rejects paths outside the sandbox"
@@ -626,6 +706,17 @@ test_isolation_sentinels() {
     ( LAPTOP_BREW_DIRS="$bad"; guard_sandbox 2>/dev/null )
     check "rejects LAPTOP_BREW_DIRS='${bad//$SANDBOX/<sandbox>}'" [ $? -ne 0 ]
   done
+  # Paths that look inside the sandbox but resolve outside it through a link.
+  ln -s /home/linuxbrew/.linuxbrew "$SANDBOX/escape-abs"
+  ln -s ../.. "$SANDBOX/escape-rel"
+  for bad in "$SANDBOX/escape-abs" "$SANDBOX/escape-rel/x" "$SANDBOX/linuxbrew $SANDBOX/escape-abs/bin"; do
+    ( LAPTOP_BREW_DIRS="$bad"; guard_sandbox 2>/dev/null )
+    check "rejects symlink escape '${bad//$SANDBOX/<sandbox>}'" [ $? -ne 0 ]
+  done
+  HOME="$SANDBOX/escape-rel" guard_sandbox 2>/dev/null
+  check "rejects a HOME that links outside" [ $? -ne 0 ]
+  ( LAPTOP_BREW_DIRS="$SANDBOX/escape-abs"; run_linux --dry-run ) >/dev/null 2>&1
+  check "run_linux refuses a symlink-escaping brew prefix" [ $? -eq 2 ]
   ( LAPTOP_BREW_DIRS="$SANDBOX/a $SANDBOX/b"; guard_sandbox )
   check "accepts several sandbox entries" [ $? -eq 0 ]
   HOME=/var/home/somebody guard_sandbox 2>/dev/null
@@ -725,9 +816,17 @@ test_bazzite_run_and_rerun() {
   check "stow ran for tmux" log_has '^stow .* tmux$'
   check "no sudo/apt/chsh/ujust/flatpak/reboot" log_lacks '^(sudo|apt-get|chsh|usermod|ujust|flatpak|systemctl)( |$)'
   check "prints reboot notice" has "$OUT" "Reboot required.*ghostty"
+  check "mise came from Homebrew" log_has '^brew install .* mise( |$)'
+  check "node lts pinned via mise, once" [ "$(log_count '^mise use -g node@lts$')" -eq 1 ]
+  check "mise wrote its global config" [ "$(cat "$HOME/.config/mise/config.toml" 2>/dev/null)" = "$(printf '[tools]\nnode = "lts"')" ]
+  check "node is installed under mise" [ -x "$HOME/.local/share/mise/installs/node/22.12.0/bin/node" ]
+  check "fnm never involved" log_lacks '^fnm |fnm'
+  check "claude installed with npm after node" log_has '^npm install -g @anthropic-ai/claude-code$'
 
   : > "$LOG"
-  local backups_before; backups_before="$(find "$HOME/.local/state/laptop/backups" -type f | wc -l)"
+  local backups_before mise_conf_before
+  backups_before="$(find "$HOME/.local/state/laptop/backups" -type f | wc -l)"
+  mise_conf_before="$(cat "$HOME/.config/mise/config.toml")"
   run_linux
   check "re-run exits 0" [ "$RC" -eq 0 ]
   check "re-run installs nothing with brew" log_lacks '^brew install'
@@ -735,6 +834,9 @@ test_bazzite_run_and_rerun() {
   check "re-run makes no new backups" [ "$(find "$HOME/.local/state/laptop/backups" -type f | wc -l)" -eq "$backups_before" ]
   check "re-run does not regenerate the SSH key" log_lacks '^ssh-keygen'
   check "re-run has no stow failures" lacks "$OUT" "stow failed"
+  check "re-run does not run mise" log_lacks '^mise '
+  check "re-run reports node installed via mise" has "$OUT" "node already installed via mise"
+  check "re-run leaves mise config unchanged" [ "$mise_conf_before" = "$(cat "$HOME/.config/mise/config.toml")" ]
   teardown
 }
 
@@ -769,8 +871,107 @@ test_debian_dry_run() {
   check "never uses --adopt" lacks "$OUT" "--adopt"
   check "backs up instead of adopting" has "$OUT" "would back up ~/.bashrc"
   check "no brew / rpm-ostree" lacks "$OUT" "(brew install|rpm-ostree)"
+  check "plans mise's apt signing key" has "$OUT" "\[dry-run\] curl -fsSL https://mise.jdx.dev/gpg-key.pub \| gpg --dearmor \| sudo tee /etc/apt/keyrings/mise-archive-keyring.gpg"
+  check "plans mise's apt repo" has "$OUT" "https://mise.jdx.dev/deb stable main.*sudo tee /etc/apt/sources.list.d/mise.list"
+  check "plans apt install mise" has "$OUT" "\[dry-run\] sudo apt-get install -y mise$"
+  check "plans node lts via mise" has "$OUT" "\[dry-run\] mise use -g node@lts$"
+  check "mise is not run at all (it creates state)" log_lacks '^mise '
+  check "no fnm anywhere in the plan" lacks "$OUT" "fnm"
   check "no mutating command was executed" log_lacks "$MUTATING"
   check "HOME is untouched" [ "$before" = "$(home_snapshot)" ]
+  teardown
+
+  setup "pop dry-run (mise in ~/.local/bin, node installed)"
+  os_release pop "ubuntu debian"
+  dotfiles_fixture
+  mise_node_fixture
+  mkdir -p "$HOME/.local/bin"
+  mv "$STUBS/mise" "$HOME/.local/bin/mise"   # mise's own installer puts it here
+  before="$(home_snapshot)"
+  run_linux --dry-run
+  check "exits 0" [ "$RC" -eq 0 ]
+  check "finds mise in ~/.local/bin" has "$OUT" "mise already installed \($HOME/.local/bin/mise\)"
+  check "no mise apt repo planned" lacks "$OUT" "mise.jdx.dev|apt-get install -y mise"
+  check "node found on disk" has "$OUT" "node already installed via mise"
+  check "mise is not run at all" log_lacks '^mise '
+  check "HOME is untouched" [ "$before" = "$(home_snapshot)" ]
+  teardown
+}
+
+# ── Tests: Ubuntu / Pop!_OS stubbed run ──────────────────────────────────────
+
+test_debian_run_and_rerun() {
+  setup "pop run + re-run (stubbed)"
+  os_release pop "ubuntu debian"
+  dotfiles_fixture
+  run_linux
+  check "first run exits 0" [ "$RC" -eq 0 ]
+  check "mise installed from its apt repo" log_has '^sudo apt-get install -y mise$'
+  check "apt repo written before the install" [ "$(grep -nE '^sudo (tee /etc/apt/sources.list.d/mise.list|apt-get install -y mise)' "$LOG" | cut -d: -f2- | tr '\n' '|')" = "sudo tee /etc/apt/sources.list.d/mise.list|sudo apt-get install -y mise|" ]
+  check "node lts pinned via mise, once" [ "$(log_count '^mise use -g node@lts$')" -eq 1 ]
+  check "mise wrote its global config" [ "$(cat "$HOME/.config/mise/config.toml" 2>/dev/null)" = "$(printf '[tools]\nnode = "lts"')" ]
+  check "no fnm installer" log_lacks 'fnm'
+  local conf_before; conf_before="$(cat "$HOME/.config/mise/config.toml")"
+  : > "$LOG"
+  run_linux
+  check "re-run exits 0" [ "$RC" -eq 0 ]
+  check "re-run skips mise install" has "$OUT" "mise already installed"
+  check "re-run adds no mise apt repo" log_lacks 'mise\.list|mise-archive-keyring|apt-get install -y mise'
+  check "re-run does not run mise" log_lacks '^mise '
+  check "re-run leaves mise config unchanged" [ "$conf_before" = "$(cat "$HOME/.config/mise/config.toml")" ]
+  teardown
+}
+
+# ── Tests: mise edge cases ───────────────────────────────────────────────────
+
+test_mise_edge_cases() {
+  setup "node pinned in mise config but not installed"
+  bazzite
+  dotfiles_fixture
+  cp "$STATE/mise-stub" "$STUBS/mise"
+  mkdir -p "$HOME/.config/mise"
+  printf '# mine\n[settings]\nexperimental = true\n\n[tools]\n  "node" = "20"  # pinned\n' > "$HOME/.config/mise/config.toml"
+  local conf_before; conf_before="$(cat "$HOME/.config/mise/config.toml")"
+  run_linux --dry-run
+  check "dry run plans installing the pinned node" has "$OUT" "\[dry-run\] $STUBS/mise install node$"
+  check "dry run does not re-pin to lts" lacks "$OUT" "mise use"
+  check "dry run does not run mise" log_lacks '^mise '
+  run_linux
+  check "run installs the pinned node" log_has '^mise install node$'
+  check "run does not re-pin" log_lacks '^mise use'
+  check "config left as the user wrote it" [ "$conf_before" = "$(cat "$HOME/.config/mise/config.toml")" ]
+  teardown
+
+  setup "node outside [tools] does not count"
+  bazzite
+  dotfiles_fixture
+  cp "$STATE/mise-stub" "$STUBS/mise"
+  mkdir -p "$HOME/.config/mise" "$HOME/.local/share/mise/installs/node/18.0.0/bin"
+  touch "$HOME/.local/share/mise/installs/node/18.0.0/bin/node"
+  printf '[env]\nnode = "not a tool"\n[tools]\npython = "3.12"\n' > "$HOME/.config/mise/config.toml"
+  run_linux --dry-run
+  check "plans pinning node lts" has "$OUT" "\[dry-run\] $STUBS/mise use -g node@lts$"
+  check "does not claim node is installed" lacks "$OUT" "node already installed"
+  teardown
+
+  setup "leftover fnm is noted, not removed"
+  os_release pop "ubuntu debian"
+  dotfiles_fixture
+  mkdir -p "$HOME/.local/share/fnm/aliases"
+  touch "$HOME/.local/share/fnm/aliases/lts-latest"
+  run_linux --dry-run
+  check "notes fnm is still installed" has "$OUT" "note: fnm is still installed \($HOME/.local/share/fnm\)"
+  check "plans no fnm removal" lacks "$OUT" "\[dry-run\] .*(rm .*fnm|fnm uninstall)"
+  run_linux
+  check "fnm dir still there after a run" [ -e "$HOME/.local/share/fnm/aliases/lts-latest" ]
+  check "fnm dir not backed up" [ -z "$(find "$HOME/.local/state/laptop/backups" -path '*fnm*' 2>/dev/null)" ]
+  teardown
+
+  setup "no fnm, no note"
+  bazzite
+  dotfiles_fixture
+  run_linux --dry-run
+  check "no fnm note" lacks "$OUT" "fnm"
   teardown
 }
 
@@ -796,6 +997,9 @@ TESTS=(
   test_bazzite_run_and_rerun
   test_bazzite_layer_failure
   test_debian_dry_run
+  test_debian_run_and_rerun
+  test_mise_edge_cases
+  test_hand_made_repo_links
 )
 
 for t in "${TESTS[@]}"; do
