@@ -52,7 +52,7 @@ BREW_FORMULAE=(
   zsh-autosuggestions:
   zsh-syntax-highlighting:
   uv:uv
-  fnm:fnm
+  mise:mise
 )
 
 # Bazzite / Fedora Atomic: GUI apps come from Flatpak — none are needed yet.
@@ -170,28 +170,176 @@ detect_os() {
 
 # ── Shared steps ─────────────────────────────────────────────────────────────
 
-install_node() {
-  local fnm="$1"
-  step "Installing Node LTS via fnm"
-  if (( DRY_RUN )); then
-    # fnm creates state (multishell links, its data dir) even for env/list, so
-    # under --dry-run it is not run at all; look for its lts alias on disk.
-    local fnm_dir="${FNM_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/fnm}"
-    if [ -e "$fnm_dir/aliases/lts-latest" ]; then
-      ok "node lts already installed via fnm ($fnm_dir)"
-    else
-      run "$fnm" install --lts
-      run "$fnm" default lts-latest
-    fi
+# mise's own directories, resolved the way mise resolves them.
+mise_data_dir() { echo "${MISE_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/mise}"; }
+mise_config_file() {
+  if [ -n "${MISE_GLOBAL_CONFIG_FILE:-}" ]; then
+    echo "$MISE_GLOBAL_CONFIG_FILE"
+  else
+    echo "${MISE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/mise}/config.toml"
+  fi
+}
+
+# Path of an installed mise (on PATH, or where mise's own installer puts it),
+# or nothing. Never runs it: mise creates state and cache dirs whenever it runs.
+find_mise() {
+  if cmd_exists mise; then
+    command -v mise
+  elif [ -x "$HOME/.local/bin/mise" ]; then
+    echo "$HOME/.local/bin/mise"
+  fi
+}
+
+# What mise's global config file $1 says about node, parsed as real TOML with
+# python3's tomllib (mise is not run). Prints one line, fields split by "|":
+#   absent                  no file, or no tools.node entry: node may be pinned
+#   pinned|VERSION|KEY      a tools.node (or tools."core:node") entry exists; VERSION
+#                           is its version when it is one string, else empty
+#   uncertain|REASON        can't tell (no python3/tomllib, unreadable or
+#                           invalid file): never write the config
+mise_node_pin() {
+  local out
+  if ! cmd_exists python3; then
+    echo "uncertain|python3 not found"
     return 0
   fi
-  eval "$("$fnm" env --shell bash)"
-  if "$fnm" list 2>/dev/null | grep -q "lts"; then
-    ok "node lts already installed via fnm"
+  out="$(python3 -I -c '
+import os, sys
+path = sys.argv[1]
+def say(*fields):
+    print("|".join(" ".join(str(f).split()) for f in fields))
+    sys.exit(0)
+if not os.path.lexists(path):
+    say("absent")
+try:
+    import tomllib
+except ImportError:
+    say("uncertain", "python3 has no tomllib (needs Python 3.11+)")
+try:
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+except Exception as e:
+    say("uncertain", "cannot parse it: %s" % e)
+tools = data.get("tools", {})
+if not isinstance(tools, dict):
+    say("uncertain", "tools is not a table")
+for key in ("node", "core:node"):
+    if key in tools:
+        v = tools[key]
+        if isinstance(v, dict):
+            v = v.get("version")
+        say("pinned", v if isinstance(v, str) else "", key)
+say("absent")
+' "$1" 2>/dev/null)" || out=""
+  case "$out" in
+    absent|pinned\|*|uncertain\|*) echo "$out" ;;
+    *) echo "uncertain|python3 could not read it" ;;
+  esac
+}
+
+# True if mise's data dir $1 holds an executable node for version selection $2,
+# found the way mise lays out installs: installs/node/<selection> (a version,
+# or a prefix/alias symlink such as 22 or lts that mise makes), or for a
+# numeric prefix, installs/node/<prefix>.*. Anything else is not proven.
+node_installed() {
+  local dir="$1/installs/node" sel="$2" d
+  [[ "$sel" =~ ^[A-Za-z0-9._-]+$ && "$sel" != *..* ]] || return 1
+  [ -x "$dir/$sel/bin/node" ] && return 0
+  if [[ "$sel" =~ ^v?[0-9]+(\.[0-9]+)*$ ]]; then
+    sel="${sel#v}"
+    for d in "$dir/$sel".*; do
+      [ -x "$d/bin/node" ] && return 0
+    done
+  fi
+  return 1
+}
+
+# Why `mise use -g` must not write config file $1, or nothing if it may.
+# Fails closed: a path that cannot be canonicalised is never written.
+config_write_blocked() {
+  local cfg repo
+  if ! cfg="$(realpath -m -- "$1" 2>/dev/null)" || ! repo="$(realpath -m -- "$DOTFILES_DIR" 2>/dev/null)" ||
+     [ -z "$cfg" ] || [ -z "$repo" ]; then
+    echo "could not resolve mise's global config $1 or the dotfiles repo; not writing to it"
+  elif [[ "$cfg" == "$repo"/* ]]; then
+    # e.g. ~/.config is a link into the repo (a stow fold, or a dotfiles mise
+    # package): `mise use -g` would write into the repo.
+    echo "mise's global config $1 resolves into the dotfiles repo; not writing to it"
+  fi
+}
+
+# Note (don't remove) a Node manager this script no longer installs.
+note_old_fnm() {
+  local where="${FNM_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/fnm}"
+  if [ ! -d "$where" ]; then
+    where="$(command -v fnm)" || return 0
+  fi
+  printf "  \033[2mnote:\033[0m fnm is still installed (%s). Node now comes from mise; this script leaves fnm alone — remove it by hand when you no longer need it.\n" "$where"
+}
+
+# npm of the mise-managed Node, once that Node is known to be usable (under
+# --dry-run: once it is installed or planned). Empty means no usable Node, so
+# nothing that needs npm runs — never some other npm on PATH.
+NODE_NPM=""
+
+# Node LTS through mise. `mise use -g node@lts` pins it in mise's global config
+# (~/.config/mise/config.toml by default) and installs it. An existing pin, of
+# any form, is never changed, and the config is only written when it is
+# confirmed to have no node entry.
+MISE_BIN=""
+install_node() {
+  step "Installing Node LTS via mise"
+  local config data shims pin state version key reason pinned mise_ok=0
+  NODE_NPM=""
+  MISE_BIN="$(find_mise)"
+  config="$(mise_config_file)"
+  data="$(mise_data_dir)"
+  shims="$data/shims"
+  if (( ! DRY_RUN )) && [ -z "$MISE_BIN" ]; then
+    die "mise not found after installing it; cannot install Node"
+  fi
+  MISE_BIN="${MISE_BIN:-mise}"
+  # Decided from files on disk, never by running mise (it creates state, so a
+  # --dry-run must not run it), so a dry run and a real run agree.
+  pin="$(mise_node_pin "$config")"
+  IFS='|' read -r state version key <<<"$pin"
+  pinned="tools.$key = ${version:-(version not derived)}"
+  if [ "$state" = uncertain ]; then
+    reason="$version"
+    warn "can't tell whether mise's global config $config pins node ($reason); not changing it or installing Node. Fix it (or pin node yourself) and re-run"
+  elif [ "$state" = pinned ] && node_installed "$data" "$version" && [ -x "$shims/node" ] && [ -x "$shims/npm" ]; then
+    ok "node already installed via mise ($pinned in $config)"
+    mise_ok=1
+  elif [ "$state" = pinned ]; then
+    # Pinned, but disk can't prove a matching, usable install (other version,
+    # version not derived, no shims): reconcile through mise, don't re-pin.
+    if ! run "$MISE_BIN" install node; then
+      warn "'mise install node' failed ($pinned in $config)"
+    elif ! run "$MISE_BIN" reshim; then
+      warn "'mise reshim' failed after installing node; its node/npm shims may be missing"
+    else
+      mise_ok=1
+      did "reconciled node with mise ($pinned in $config)"
+    fi
+  elif reason="$(config_write_blocked "$config")" && [ -n "$reason" ]; then
+    warn "$reason. Add node = \"lts\" under [tools] there (or run 'mise use -g node@lts' yourself) and re-run"
+  elif run "$MISE_BIN" use -g node@lts; then
+    mise_ok=1
+    did "installed node lts with mise (pinned in $config)"
   else
-    run "$fnm" install --lts
-    run "$fnm" default lts-latest
-    did "installed node $(node --version 2>/dev/null || echo lts)"
+    warn "'mise use -g node@lts' failed"
+  fi
+  note_old_fnm
+  if (( ! mise_ok )); then
+    return 0
+  elif (( DRY_RUN )); then
+    NODE_NPM="$shims/npm"
+  elif [ -x "$shims/node" ] && [ -x "$shims/npm" ]; then
+    NODE_NPM="$shims/npm"
+    # Put mise's node first for the following steps (npm's scripts run node).
+    export PATH="$shims:$PATH"
+  else
+    warn "mise's node/npm shims are missing from $shims; Node is not usable"
   fi
 }
 
@@ -199,9 +347,23 @@ install_claude() {
   step "Installing Claude Code"
   if cmd_exists claude; then
     ok "claude already installed"
+  elif [ -z "$NODE_NPM" ]; then
+    warn "skipped Claude Code: no usable mise-managed Node (see above). Once Node works: npm install -g @anthropic-ai/claude-code"
   else
-    run npm install -g @anthropic-ai/claude-code
-    did "installed claude"
+    run "$NODE_NPM" install -g @anthropic-ai/claude-code
+    # npm put claude in node's own bin dir; a shim makes it reachable on PATH.
+    if run "$MISE_BIN" reshim; then
+      did "installed claude"
+    else
+      warn "installed Claude Code, but 'mise reshim' failed, so claude has no shim; run 'mise reshim'"
+    fi
+  fi
+}
+
+# npm settings, only through the mise-managed npm.
+npm_no_fund() {
+  if [ -n "$NODE_NPM" ]; then
+    run "$NODE_NPM" config set fund false 2>/dev/null || true
   fi
 }
 
@@ -326,8 +488,12 @@ backup_file() {
   fi
 }
 
-# True if $1 resolves to a path inside the dotfiles repo, i.e. a link stow owns
-# (possibly a directory it folded into another package of this repo).
+# True if $1 resolves to a path inside the dotfiles repo. This is repository
+# membership only: it does not prove stow made the link. A stow fold qualifies,
+# but so does a link made by hand into the repo. Either way the script never
+# moves it (anything below it lives in the repo) and leaves it to stow, which
+# unfolds a directory link into one of its packages and reports every other
+# clash as a conflict (the package is then reported as failed, not forced).
 in_repo() {
   local real repo
   real="$(realpath "$1" 2>/dev/null)" || return 1
@@ -352,8 +518,9 @@ resolve_conflict() {
       if [ "$(realpath "$a" 2>/dev/null)" = "$(realpath "$pkg_dir/$prefix")" ]; then
         return 0 # folded by stow into this package
       elif in_repo "$a"; then
-        # Folded into another package of this repo: stow unfolds it itself.
-        # Anything below it lives in the repo, so never move it.
+        # Resolves into the repo (a fold into another package, or a link made
+        # by hand): stow's to unfold or report. Anything below it lives in the
+        # repo, so never move it.
         return 0
       elif [ -d "$a" ]; then
         warn "$a is a symlink to somewhere else; not touching $HOME/$rel — resolve by hand"
@@ -377,7 +544,7 @@ resolve_conflict() {
     return 0 # already moved, or already stowed
   fi
   if [ -L "$a" ] && in_repo "$a"; then
-    return 0 # another package's link: stow's to resolve (it reports real clashes)
+    return 0 # resolves into the repo (stow's or hand-made): stow's to resolve; it reports clashes
   fi
   backup_file "$a" "$rel" || return 1
 }
@@ -470,6 +637,7 @@ install_debian() {
   apt_install \
     build-essential \
     curl \
+    gpg \
     wget \
     git \
     git-delta \
@@ -497,19 +665,23 @@ install_debian() {
     did "installed gh"
   fi
 
-  step "Installing fnm"
-  local fnm_bin="$HOME/.local/share/fnm/fnm"
-  if [ -x "$fnm_bin" ]; then
-    if (( DRY_RUN )); then
-      ok "fnm already installed" # not run under --dry-run: fnm creates state
-    else
-      ok "fnm already installed ($("$fnm_bin" --version))"
-    fi
+  step "Installing mise"
+  if [ -n "$(find_mise)" ]; then
+    ok "mise already installed ($(find_mise))" # not run: mise creates state
   else
-    run_sh "curl -fsSL https://fnm.vercel.app/install | bash -s -- --skip-shell"
-    did "installed fnm"
+    # mise's official apt repo: signed packages that `apt-get upgrade` keeps
+    # current, set up the same way as the gh repo above.
+    run sudo install -dm 755 /etc/apt/keyrings
+    # The key is dearmored to a temp file first, so a failed download never
+    # leaves an empty keyring behind; both files are made apt-readable (0644).
+    run_sh "tmp=\$(mktemp) && trap 'rm -f \"\$tmp\"' EXIT && curl -fsSL https://mise.jdx.dev/gpg-key.pub | gpg --dearmor > \"\$tmp\" && sudo install -m 644 \"\$tmp\" /etc/apt/keyrings/mise-archive-keyring.gpg"
+    run_sh "echo \"deb [signed-by=/etc/apt/keyrings/mise-archive-keyring.gpg arch=\$(dpkg --print-architecture)] https://mise.jdx.dev/deb stable main\" | sudo tee /etc/apt/sources.list.d/mise.list > /dev/null"
+    run sudo chmod 644 /etc/apt/sources.list.d/mise.list
+    run sudo apt-get update -qq
+    run sudo apt-get install -y mise
+    did "installed mise"
   fi
-  install_node "$fnm_bin"
+  install_node
   install_claude
   install_bun
 
@@ -550,7 +722,7 @@ install_debian() {
   if cmd_exists go; then
     run go telemetry off 2>/dev/null || true
   fi
-  run npm config set fund false 2>/dev/null || true
+  npm_no_fund
   ok "telemetry disabled"
 
   configure_git
@@ -678,9 +850,7 @@ install_atomic() {
   ensure_brew
   install_brew_formulae
 
-  local fnm_bin
-  fnm_bin="$(command -v fnm || echo "${HOMEBREW_PREFIX:-/home/linuxbrew/.linuxbrew}/bin/fnm")"
-  install_node "$fnm_bin"
+  install_node
   install_claude
   install_bun
 
@@ -691,7 +861,7 @@ install_atomic() {
   if cmd_exists go; then
     run go telemetry off 2>/dev/null || true
   fi
-  run npm config set fund false 2>/dev/null || true
+  npm_no_fund
   ok "telemetry disabled"
 
   configure_git

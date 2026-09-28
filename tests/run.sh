@@ -6,7 +6,7 @@
 # stub that logs its arguments, and PATH holds only those stubs plus a sandbox
 # of core utilities. HOME is a throwaway directory. The script runs under
 # `env -i` with an allowlisted environment (see sandboxed), so exported shell
-# functions, BASH_ENV/ENV and host HOMEBREW_*/FNM_*/XDG_* settings never reach it.
+# functions, BASH_ENV/ENV and host HOMEBREW_*/MISE_*/FNM_*/XDG_* settings never reach it.
 #
 # Usage: tests/run.sh
 
@@ -24,11 +24,11 @@ CURRENT=""
 # Core utilities the script (and the stubs) legitimately need.
 CORE_UTILS=(bash env cat grep sed find realpath dirname basename date mkdir mv cp rm ln chmod head tr sort mktemp touch readlink ls wc python3)
 
-ALL_FORMULAE=(git git-delta stow neovim tmux jq ripgrep fd fzf bat wget gh starship zsh zsh-autosuggestions zsh-syntax-highlighting uv fnm)
+ALL_FORMULAE=(git git-delta stow neovim tmux jq ripgrep fd fzf bat wget gh starship zsh zsh-autosuggestions zsh-syntax-highlighting uv mise)
 ALL_PACKAGES=(agy bash bat bin ghostty git nvim ripgrep ssh starship tmux zsh)
 
 # Calls that would change the machine. None may appear during --dry-run.
-MUTATING='^(sudo|apt-get|chsh|usermod|ujust|ssh-keygen|npm|curl|stow|systemctl|ubuntu-report|unzip|fc-cache)( |$)|^brew install|^rpm-ostree (install|upgrade|reboot)|^flatpak install|^git (clone|config)|^fnm (install|default)'
+MUTATING='^(sudo|apt-get|chsh|usermod|ujust|ssh-keygen|npm|curl|stow|systemctl|ubuntu-report|unzip|fc-cache)( |$)|^brew install|^rpm-ostree (install|upgrade|reboot)|^flatpak install|^git (clone|config)|^mise (use|install|reshim)|^mise-'
 
 # rpm-ostree status --json shapes. Deployments are listed newest first:
 # staged/pending, then booted, then rollback.
@@ -36,14 +36,108 @@ BOOTED_ONLY='{"deployments":[{"booted":true,"requested-packages":[],"packages":[
 PENDING_GHOSTTY='{"deployments":[{"booted":false,"staged":true,"requested-packages":["ghostty"],"packages":["ghostty"]},{"booted":true,"requested-packages":[]}]}'
 ROLLBACK_GHOSTTY='{"deployments":[{"booted":true,"requested-packages":[],"packages":[]},{"booted":false,"requested-packages":["ghostty"],"packages":["ghostty"]}]}'
 
-# Like real fnm, the stub leaves state behind whenever it runs (except --version):
-# env creates a multishell link, anything else creates its data dir.
-FNM_SIDE_EFFECTS='
-if [ "$1" != --version ]; then
-  mkdir -p "$HOME/.local/share/fnm/node-versions"
-  if [ "$1" = env ]; then mkdir -p "$HOME/.local/state/fnm_multishells"; ln -sfn / "$HOME/.local/state/fnm_multishells/$$"; fi
+# A mise that models its filesystem side effects. Like real mise, every
+# invocation leaves state and cache dirs behind; `use -g node@lts` writes the
+# global config and installs node; `install node` installs the pinned version
+# (a no-op if it is already installed, shims included); `reshim` rebuilds the
+# shims from what is installed. Installs and shims come from node-install (see
+# write_node_install). It resolves its dirs from the same MISE_*/XDG_*
+# variables as real mise. STUB_MISE_RC makes use/install fail and
+# STUB_RESHIM_RC makes reshim fail.
+MISE_SIDE_EFFECTS='
+conf="${MISE_GLOBAL_CONFIG_FILE:-${MISE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/mise}/config.toml}"
+mkdir -p "${XDG_STATE_HOME:-$HOME/.local/state}/mise" "${XDG_CACHE_HOME:-$HOME/.cache}/mise"
+case "$*" in
+  --version)         echo "2026.9.0 linux-x64 (stub)" ;;
+  "use -g node@lts") [ "${STUB_MISE_RC:-0}" = 0 ] || exit "$STUB_MISE_RC"
+                     mkdir -p "${conf%/*}"; printf "[tools]\nnode = \"lts\"\n" >> "$conf"
+                     "$STUB_STATE/node-install" lts ;;
+  "install node")    [ "${STUB_MISE_RC:-0}" = 0 ] || exit "$STUB_MISE_RC"
+                     "$STUB_STATE/node-install" "$("$STUB_STATE/node-install" --pin)" ;;
+  reshim)            [ "${STUB_RESHIM_RC:-0}" = 0 ] || exit "$STUB_RESHIM_RC"
+                     "$STUB_STATE/node-install" --reshim ;;
+  *)                 echo "stub mise: unexpected: $*" >&2; exit 2 ;;
+esac'
+
+# node-install models what mise leaves on disk for node:
+#   node-install SEL   install the version SEL resolves to (installs/node/<v>/bin
+#                      with node and npm, plus the prefix/alias links mise makes:
+#                      22, 22.12, and lts/latest for 22.12.0), then reshim — only
+#                      if that version wasn't installed yet. NODE_NO_ALIAS=1 skips
+#                      the lts/latest links.
+#   --reshim           one shim per executable in any installed version's bin
+#   --pin / --which    the config's node selection / the version it resolves to
+# Each tool logs as "mise-<version>-<tool>" and each shim as "mise-shim-<tool>";
+# a shim runs the pinned version's tool, as mise's shims do. The versioned
+# npm's `install -g @anthropic-ai/claude-code` adds claude to that bin dir, not
+# a shim: only reshim exposes it.
+write_node_install() {
+  cat > "$STATE/node-install" <<'EOF'
+#!@BASH@
+data="${MISE_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/mise}"
+conf="${MISE_GLOBAL_CONFIG_FILE:-${MISE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/mise}/config.toml}"
+dir="$data/installs/node"
+resolve() {
+  case "$1" in
+    ""|lts|latest|22|22.*) echo 22.12.0 ;;
+    20|20.*)               echo 20.18.1 ;;
+    *)                     echo "$1" ;;
+  esac
+}
+pin() {
+  python3 -I -c '
+import sys, tomllib
+try:
+    v = tomllib.load(open(sys.argv[1], "rb")).get("tools", {}).get("node", "")
+except Exception:
+    v = ""
+if isinstance(v, dict): v = v.get("version", "")
+if isinstance(v, list): v = v[0] if v else ""
+print(v)' "$conf"
+}
+tool() { # tool PATH LABEL
+  cat > "$1" <<TOOL
+#!@BASH@
+printf '%s\n' "mise-$2 \$*" >> "\$STUB_LOG"
+if [ "\$*" = "install -g @anthropic-ai/claude-code" ]; then
+  printf '#!@BASH@\nexit 0\n' > "\${0%/*}/claude"; chmod +x "\${0%/*}/claude"
 fi
-'
+TOOL
+  chmod +x "$1"
+}
+reshim() {
+  local b n
+  rm -rf "$data/shims"; mkdir -p "$data/shims"
+  for b in "$dir"/*/bin/*; do
+    [ -x "$b" ] && [ ! -L "${b%/bin/*}" ] || continue
+    n="${b##*/}"
+    cat > "$data/shims/$n" <<SHIM
+#!@BASH@
+printf '%s\n' "mise-shim-$n \$*" >> "\$STUB_LOG"
+v="\$("$0" --which)"
+[ -x "$dir/\$v/bin/$n" ] || { echo "mise: $n is not installed for node \$v" >&2; exit 127; }
+exec "$dir/\$v/bin/$n" "\$@"
+SHIM
+    chmod +x "$data/shims/$n"
+  done
+}
+case "$1" in
+  --pin)    pin; exit 0 ;;
+  --which)  resolve "$(pin)"; exit 0 ;;
+  --reshim) reshim; exit 0 ;;
+esac
+v="$(resolve "$1")"
+[ -x "$dir/$v/bin/node" ] && exit 0 # already installed: nothing to do
+mkdir -p "$dir/$v/bin"
+tool "$dir/$v/bin/node" "$v-node"
+tool "$dir/$v/bin/npm" "$v-npm"
+ln -sfn "$v" "$dir/${v%%.*}"; ln -sfn "$v" "$dir/${v%.*}"
+if [ "$v" = 22.12.0 ] && [ -z "${NODE_NO_ALIAS:-}" ]; then ln -sfn "$v" "$dir/lts"; ln -sfn "$v" "$dir/latest"; fi
+reshim
+EOF
+  sed -i "s|@BASH@|$SANDBOX/sysbin/bash|g" "$STATE/node-install"
+  chmod +x "$STATE/node-install"
+}
 
 # ── Assertions ───────────────────────────────────────────────────────────────
 
@@ -56,6 +150,7 @@ check() { # check "description" command...
 }
 
 has()      { grep -qE -- "$2" <<<"$1"; }
+is_real_dir() { [ -d "$1" ] && [ ! -L "$1" ]; }
 lacks()    { ! grep -qE -- "$2" <<<"$1"; }
 log_has()  { grep -qE -- "$1" "$LOG"; }
 log_lacks(){ ! grep -qE -- "$1" "$LOG"; }
@@ -107,18 +202,29 @@ setup() { # setup TEST_NAME
     ln -s "$path" "$SANDBOX/sysbin/$u"
   done
 
-  stub sudo; stub apt-get; stub chsh; stub usermod; stub ujust; stub flatpak
-  stub systemctl; stub npm; stub unzip; stub fc-cache
-  stub curl 'exit "${STUB_CURL_RC:-0}"' 
-  stub dpkg 'exit 1'
+  # mise is absent until something installs it: `brew install mise` or
+  # `sudo apt-get install -y mise` puts this stub on PATH.
+  stub mise "$MISE_SIDE_EFFECTS"; mv "$STUBS/mise" "$STATE/mise-stub"
+  # Like `sudo tee` / `sudo dd`, read piped input, so the writer never gets SIGPIPE.
+  stub sudo '[ -p /dev/stdin ] && cat > /dev/null
+[ "$*" = "apt-get install -y mise" ] && cp "$STUB_STATE/mise-stub" "${0%/*}/mise"; exit 0'
+  stub apt-get; stub chsh; stub usermod; stub ujust; stub flatpak
+  stub systemctl; stub unzip; stub fc-cache
+  # A competing npm on PATH: the script must only use mise's. It fails, loudly.
+  stub npm 'echo "stub: PATH npm used instead of mise-managed npm" >&2; exit 97'
+  write_node_install
+  stub sh '[ -p /dev/stdin ] && cat > /dev/null; exit 0' # `curl ... | sh` installers
+  stub curl 'if [ -n "${STUB_CURL_FAIL:-}" ] && [[ "$*" == *"$STUB_CURL_FAIL"* ]]; then exit 22; fi; exit "${STUB_CURL_RC:-0}"'
+  stub dpkg '[ "$1" = --print-architecture ] && echo amd64 || exit 1'
+  stub gpg 'exit "${STUB_GPG_RC:-0}"'
   stub fc-list 'echo "/x/JetBrainsMonoNerdFont-Regular.ttf: JetBrainsMono Nerd Font:style=Regular"'
   stub git 'if [ "$1" = clone ]; then mkdir -p "$3/.git"; fi'
   stub ssh-keygen 'while [ $# -gt 0 ]; do [ "$1" = -f ] && { touch "$2" "$2.pub"; break; }; shift; done'
-  stub fnm "$FNM_SIDE_EFFECTS"'case "$1" in --version) echo "fnm 1.0";; esac'
   stub brew '
 case "$1" in
   list)     grep -qx -- "${!#}" "$STUB_STATE/brew-installed" ;;
-  install)  shift; printf "%s\n" "$@" >> "$STUB_STATE/brew-installed" ;;
+  install)  shift; printf "%s\n" "$@" >> "$STUB_STATE/brew-installed"
+            for f; do [ "$f" = mise ] && cp "$STUB_STATE/mise-stub" "${0%/*}/mise"; done; exit 0 ;;
   --prefix) cd "$(dirname "$0")/.." && pwd ;;
   shellenv) p="$(cd "$(dirname "$0")/.." && pwd)"
             echo "export HOMEBREW_PREFIX=\"$p\"; export PATH=\"$p/bin:\$PATH\";" ;;
@@ -204,6 +310,20 @@ dotfiles_fixture() {
   echo "README — must not be stowed" > "$d/bash/README.md"
 }
 
+# mise on PATH, node pinned in its global config and installed, as
+# `mise use -g node@lts` leaves it. Made without running mise.
+mise_node_fixture() { # mise_node_fixture [PIN] [INSTALLED_VERSION]
+  cp "$STATE/mise-stub" "$STUBS/mise"
+  mkdir -p "$HOME/.config/mise"
+  printf '[tools]\nnode = "%s"\n' "${1:-lts}" > "$HOME/.config/mise/config.toml"
+  sandboxed "$STATE/node-install" "${2:-${1:-lts}}"
+}
+
+# Line number of the first log entry matching $1 (0 if none).
+log_line() { local n; n="$(grep -nE -m1 -- "$1" "$LOG" | cut -d: -f1)"; echo "${n:-0}"; }
+# True if the first match of $1 is logged before the first match of $2.
+logged_before() { local a b; a="$(log_line "$1")"; b="$(log_line "$2")"; [ "$a" -gt 0 ] && [ "$b" -gt "$a" ]; }
+
 # Everything already in place, as after a successful run.
 all_done_fixture() {
   printf "%s\n" "${ALL_FORMULAE[@]}" > "$STATE/brew-installed"
@@ -212,9 +332,7 @@ all_done_fixture() {
   touch "$HOME/.ssh/id_ed25519"
   printf '#!%s\necho 1.1.0\n' "$SANDBOX/sysbin/bash" > "$HOME/.bun/bin/bun"; chmod +x "$HOME/.bun/bin/bun"
   stub claude
-  stub fnm "$FNM_SIDE_EFFECTS"'case "$1" in list) echo "* v22.0.0 default, lts-latest";; --version) echo "fnm 1.0";; esac'
-  mkdir -p "$HOME/.local/share/fnm/aliases"
-  touch "$HOME/.local/share/fnm/aliases/lts-latest"
+  mise_node_fixture
   sandboxed "$STUBS/stow" --dir="$HOME/Projects/Home/dotfiles" --target="$HOME" --restow "${ALL_PACKAGES[@]}"
   : > "$LOG"
 }
@@ -266,7 +384,7 @@ sandboxed() {
     LAPTOP_YUM_REPOS_DIR="$LAPTOP_YUM_REPOS_DIR" LAPTOP_BREW_DIRS="$LAPTOP_BREW_DIRS"
     STUB_LOG="$STUB_LOG" STUB_STATE="$STUB_STATE"
   )
-  for v in STUB_CURL_RC STUB_OSTREE_RC; do
+  for v in STUB_CURL_RC STUB_CURL_FAIL STUB_GPG_RC STUB_MISE_RC STUB_RESHIM_RC STUB_OSTREE_RC; do
     if [ -n "${!v:-}" ]; then vars+=("$v=${!v}"); fi
   done
   "$SANDBOX/sysbin/env" -i "${vars[@]}" "$@"
@@ -274,7 +392,7 @@ sandboxed() {
 
 run_linux() { # run_linux ARGS... — sets OUT and RC
   guard_sandbox || { echo "refusing to run outside the sandbox" >&2; exit 2; }
-  OUT="$(sandboxed "$SANDBOX/sysbin/bash" "$SCRIPT" "$@" 2>&1)"
+  OUT="$(sandboxed "$SANDBOX/sysbin/bash" "$SCRIPT" "$@" 2>&1 </dev/null)"
   RC=$?
   # shellcheck disable=SC2001 # a regex, not a fixed string
   OUT="$(sed $'s/\x1b\\[[0-9;]*m//g' <<<"$OUT")" # drop colours
@@ -340,7 +458,7 @@ test_bazzite_dry_run_fresh() {
   check "detects Bazzite" has "$OUT" "Detected Bazzite"
   check "plans exactly one brew install" [ "$(grep -cF '[dry-run] brew install' <<<"$OUT")" -eq 1 ]
   local f
-  for f in zsh zsh-autosuggestions zsh-syntax-highlighting git-delta neovim ripgrep fd fzf bat jq gh starship uv wget; do
+  for f in zsh zsh-autosuggestions zsh-syntax-highlighting git-delta neovim ripgrep fd fzf bat jq gh starship uv wget mise; do
     check "brew installs $f" has "$brew_line" " $f( |$)"
   done
   check "skips image-provided tmux" lacks "$brew_line" " tmux( |$)"
@@ -361,8 +479,9 @@ test_bazzite_dry_run_fresh() {
   check "keeps bash as login shell" has "$OUT" "login shell stays bash"
   check "no apt/sudo/chsh/ujust/flatpak in plan" lacks "$OUT" "\[dry-run\] (sudo|apt-get|chsh|usermod|ujust|flatpak)"
   check "no mutating command was executed" log_lacks "$MUTATING"
-  check "fnm is not run at all (it creates state)" log_lacks '^fnm '
-  check "plans the LTS install instead" has "$OUT" "\[dry-run\] .*fnm install --lts"
+  check "mise is not run at all (it creates state)" log_lacks '^mise '
+  check "plans node lts via mise" has "$OUT" "\[dry-run\] mise use -g node@lts$"
+  check "no fnm anywhere in the plan" lacks "$OUT" "fnm"
   check "HOME is untouched" [ "$before" = "$(home_snapshot)" ]
   check "says nothing was changed" has "$OUT" "Dry run complete"
   teardown
@@ -373,16 +492,19 @@ test_bazzite_dry_run_all_done() {
   bazzite
   dotfiles_fixture
   all_done_fixture
+  local before; before="$(home_snapshot)"
   run_linux --dry-run
   check "exits 0" [ "$RC" -eq 0 ]
+  check "HOME is untouched" [ "$before" = "$(home_snapshot)" ]
   check "no brew install" lacks "$OUT" "brew install"
   check "no rpm-ostree install" lacks "$OUT" "rpm-ostree install"
   check "ghostty already installed" has "$OUT" "ghostty already installed"
   check "no reboot needed" lacks "$OUT" "Reboot required"
   check "no backups" lacks "$OUT" "back up"
   check "no ssh-keygen" lacks "$OUT" "ssh-keygen"
-  check "fnm is not run; LTS found on disk" [ "$(log_count '^fnm ')" -eq 0 ]
-  check "reports node lts installed" has "$OUT" "node lts already installed"
+  check "mise is not run; node found on disk" [ "$(log_count '^mise ')" -eq 0 ]
+  check "reports node installed via mise" has "$OUT" 'node already installed via mise \(tools.node = lts in '
+  check "no mise use/install planned" lacks "$OUT" "\[dry-run\] mise "
   check "no mutating command was executed" log_lacks "$MUTATING"
   teardown
 }
@@ -581,9 +703,309 @@ test_folded_into_other_package() {
   check "stow ran for bat" log_has '^stow .* bat$'
   check "bat config resolves into bat" [ "$(realpath "$HOME/.config/bat/config")" = "$(realpath "$d/bat/.config/bat/config")" ]
   check "agy config still resolves into agy" [ "$(realpath "$HOME/.config/agy/permissions.json")" = "$(realpath "$d/agy/.config/agy/permissions.json")" ]
-  check ".config was unfolded into a real dir" [ -d "$HOME/.config" ] && [ ! -L "$HOME/.config" ]
+  check ".config was unfolded into a real dir" is_real_dir "$HOME/.config"
   check "repo contents unchanged" [ "$repo_before" = "$(repo_snapshot)" ]
+  check "mise config not written through the fold" [ ! -e "$d/agy/.config/mise" ]
+  check "mise was not asked to pin node" log_lacks '^mise use'
+  check "says why node was not pinned" has "$OUT" "mise's global config .* resolves into the dotfiles repo; not writing to it"
+  check "skips Claude with a clear warning" has "$OUT" "skipped Claude Code: no usable mise-managed Node"
+  check "competing PATH npm never used" log_lacks '^npm '
+  check "no npm through mise either" log_lacks '^mise-'
   check "no backups made" [ ! -e "$HOME/.local/state/laptop/backups" ]
+  teardown
+}
+
+# Installed-Node detection must match the pin and need an executable node;
+# Claude must only ever be installed through mise's own npm.
+test_node_readiness() {
+  setup "pinned 20, only 22 installed"
+  bazzite
+  dotfiles_fixture
+  mise_node_fixture 20 22.12.0
+  local conf_before before; conf_before="$(cat "$HOME/.config/mise/config.toml")"
+  before="$(home_snapshot)"
+  run_linux --dry-run
+  check "dry run: 22 does not satisfy the pin" lacks "$OUT" "node already installed"
+  check "dry run: plans installing the pinned node" has "$OUT" "\[dry-run\] $STUBS/mise install node$"
+  check "dry run: does not re-pin" lacks "$OUT" "\[dry-run\] .*mise use"
+  check "dry run: mise not run" log_lacks '^mise '
+  check "dry run: HOME is untouched" [ "$before" = "$(home_snapshot)" ]
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "runs mise install node" log_has '^mise install node$'
+  check "node 20 is now installed" [ -x "$HOME/.local/share/mise/installs/node/20.18.1/bin/node" ]
+  check "pin unchanged" [ "$conf_before" = "$(cat "$HOME/.config/mise/config.toml")" ]
+  check "claude through mise's npm shim, after node" logged_before '^mise install node$' '^mise-shim-npm install -g @anthropic-ai/claude-code$'
+  check "PATH npm never used" log_lacks '^npm '
+  teardown
+
+  setup "pinned lts, installed node not executable"
+  bazzite
+  dotfiles_fixture
+  mise_node_fixture lts
+  chmod -x "$HOME/.local/share/mise/installs/node/22.12.0/bin/node"
+  run_linux --dry-run
+  check "dry run: not counted as installed" lacks "$OUT" "node already installed"
+  check "dry run: plans mise install node" has "$OUT" "\[dry-run\] $STUBS/mise install node$"
+  check "dry run: mise not run" log_lacks '^mise '
+  run_linux
+  check "run reinstalls through mise" log_has '^mise install node$'
+  check "node is executable afterwards" [ -x "$HOME/.local/share/mise/installs/node/22.12.0/bin/node" ]
+  teardown
+
+  setup "installed but shims missing"
+  bazzite
+  dotfiles_fixture
+  mise_node_fixture lts
+  rm -rf "$HOME/.local/share/mise/shims"
+  run_linux
+  check "not counted as ready" lacks "$OUT" "node already installed"
+  check "reshims after install" logged_before '^mise install node$' '^mise reshim$'
+  check "shims restored (install alone is a no-op)" [ -x "$HOME/.local/share/mise/shims/npm" ]
+  check "claude through the restored shim" log_has '^mise-shim-npm install -g @anthropic-ai/claude-code$'
+  teardown
+
+  setup "shims missing, reshim fails"
+  bazzite
+  dotfiles_fixture
+  mise_node_fixture lts
+  rm -rf "$HOME/.local/share/mise/shims"
+  STUB_RESHIM_RC=1 run_linux
+  check "run completes" [ "$RC" -eq 0 ]
+  check "reshim failure has its own warning" has "$OUT" "'mise reshim' failed after installing node"
+  check "not reported as an install failure" lacks "$OUT" "'mise install node' failed"
+  check "skips Claude" has "$OUT" "skipped Claude Code"
+  check "no npm of any kind" log_lacks 'npm'
+  teardown
+
+  setup "no installs/node/lts link"
+  bazzite
+  dotfiles_fixture
+  mise_node_fixture lts
+  rm "$HOME/.local/share/mise/installs/node/lts"
+  stub claude
+  local conf_before; conf_before="$(cat "$HOME/.config/mise/config.toml")"
+  run_linux --dry-run
+  check "dry run: lts not proven without the link" lacks "$OUT" "node already installed"
+  check "dry run: plans reconciling with mise" has "$OUT" "\[dry-run\] $STUBS/mise install node$"
+  check "dry run: mise not run" log_lacks '^mise '
+  run_linux
+  : > "$LOG"
+  run_linux
+  check "every run reconciles again" [ "$(log_count '^mise (install node|reshim)$')" -eq 2 ]
+  check "never re-pins" log_lacks '^mise use'
+  check "config unchanged" [ "$conf_before" = "$(cat "$HOME/.config/mise/config.toml")" ]
+  teardown
+
+  setup "[tools.node] table with version"
+  bazzite
+  dotfiles_fixture
+  mise_node_fixture 20
+  printf '[tools.node]\nversion = "20"\n' > "$HOME/.config/mise/config.toml"
+  stub claude
+  run_linux --dry-run
+  check "recognised as installed" has "$OUT" 'node already installed via mise \(tools.node = 20 in '
+  check "mise not run" log_lacks '^mise '
+  teardown
+
+  setup "node entry that cannot be parsed"
+  bazzite
+  dotfiles_fixture
+  mise_node_fixture lts
+  printf '[tools]\nnode = ["22", "20"]\n' > "$HOME/.config/mise/config.toml"
+  conf_before="$(cat "$HOME/.config/mise/config.toml")"
+  run_linux --dry-run
+  check "dry run: never re-pins" lacks "$OUT" "\[dry-run\] .*mise use"
+  check "dry run: plans mise install node" has "$OUT" "\[dry-run\] $STUBS/mise install node$"
+  run_linux
+  check "run never re-pins" log_lacks '^mise use'
+  check "config unchanged" [ "$conf_before" = "$(cat "$HOME/.config/mise/config.toml")" ]
+  teardown
+
+  setup "config blocked, no npm anywhere"
+  bazzite
+  dotfiles_fixture
+  ln -s Projects/Home/dotfiles/agy/.config "$HOME/.config"
+  rm "$STUBS/npm"
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "skips Claude with a clear warning" has "$OUT" "skipped Claude Code: no usable mise-managed Node"
+  check "no npm call of any kind" log_lacks 'npm'
+  check "no command-not-found noise" lacks "$OUT" "npm: command not found"
+  teardown
+
+  setup "reshim after the claude install fails"
+  bazzite
+  dotfiles_fixture
+  STUB_RESHIM_RC=1 run_linux
+  check "run completes" [ "$RC" -eq 0 ]
+  check "claude was installed by npm" log_has '^mise-shim-npm install -g @anthropic-ai/claude-code$'
+  check "warns claude has no shim" has "$OUT" "installed Claude Code, but 'mise reshim' failed"
+  check "no shim was made" [ ! -e "$HOME/.local/share/mise/shims/claude" ]
+  teardown
+
+  setup "mise use fails"
+  bazzite
+  dotfiles_fixture
+  STUB_MISE_RC=1 run_linux
+  check "run completes" [ "$RC" -eq 0 ]
+  check "reports the failure" has "$OUT" "'mise use -g node@lts' failed"
+  check "skips Claude" has "$OUT" "skipped Claude Code"
+  check "competing PATH npm never used" log_lacks '^npm '
+  teardown
+
+  setup "config path cannot be canonicalised"
+  bazzite
+  dotfiles_fixture
+  stub realpath 'case "$*" in *config.toml*) exit 1 ;; esac; exec "$STUB_STATE/../sysbin/realpath" "$@"'
+  run_linux --dry-run
+  check "dry run: fails closed" has "$OUT" "could not resolve mise's global config"
+  check "dry run: no mise use planned" lacks "$OUT" "\[dry-run\] .*mise use"
+  run_linux
+  check "run: fails closed" has "$OUT" "could not resolve mise's global config"
+  check "run: mise use never ran" log_lacks '^mise use'
+  check "run: no config written" [ ! -e "$HOME/.config/mise/config.toml" ]
+  check "run: Claude skipped" has "$OUT" "skipped Claude Code"
+  teardown
+}
+
+# mise's global config is read with python3's tomllib. A node entry in any
+# valid TOML form is a pin (never re-pinned); an unreadable config, or no way to
+# parse it, is uncertain (never written, Node not installed).
+pin_fixture() { # pin_fixture NAME TOML — the pin (20) differs from what is installed (22)
+  setup "$1"
+  bazzite
+  dotfiles_fixture
+  mise_node_fixture lts 22.12.0
+  printf '%b' "$2" > "$HOME/.config/mise/config.toml"
+  cp "$HOME/.config/mise/config.toml" "$SANDBOX/config.before"
+}
+same_config() { cmp -s "$SANDBOX/config.before" "$HOME/.config/mise/config.toml"; }
+
+test_mise_config_parsing() {
+  local name toml
+  for name in quoted-table dotted-key multiline-fake-header; do
+    case "$name" in
+      quoted-table)          toml='["tools"]\nnode = "20"\n' ;;
+      dotted-key)            toml='[tools]\nnode.version = "20"\n' ;;
+      multiline-fake-header) toml='[env]\nBANNER = """\n[tools]\nnode = "lts"\n"""\n\n[tools.node]\nversion = "20"\n' ;;
+    esac
+    pin_fixture "pin 20 as $name" "$toml"
+    run_linux --dry-run
+    check "dry run: sees the pin (not installed: 22 only)" lacks "$OUT" "node already installed"
+    check "dry run: no mise use planned" lacks "$OUT" "\[dry-run\] .*mise use"
+    check "dry run: plans mise install node" has "$OUT" "\[dry-run\] $STUBS/mise install node$"
+    check "dry run: mise not run" log_lacks '^mise '
+    check "dry run: config byte-identical" same_config
+    run_linux
+    check "run exits 0" [ "$RC" -eq 0 ]
+    check "run: never mise use" log_lacks '^mise use'
+    check "run: installs the pinned 20" [ -x "$HOME/.local/share/mise/installs/node/20.18.1/bin/node" ]
+    check "run: config byte-identical" same_config
+    teardown
+  done
+
+  pin_fixture "node only inside a multiline string" '[env]\nBANNER = """\n[tools]\nnode = "20"\n"""\n'
+  rm -rf "$HOME/.local/share/mise"
+  run_linux --dry-run
+  check "a string is not a pin: plans pinning lts" has "$OUT" "\[dry-run\] $STUBS/mise use -g node@lts$"
+  teardown
+
+  for name in invalid-toml no-python3 no-tomllib; do
+    pin_fixture "uncertain config: $name" '[tools]\nnode = "20"\n'
+    case "$name" in
+      invalid-toml) printf '[tools\nnode = \n' > "$HOME/.config/mise/config.toml"
+                    cp "$HOME/.config/mise/config.toml" "$SANDBOX/config.before" ;;
+      no-python3)   rm "$SANDBOX/sysbin/python3" ;;
+      # A real python3 whose `import tomllib` raises ImportError (as on 3.10).
+      no-tomllib)   stub python3 'if [ "$1" = -I ] && [ "$2" = -c ]; then
+  code="import sys; sys.modules[\"tomllib\"] = None
+$3"; shift 3; exec "$STUB_STATE/../sysbin/python3" -I -c "$code" "$@"
+fi
+exec "$STUB_STATE/../sysbin/python3" "$@"' ;;
+    esac
+    run_linux --dry-run
+    check "dry run: warns it can't tell" has "$OUT" "can't tell whether mise's global config .* pins node"
+    case "$name" in
+      invalid-toml) check "dry run: says it can't parse it" has "$OUT" "pins node \(cannot parse it: " ;;
+      no-python3)   check "dry run: says python3 is missing" has "$OUT" "pins node \(python3 not found\)" ;;
+      no-tomllib)   check "dry run: says tomllib is missing" has "$OUT" "pins node \(python3 has no tomllib" ;;
+    esac
+    check "dry run: no mise planned" lacks "$OUT" "\[dry-run\] .*mise (use|install)"
+    check "dry run: config byte-identical" same_config
+    run_linux
+    check "run exits 0" [ "$RC" -eq 0 ]
+    check "run: no mise use or install" log_lacks '^mise (use|install)'
+    check "run: config byte-identical" same_config
+    check "run: Claude skipped" has "$OUT" "skipped Claude Code"
+    check "run: no npm of any kind" log_lacks 'npm'
+    teardown
+  done
+}
+
+# The mise apt key is dearmored to a temp file, so a failed download or
+# dearmor never leaves an empty keyring, and nothing after it runs.
+test_mise_apt_failures() {
+  local what
+  for what in download dearmor; do
+    setup "pop run (mise key $what fails)"
+    os_release pop "ubuntu debian"
+    dotfiles_fixture
+    if [ "$what" = download ]; then
+      STUB_CURL_FAIL=mise.jdx.dev/gpg-key.pub run_linux
+      check "download was attempted" log_has '^curl -fsSL https://mise.jdx.dev/gpg-key.pub$'
+    else
+      STUB_GPG_RC=2 run_linux
+      check "dearmor was attempted" log_has '^gpg --dearmor$'
+    fi
+    check "run fails" [ "$RC" -ne 0 ]
+    check "no keyring installed" log_lacks '^sudo install -m 644 .*mise-archive-keyring'
+    check "no mise apt source added" log_lacks 'mise\.list'
+    check "mise not installed" log_lacks '^sudo apt-get install -y mise$'
+    check "no mise, node or npm run" log_lacks '^mise|npm'
+    check "no temp file left" [ -z "$(ls -A "$SANDBOX/tmp")" ]
+    teardown
+  done
+}
+
+# The in_repo predicate is repository membership, not proof of a stow fold.
+# A link made by hand into the repo must never lose data: the script leaves it
+# (and the repo) alone, and stow reports the clash.
+test_hand_made_repo_links() {
+  setup "hand-made file link into the repo (not a fold)"
+  bazzite
+  dotfiles_fixture
+  local d="$HOME/Projects/Home/dotfiles"
+  ln -s "$d/bash/.bashrc" "$HOME/.tmux.conf"   # points at the wrong package's file
+  local repo_before; repo_before="$(repo_snapshot)"
+  run_linux --dry-run
+  check "dry run: not backed up" lacks "$OUT" "back up ~/.tmux.conf"
+  check "dry run: not called foreign" lacks "$OUT" "is a symlink to somewhere else"
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "stow reports the conflict" has "$OUT" "stub stow: conflict on $HOME/.tmux.conf"
+  check "the package is reported as failed" has "$OUT" "stow failed for tmux"
+  check "the hand-made link is untouched" [ "$(readlink "$HOME/.tmux.conf")" = "$d/bash/.bashrc" ]
+  check "repo contents unchanged" [ "$repo_before" = "$(repo_snapshot)" ]
+  check "nothing backed up" [ ! -e "$HOME/.local/state/laptop/backups" ]
+  check "other packages still stowed" [ "$(realpath "$HOME/.zshrc")" = "$(realpath "$d/zsh/.zshrc")" ]
+  teardown
+
+  setup "hand-made dir link into the repo (not a fold)"
+  bazzite
+  dotfiles_fixture
+  d="$HOME/Projects/Home/dotfiles"
+  mkdir -p "$HOME/.config"
+  ln -s "$d/agy/.config/agy" "$HOME/.config/nvim"   # nvim's dir, pointed into agy
+  repo_before="$(repo_snapshot)"
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "nothing inside the repo was moved" [ "$repo_before" = "$(repo_snapshot)" ]
+  check "agy's file still in the repo" grep -qx "{}" "$d/agy/.config/agy/permissions.json"
+  check "nothing backed up" [ ! -e "$HOME/.local/state/laptop/backups" ]
+  check "no package skipped" lacks "$OUT" "skipped stowing"
+  check "stow unfolded it into a real dir" is_real_dir "$HOME/.config/nvim"
+  check "nvim resolves into nvim" [ "$(realpath "$HOME/.config/nvim/init.lua")" = "$(realpath "$d/nvim/.config/nvim/init.lua")" ]
   teardown
 }
 
@@ -613,9 +1035,12 @@ test_isolation_sentinels() {
   setup "host tool settings do not leak"
   bazzite
   dotfiles_fixture
-  HOMEBREW_PREFIX=/home/linuxbrew/.linuxbrew FNM_DIR=/nonexistent/fnm XDG_DATA_HOME=/nonexistent run_linux --dry-run
+  HOMEBREW_PREFIX=/home/linuxbrew/.linuxbrew FNM_DIR=/nonexistent/fnm XDG_DATA_HOME=/nonexistent \
+    MISE_DATA_DIR=/nonexistent/mise MISE_CONFIG_DIR=/nonexistent/mise MISE_GLOBAL_CONFIG_FILE=/nonexistent/mise.toml \
+    run_linux --dry-run
   check "HOMEBREW_PREFIX is the sandbox one" has "$OUT" "command = $SANDBOX/homebrew-env/bin/zsh"
   check "no host prefix in output" lacks "$OUT" "/home/linuxbrew"
+  check "no host MISE_*/XDG_* paths in output" lacks "$OUT" "/nonexistent"
   teardown
 
   setup "guard rejects paths outside the sandbox"
@@ -626,6 +1051,17 @@ test_isolation_sentinels() {
     ( LAPTOP_BREW_DIRS="$bad"; guard_sandbox 2>/dev/null )
     check "rejects LAPTOP_BREW_DIRS='${bad//$SANDBOX/<sandbox>}'" [ $? -ne 0 ]
   done
+  # Paths that look inside the sandbox but resolve outside it through a link.
+  ln -s /home/linuxbrew/.linuxbrew "$SANDBOX/escape-abs"
+  ln -s ../.. "$SANDBOX/escape-rel"
+  for bad in "$SANDBOX/escape-abs" "$SANDBOX/escape-rel/x" "$SANDBOX/linuxbrew $SANDBOX/escape-abs/bin"; do
+    ( LAPTOP_BREW_DIRS="$bad"; guard_sandbox 2>/dev/null )
+    check "rejects symlink escape '${bad//$SANDBOX/<sandbox>}'" [ $? -ne 0 ]
+  done
+  HOME="$SANDBOX/escape-rel" guard_sandbox 2>/dev/null
+  check "rejects a HOME that links outside" [ $? -ne 0 ]
+  ( LAPTOP_BREW_DIRS="$SANDBOX/escape-abs"; run_linux --dry-run ) >/dev/null 2>&1
+  check "run_linux refuses a symlink-escaping brew prefix" [ $? -eq 2 ]
   ( LAPTOP_BREW_DIRS="$SANDBOX/a $SANDBOX/b"; guard_sandbox )
   check "accepts several sandbox entries" [ $? -eq 0 ]
   HOME=/var/home/somebody guard_sandbox 2>/dev/null
@@ -725,9 +1161,21 @@ test_bazzite_run_and_rerun() {
   check "stow ran for tmux" log_has '^stow .* tmux$'
   check "no sudo/apt/chsh/ujust/flatpak/reboot" log_lacks '^(sudo|apt-get|chsh|usermod|ujust|flatpak|systemctl)( |$)'
   check "prints reboot notice" has "$OUT" "Reboot required.*ghostty"
+  check "mise came from Homebrew" log_has '^brew install .* mise( |$)'
+  check "node lts pinned via mise, once" [ "$(log_count '^mise use -g node@lts$')" -eq 1 ]
+  check "mise wrote its global config" [ "$(cat "$HOME/.config/mise/config.toml" 2>/dev/null)" = "$(printf '[tools]\nnode = "lts"')" ]
+  check "node is installed under mise" [ -x "$HOME/.local/share/mise/installs/node/22.12.0/bin/node" ]
+  check "fnm never involved" log_lacks '^fnm |fnm'
+  check "claude installed through mise's npm shim, after node" logged_before '^mise use -g node@lts$' '^mise-shim-npm install -g @anthropic-ai/claude-code$'
+  check "the shim ran the pinned node's npm" log_has '^mise-22.12.0-npm install -g @anthropic-ai/claude-code$'
+  check "reshim after the claude install" logged_before '^mise-shim-npm install -g' '^mise reshim$'
+  check "reshim exposed claude" [ -x "$HOME/.local/share/mise/shims/claude" ]
+  check "PATH npm never used" log_lacks '^npm '
 
   : > "$LOG"
-  local backups_before; backups_before="$(find "$HOME/.local/state/laptop/backups" -type f | wc -l)"
+  local backups_before mise_conf_before
+  backups_before="$(find "$HOME/.local/state/laptop/backups" -type f | wc -l)"
+  mise_conf_before="$(cat "$HOME/.config/mise/config.toml")"
   run_linux
   check "re-run exits 0" [ "$RC" -eq 0 ]
   check "re-run installs nothing with brew" log_lacks '^brew install'
@@ -735,6 +1183,10 @@ test_bazzite_run_and_rerun() {
   check "re-run makes no new backups" [ "$(find "$HOME/.local/state/laptop/backups" -type f | wc -l)" -eq "$backups_before" ]
   check "re-run does not regenerate the SSH key" log_lacks '^ssh-keygen'
   check "re-run has no stow failures" lacks "$OUT" "stow failed"
+  check "re-run does not run mise" log_lacks '^mise '
+  check "re-run reports node installed via mise" has "$OUT" "node already installed via mise"
+  check "re-run leaves mise config unchanged" [ "$mise_conf_before" = "$(cat "$HOME/.config/mise/config.toml")" ]
+  check "re-run finds claude, installs nothing with npm" log_lacks 'npm install'
   teardown
 }
 
@@ -769,8 +1221,115 @@ test_debian_dry_run() {
   check "never uses --adopt" lacks "$OUT" "--adopt"
   check "backs up instead of adopting" has "$OUT" "would back up ~/.bashrc"
   check "no brew / rpm-ostree" lacks "$OUT" "(brew install|rpm-ostree)"
+  check "plans mise's apt signing key, 0644" has "$OUT" "\[dry-run\] .*curl -fsSL https://mise.jdx.dev/gpg-key.pub \| gpg --dearmor > \"\\\$tmp\" && sudo install -m 644 \"\\\$tmp\" /etc/apt/keyrings/mise-archive-keyring.gpg$"
+  check "plans an apt-readable sources file" has "$OUT" "\[dry-run\] sudo chmod 644 /etc/apt/sources.list.d/mise.list$"
+  check "plans claude through mise's npm shim" has "$OUT" "\[dry-run\] $HOME/.local/share/mise/shims/npm install -g @anthropic-ai/claude-code$"
+  check "plans mise's apt repo" has "$OUT" "https://mise.jdx.dev/deb stable main.*sudo tee /etc/apt/sources.list.d/mise.list"
+  check "plans apt install mise" has "$OUT" "\[dry-run\] sudo apt-get install -y mise$"
+  check "plans node lts via mise" has "$OUT" "\[dry-run\] mise use -g node@lts$"
+  check "mise is not run at all (it creates state)" log_lacks '^mise '
+  check "no fnm anywhere in the plan" lacks "$OUT" "fnm"
   check "no mutating command was executed" log_lacks "$MUTATING"
   check "HOME is untouched" [ "$before" = "$(home_snapshot)" ]
+  teardown
+
+  setup "pop dry-run (mise in ~/.local/bin, node installed)"
+  os_release pop "ubuntu debian"
+  dotfiles_fixture
+  mise_node_fixture
+  mkdir -p "$HOME/.local/bin"
+  mv "$STUBS/mise" "$HOME/.local/bin/mise"   # mise's own installer puts it here
+  before="$(home_snapshot)"
+  run_linux --dry-run
+  check "exits 0" [ "$RC" -eq 0 ]
+  check "finds mise in ~/.local/bin" has "$OUT" "mise already installed \($HOME/.local/bin/mise\)"
+  check "no mise apt repo planned" lacks "$OUT" "mise.jdx.dev|apt-get install -y mise"
+  check "node found on disk" has "$OUT" "node already installed via mise"
+  check "mise is not run at all" log_lacks '^mise '
+  check "HOME is untouched" [ "$before" = "$(home_snapshot)" ]
+  teardown
+}
+
+# ── Tests: Ubuntu / Pop!_OS stubbed run ──────────────────────────────────────
+
+test_debian_run_and_rerun() {
+  setup "pop run + re-run (stubbed)"
+  os_release pop "ubuntu debian"
+  dotfiles_fixture
+  run_linux
+  check "first run exits 0" [ "$RC" -eq 0 ]
+  check "mise installed from its apt repo" log_has '^sudo apt-get install -y mise$'
+  check "apt repo written before the install" [ "$(grep -nE '^sudo (tee /etc/apt/sources.list.d/mise.list|apt-get install -y mise)' "$LOG" | cut -d: -f2- | tr '\n' '|')" = "sudo tee /etc/apt/sources.list.d/mise.list|sudo apt-get install -y mise|" ]
+  check "node lts pinned via mise, once" [ "$(log_count '^mise use -g node@lts$')" -eq 1 ]
+  check "mise wrote its global config" [ "$(cat "$HOME/.config/mise/config.toml" 2>/dev/null)" = "$(printf '[tools]\nnode = "lts"')" ]
+  check "no fnm installer" log_lacks 'fnm'
+  check "keyring installed 0644" log_has '^sudo install -m 644 .* /etc/apt/keyrings/mise-archive-keyring.gpg$'
+  check "sources file made 0644" log_has '^sudo chmod 644 /etc/apt/sources.list.d/mise.list$'
+  check "claude installed through mise's npm shim, after node" logged_before '^mise use -g node@lts$' '^mise-shim-npm install -g @anthropic-ai/claude-code$'
+  check "reshim after the claude install" logged_before '^mise-shim-npm install -g' '^mise reshim$'
+  check "reshim exposed claude" [ -x "$HOME/.local/share/mise/shims/claude" ]
+  check "PATH npm never used" log_lacks '^npm '
+  local conf_before; conf_before="$(cat "$HOME/.config/mise/config.toml")"
+  : > "$LOG"
+  run_linux
+  check "re-run exits 0" [ "$RC" -eq 0 ]
+  check "re-run skips mise install" has "$OUT" "mise already installed"
+  check "re-run adds no mise apt repo" log_lacks 'mise\.list|mise-archive-keyring|apt-get install -y mise'
+  check "re-run does not run mise" log_lacks '^mise '
+  check "re-run leaves mise config unchanged" [ "$conf_before" = "$(cat "$HOME/.config/mise/config.toml")" ]
+  teardown
+}
+
+# ── Tests: mise edge cases ───────────────────────────────────────────────────
+
+test_mise_edge_cases() {
+  setup "node pinned in mise config but not installed"
+  bazzite
+  dotfiles_fixture
+  cp "$STATE/mise-stub" "$STUBS/mise"
+  mkdir -p "$HOME/.config/mise"
+  printf '# mine\n[settings]\nexperimental = true\n\n[tools]\n  "node" = "20"  # pinned\n' > "$HOME/.config/mise/config.toml"
+  local conf_before; conf_before="$(cat "$HOME/.config/mise/config.toml")"
+  run_linux --dry-run
+  check "dry run plans installing the pinned node" has "$OUT" "\[dry-run\] $STUBS/mise install node$"
+  check "dry run does not re-pin to lts" lacks "$OUT" "\[dry-run\] .*mise use"
+  check "dry run does not run mise" log_lacks '^mise '
+  run_linux
+  check "run installs the pinned node" log_has '^mise install node$'
+  check "run does not re-pin" log_lacks '^mise use'
+  check "config left as the user wrote it" [ "$conf_before" = "$(cat "$HOME/.config/mise/config.toml")" ]
+  teardown
+
+  setup "node outside [tools] does not count"
+  bazzite
+  dotfiles_fixture
+  cp "$STATE/mise-stub" "$STUBS/mise"
+  mkdir -p "$HOME/.config/mise" "$HOME/.local/share/mise/installs/node/18.0.0/bin"
+  touch "$HOME/.local/share/mise/installs/node/18.0.0/bin/node"
+  printf '[env]\nnode = "not a tool"\n[tools]\npython = "3.12"\n' > "$HOME/.config/mise/config.toml"
+  run_linux --dry-run
+  check "plans pinning node lts" has "$OUT" "\[dry-run\] $STUBS/mise use -g node@lts$"
+  check "does not claim node is installed" lacks "$OUT" "node already installed"
+  teardown
+
+  setup "leftover fnm is noted, not removed"
+  os_release pop "ubuntu debian"
+  dotfiles_fixture
+  mkdir -p "$HOME/.local/share/fnm/aliases"
+  touch "$HOME/.local/share/fnm/aliases/lts-latest"
+  run_linux --dry-run
+  check "notes fnm is still installed" has "$OUT" "note: fnm is still installed \($HOME/.local/share/fnm\)"
+  check "plans no fnm removal" lacks "$OUT" "\[dry-run\] .*(rm .*fnm|fnm uninstall)"
+  run_linux
+  check "fnm dir still there after a run" [ -e "$HOME/.local/share/fnm/aliases/lts-latest" ]
+  check "fnm dir not backed up" [ -z "$(find "$HOME/.local/state/laptop/backups" -path '*fnm*' 2>/dev/null)" ]
+  teardown
+
+  setup "no fnm, no note"
+  bazzite
+  dotfiles_fixture
+  run_linux --dry-run
+  check "no fnm note" lacks "$OUT" "fnm"
   teardown
 }
 
@@ -796,6 +1355,12 @@ TESTS=(
   test_bazzite_run_and_rerun
   test_bazzite_layer_failure
   test_debian_dry_run
+  test_debian_run_and_rerun
+  test_mise_edge_cases
+  test_node_readiness
+  test_mise_config_parsing
+  test_mise_apt_failures
+  test_hand_made_repo_links
 )
 
 for t in "${TESTS[@]}"; do
