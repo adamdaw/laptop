@@ -72,8 +72,9 @@ REBOOT_PKGS=()
 # Machine-local git settings (identity, credentials) live here; the dotfiles
 # .gitconfig includes it.
 GIT_LOCAL="$HOME/.gitconfig.local"
-# Keys copied into $GIT_LOCAL this run (under --dry-run: would be copied).
-GIT_CARRIED=()
+# Under --dry-run only: the last value of each key that would be copied into
+# $GIT_LOCAL, to predict the identity. A real run reads the files instead.
+declare -A GIT_PLANNED=()
 # 1 once the dotfiles git package is stowed (under --dry-run: would be).
 GIT_STOWED=0
 
@@ -408,13 +409,26 @@ install_font() {
   fi
 }
 
+# True if git config --global could write into the dotfiles repo: ~/.gitconfig
+# or ~/.config/git/config resolves into it (a stowed file, or a link by hand).
+global_config_in_repo() {
+  local f repo
+  repo="$(realpath -m -- "$DOTFILES_DIR")"
+  for f in "$HOME/.gitconfig" "${XDG_CONFIG_HOME:-$HOME/.config}/git/config"; do
+    [ -e "$f" ] || [ -L "$f" ] || continue
+    [[ "$(realpath -m -- "$f")" == "$repo"/* ]] && return 0
+  done
+  return 1
+}
+
 # Runs after apply_dotfiles. Once ~/.gitconfig is the stowed dotfiles file,
 # its settings come from dotfiles: `git config --global` would write through
 # the link into the repo. Before, it would write into a file about to be
-# backed up. Only when the git package was not stowed are they set here.
+# backed up. Only when the git package was not stowed, and no global config
+# file resolves into the repo, are they set here.
 configure_git() {
   step "Configuring git"
-  if (( GIT_STOWED )) || in_repo "$HOME/.gitconfig"; then
+  if (( GIT_STOWED )) || global_config_in_repo; then
     ok "git settings come from the dotfiles .gitconfig (stowed; nothing written with --global)"
   else
     run git config --global core.hooksPath "$HOME/.config/git/hooks"
@@ -445,40 +459,32 @@ git_get() { # git_get FILE KEY [--includes]
   git config --file "$1" ${3:+"$3"} --get "$2" 2>/dev/null
 }
 
-# True if KEY is (or, under --dry-run, will be) in ~/.gitconfig.local, with
-# any value — an empty one included.
-git_local_has() {
-  local k
-  for k in "${GIT_CARRIED[@]}"; do
-    [ "$k" = "$1" ] && return 0
-  done
-  [ -e "$GIT_LOCAL" ] && cmd_exists git && git config --file "$GIT_LOCAL" --get-all "$1" >/dev/null 2>&1
-}
-
-# True if KEY has a non-empty value in ~/.gitconfig.local (under --dry-run,
-# also if it would be copied there).
-git_local_set() {
-  local k
-  for k in "${GIT_CARRIED[@]}"; do
-    [ "$k" = "$1" ] && return 0
-  done
-  [ -n "$(git_get "$GIT_LOCAL" "$1")" ]
+# The global git config as it is after this run. Under --dry-run, if
+# ~/.gitconfig would be backed up, that is the dotfiles .gitconfig.
+effective_gitconfig() {
+  if (( DRY_RUN )) && [ -n "${BACKED_UP[$HOME/.gitconfig]:-}" ] && [ -e "$DOTFILES_DIR/git/.gitconfig" ]; then
+    echo "$DOTFILES_DIR/git/.gitconfig"
+  else
+    echo "$HOME/.gitconfig"
+  fi
 }
 
 # Say where the git identity comes from, or warn (into the summary) that it
-# is missing. Runs after ~/.laptop.local, which may set it. ~/.gitconfig only
-# counts if it was not backed up this run.
+# is missing. Runs last, after ~/.laptop.local, which may set or clear it, and
+# reads the final values (with includes); an empty value counts as missing.
+# Under --dry-run, values that would be copied to ~/.gitconfig.local count.
 check_git_identity() {
-  local key missing=() where=".gitconfig.local" hint=""
+  local key val cfg missing=() where=".gitconfig.local" hint=""
   step "git identity"
+  cfg="$(effective_gitconfig)"
   for key in user.name user.email; do
-    if git_local_set "$key"; then
-      continue
-    elif [ -z "${BACKED_UP[$HOME/.gitconfig]:-}" ] && [ -n "$(git_get "$HOME/.gitconfig" "$key" --includes)" ]; then
+    val="$(git_get "$cfg" "$key" --includes)" || val=""
+    if [ -z "$val" ] && (( DRY_RUN )) && [ -n "${GIT_PLANNED[$key]+x}" ]; then
+      val="${GIT_PLANNED[$key]}"
+    elif [ -n "$val" ] && [ "$val" != "$(git_get "$GIT_LOCAL" "$key")" ]; then
       where=".gitconfig"
-    else
-      missing+=("$key")
     fi
+    [ -n "$val" ] || missing+=("$key")
   done
   if (( DRY_RUN )) && [ -f ~/.laptop.local ]; then
     hint=" (unless ~/.laptop.local sets it)"
@@ -492,35 +498,50 @@ check_git_identity() {
   fi
 }
 
+# Refuse to migrate: warn why, and what to do by hand. ~/.gitconfig stays put
+# and the git package is not stowed.
+refuse_git_carry() {
+  warn "$1 — not moving ~/.gitconfig and not stowing git. By hand: put user.name, user.email, user.signingkey and credential.* from ~/.gitconfig into ~/.gitconfig.local (a regular file), then move ~/.gitconfig away and re-run"
+  return 1
+}
+
 # Before ~/.gitconfig is moved out of the way of the dotfiles one, copy its
 # identity and credential settings into ~/.gitconfig.local, which the dotfiles
 # .gitconfig includes. Every value of a multi-valued key is copied in order,
 # empty values (a helper reset) included. A key already in ~/.gitconfig.local
-# is never touched. A new ~/.gitconfig.local is created mode 0600. Prints key
-# names only, never values. Returns non-zero, with a warning, if the settings
-# could not be read or written (~/.gitconfig must then stay where it is).
+# is never touched.
+#
+# All or nothing: the new file is built in a temp file next to it (a copy of
+# the existing one plus the missing keys), checked value by value, and moved
+# into place with mode 0600. On any failure the original is untouched.
+#
+# Refuses (returns non-zero with a warning, so ~/.gitconfig stays where it is)
+# when it can't be done faithfully: git missing, a file unreadable,
+# ~/.gitconfig using include/includeIf (flattening would change what applies
+# where), ~/.gitconfig.local a symlink or not a regular file (never write
+# through it), or a key to copy that has no value (git config can't write one).
+# Prints key names only, never values.
 carry_git_local() {
-  local src="$HOME/.gitconfig" entry key val i n
-  local -a keys=() vals=() order=()
-  local -A count=()
-  if ! cmd_exists git; then
-    warn "git not found; cannot copy identity/credentials from ~/.gitconfig to ~/.gitconfig.local — not moving ~/.gitconfig"
-    return 1
+  local src="$HOME/.gitconfig" entry key val i n tmp
+  local -a keys=() vals=() order=() todo=()
+  local -A count=() bare=()
+  cmd_exists git || refuse_git_carry "git not found; cannot copy identity/credentials to ~/.gitconfig.local" || return 1
+  if [ -L "$GIT_LOCAL" ] || { [ -e "$GIT_LOCAL" ] && [ ! -f "$GIT_LOCAL" ]; }; then
+    refuse_git_carry "not writing through ~/.gitconfig.local: it is a symlink or not a regular file" || return 1
   fi
-  if ! git config --file "$src" --list >/dev/null 2>&1; then
-    warn "could not read ~/.gitconfig; not moving it — copy your identity/credentials to ~/.gitconfig.local by hand"
-    return 1
-  fi
+  git config --file "$src" --list >/dev/null 2>&1 || refuse_git_carry "could not read ~/.gitconfig" || return 1
   if [ -e "$GIT_LOCAL" ] && ! git config --file "$GIT_LOCAL" --list >/dev/null 2>&1; then
-    warn "could not read ~/.gitconfig.local; not moving ~/.gitconfig"
-    return 1
+    refuse_git_carry "could not read ~/.gitconfig.local" || return 1
+  fi
+  if git config --file "$src" --name-only --get-regexp '^include(if)?\.' >/dev/null 2>&1; then
+    refuse_git_carry "not copying from ~/.gitconfig: it uses [include]/[includeIf], and flattening those would change what applies where" || return 1
   fi
   # --null: entries end in NUL, key and value are split by a newline; a key
-  # with no newline has no value (boolean true).
+  # with no newline has no value (a bare key).
   while IFS= read -r -d '' entry; do
     key="${entry%%$'\n'*}"
-    if [[ "$entry" == *$'\n'* ]]; then val="${entry#*$'\n'}"; else val=true; fi
     is_local_git_key "$key" || continue
+    if [[ "$entry" == *$'\n'* ]]; then val="${entry#*$'\n'}"; else val=""; bare[$key]=1; fi
     if [ -z "${count[$key]:-}" ]; then
       order+=("$key")
       count[$key]=0
@@ -531,31 +552,68 @@ carry_git_local() {
   done < <(git config --file "$src" --null --list 2>/dev/null)
 
   for key in "${order[@]}"; do
-    n="${count[$key]}"
-    if git_local_has "$key"; then
+    if [ -e "$GIT_LOCAL" ] && git config --file "$GIT_LOCAL" --get-all "$key" >/dev/null 2>&1; then
       ok "kept existing $key in ~/.gitconfig.local (not copied from ~/.gitconfig)"
-      continue
-    fi
-    if (( DRY_RUN )); then
-      ok "would copy $key to ~/.gitconfig.local ($n value$([ "$n" -eq 1 ] || echo s))"
+    elif [ -n "${bare[$key]:-}" ]; then
+      refuse_git_carry "$key in ~/.gitconfig has no value, which git config cannot copy exactly" || return 1
     else
-      if [ ! -e "$GIT_LOCAL" ] && [ ! -L "$GIT_LOCAL" ]; then
-        if ! (umask 077 && : > "$GIT_LOCAL"); then
-          warn "could not create ~/.gitconfig.local; not moving ~/.gitconfig"
-          return 1
-        fi
-      fi
-      for i in "${!keys[@]}"; do
-        [ "${keys[$i]}" = "$key" ] || continue
-        if ! git config --file "$GIT_LOCAL" --add "$key" "${vals[$i]}"; then
-          warn "could not write $key to ~/.gitconfig.local; not moving ~/.gitconfig"
-          return 1
-        fi
-      done
-      ok "copied $key to ~/.gitconfig.local ($n value$([ "$n" -eq 1 ] || echo s))"
+      todo+=("$key")
     fi
-    GIT_CARRIED+=("$key")
   done
+  (( ${#todo[@]} )) || return 0
+
+  if (( DRY_RUN )); then
+    for key in "${todo[@]}"; do
+      n="${count[$key]}"
+      for i in "${!keys[@]}"; do
+        [ "${keys[$i]}" = "$key" ] && GIT_PLANNED[$key]="${vals[$i]}"
+      done
+      ok "would copy $key to ~/.gitconfig.local ($n value$([ "$n" -eq 1 ] || echo s))"
+    done
+    return 0
+  fi
+
+  if ! tmp="$(mktemp "$GIT_LOCAL.XXXXXX")"; then
+    refuse_git_carry "could not create a temp file next to ~/.gitconfig.local" || return 1
+  fi
+  if ! write_git_local "$tmp"; then
+    rm -f -- "$tmp"
+    refuse_git_carry "could not write ~/.gitconfig.local (left unchanged)" || return 1
+  fi
+  for key in "${todo[@]}"; do
+    n="${count[$key]}"
+    ok "copied $key to ~/.gitconfig.local ($n value$([ "$n" -eq 1 ] || echo s))"
+  done
+}
+
+# Build the new ~/.gitconfig.local in TMP and move it into place. Reads
+# carry_git_local's keys/vals/todo (bash dynamic scope). Returns non-zero, without touching
+# ~/.gitconfig.local, if any step fails or TMP doesn't hold exactly the values.
+write_git_local() {
+  local tmp="$1" key i
+  local -a want got
+  if [ -e "$GIT_LOCAL" ]; then
+    cat -- "$GIT_LOCAL" > "$tmp" || return 1
+  fi
+  for key in "${todo[@]}"; do
+    for i in "${!keys[@]}"; do
+      [ "${keys[$i]}" = "$key" ] || continue
+      git config --file "$tmp" --add "$key" "${vals[$i]}" || return 1
+    done
+  done
+  for key in "${todo[@]}"; do
+    want=()
+    for i in "${!keys[@]}"; do
+      [ "${keys[$i]}" = "$key" ] && want+=("${vals[$i]}")
+    done
+    got=()
+    mapfile -d '' got < <(git config --file "$tmp" --null --get-all "$key" 2>/dev/null)
+    [ "${#got[@]}" -eq "${#want[@]}" ] || return 1
+    for i in "${!want[@]}"; do
+      [ "${got[$i]}" = "${want[$i]}" ] || return 1
+    done
+  done
+  chmod 600 -- "$tmp" && mv -f -- "$tmp" "$GIT_LOCAL"
 }
 
 setup_ssh() {
