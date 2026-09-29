@@ -38,11 +38,22 @@ bash laptop/linux
 | Data | jq | jq |
 | GitHub | gh CLI (GitHub apt repo) | gh |
 | Node | mise (mise's apt repo) + Node LTS, Claude Code | mise + Node LTS, Claude Code |
+| Java | openjdk-21-jdk | openjdk@21 (keg-only) |
 | Python | uv (installer) | uv |
 | JavaScript runtime | Bun (installer, `~/.bun`) | Bun (installer, `~/.bun`) |
 | Font | JetBrains Mono Nerd Font (`~/.local/share/fonts`) | checked; installed to `~/.local/share/fonts` only if missing |
 
 On Bazzite, a Homebrew formula is skipped when the command is already on `PATH` from the image (for example `tmux` and `git`).
+
+### Java 21
+
+JDK 21 supports the Salesforce Apex language server and Code Analyzer. Bazzite
+installs Homebrew `openjdk@21`, checking the formula even when a different `java`
+is on PATH. Ubuntu/Pop!_OS installs `openjdk-21-jdk` through the existing apt
+package checks. Both appear in `--dry-run` and are skipped once installed.
+The dotfiles bash/zsh configuration selects the keg-only JDK via `JAVA_HOME`.
+There is no macOS installer or Brewfile in this repository; on the Mac run
+`brew install openjdk@21` (the dotfiles still accept 17 during the upgrade).
 
 ### Node comes from mise
 
