@@ -53,6 +53,7 @@ BREW_FORMULAE=(
   zsh-syntax-highlighting:
   uv:uv
   mise:mise
+  openjdk@21: # keg-only; a system java does not prove JDK 21 is installed
 )
 
 # Bazzite / Fedora Atomic: GUI apps come from Flatpak — none are needed yet.
@@ -921,6 +922,7 @@ install_debian() {
     fzf \
     bat \
     xclip \
+    openjdk-21-jdk \
     zsh-autosuggestions \
     zsh-syntax-highlighting
 

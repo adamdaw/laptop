@@ -24,7 +24,7 @@ CURRENT=""
 # Core utilities the script (and the stubs) legitimately need.
 CORE_UTILS=(bash env cat grep sed find realpath dirname basename date mkdir mv cp rm ln chmod head tr sort mktemp touch readlink ls wc python3)
 
-ALL_FORMULAE=(git git-delta stow neovim tmux jq ripgrep fd fzf bat wget gh starship zsh zsh-autosuggestions zsh-syntax-highlighting uv mise)
+ALL_FORMULAE=(git git-delta stow neovim tmux jq ripgrep fd fzf bat wget gh starship zsh zsh-autosuggestions zsh-syntax-highlighting uv mise openjdk@21)
 ALL_PACKAGES=(agy bash bat bin ghostty git nvim ripgrep ssh starship tmux zsh)
 
 # Calls that would change the machine. None may appear during --dry-run.
@@ -262,6 +262,7 @@ setup() { # setup TEST_NAME
   stub mise "$MISE_SIDE_EFFECTS"; mv "$STUBS/mise" "$STATE/mise-stub"
   # Like `sudo tee` / `sudo dd`, read piped input, so the writer never gets SIGPIPE.
   stub sudo '[ -p /dev/stdin ] && cat > /dev/null
+[ "${1:-} ${2:-} ${3:-}" = "apt-get install -y" ] && printf "%s\n" "${@:4}" >> "$STUB_STATE/apt-installed"
 [ "$*" = "apt-get install -y mise" ] && cp "$STUB_STATE/mise-stub" "${0%/*}/mise"; exit 0'
   stub apt-get; stub chsh; stub usermod; stub ujust; stub flatpak
   stub systemctl; stub unzip; stub fc-cache
@@ -270,7 +271,11 @@ setup() { # setup TEST_NAME
   write_node_install
   stub sh '[ -p /dev/stdin ] && cat > /dev/null; exit 0' # `curl ... | sh` installers
   stub curl 'if [ -n "${STUB_CURL_FAIL:-}" ] && [[ "$*" == *"$STUB_CURL_FAIL"* ]]; then exit 22; fi; exit "${STUB_CURL_RC:-0}"'
-  stub dpkg '[ "$1" = --print-architecture ] && echo amd64 || exit 1'
+  stub dpkg 'case "$1" in
+  --print-architecture) echo amd64 ;;
+  -s) grep -qx -- "$2" "$STUB_STATE/apt-installed" 2>/dev/null ;;
+  *) exit 1 ;;
+esac'
   stub gpg 'exit "${STUB_GPG_RC:-0}"'
   stub fc-list 'echo "/x/JetBrainsMonoNerdFont-Regular.ttf: JetBrainsMono Nerd Font:style=Regular"'
   mkdir -p "$STATE/real"; ln -s "$(PATH=/usr/bin:/bin type -P git)" "$STATE/real/git" || { echo "missing git" >&2; exit 2; }
@@ -502,6 +507,7 @@ test_bazzite_dry_run_fresh() {
   setup "bazzite dry-run (fresh)"
   bazzite
   dotfiles_fixture
+  stub java   # an unrelated system Java must not suppress openjdk@21
   stub tmux   # shipped by the image, not by brew
   printf 'export PS1=x\ntest -f /usr/share/ublue-os/bling/bling.sh && source /usr/share/ublue-os/bling/bling.sh\n' > "$HOME/.bashrc"
   echo "# distro zshrc" > "$HOME/.zshrc"
@@ -514,7 +520,7 @@ test_bazzite_dry_run_fresh() {
   check "detects Bazzite" has "$OUT" "Detected Bazzite"
   check "plans exactly one brew install" [ "$(grep -cF '[dry-run] brew install' <<<"$OUT")" -eq 1 ]
   local f
-  for f in zsh zsh-autosuggestions zsh-syntax-highlighting git-delta neovim ripgrep fd fzf bat jq gh starship uv wget mise; do
+  for f in zsh zsh-autosuggestions zsh-syntax-highlighting git-delta neovim ripgrep fd fzf bat jq gh starship uv wget mise openjdk@21; do
     check "brew installs $f" has "$brew_line" " $f( |$)"
   done
   check "skips image-provided tmux" lacks "$brew_line" " tmux( |$)"
@@ -1217,6 +1223,7 @@ test_bazzite_run_and_rerun() {
   check "stow ran for tmux" log_has '^stow .* tmux$'
   check "no sudo/apt/chsh/ujust/flatpak/reboot" log_lacks '^(sudo|apt-get|chsh|usermod|ujust|flatpak|systemctl)( |$)'
   check "prints reboot notice" has "$OUT" "Reboot required.*ghostty"
+  check "JDK 21 came from Homebrew" log_has '^brew install .* openjdk@21( |$)'
   check "mise came from Homebrew" log_has '^brew install .* mise( |$)'
   check "node lts pinned via mise, once" [ "$(log_count '^mise use -g node@lts$')" -eq 1 ]
   check "mise wrote its global config" [ "$(cat "$HOME/.config/mise/config.toml" 2>/dev/null)" = "$(printf '[tools]\nnode = "lts"')" ]
@@ -1272,6 +1279,7 @@ test_debian_dry_run() {
   check "plans apt-get update" has "$OUT" "\[dry-run\] sudo apt-get update -qq"
   check "plans apt install zsh" has "$OUT" "\[dry-run\] sudo apt-get install -y zsh$"
   check "plans gh apt repo" has "$OUT" "/etc/apt/sources.list.d/github-cli.list"
+  check "plans JDK 21 via apt" has "$OUT" "\[dry-run\] sudo apt-get install -y openjdk-21-jdk$"
   check "plans chsh" has "$OUT" "\[dry-run\] chsh -s"
   check "stows tmux" has "$OUT" "\[dry-run\] stow .* --restow tmux$"
   check "never uses --adopt" lacks "$OUT" "--adopt"
@@ -1314,6 +1322,7 @@ test_debian_run_and_rerun() {
   dotfiles_fixture
   run_linux
   check "first run exits 0" [ "$RC" -eq 0 ]
+  check "JDK 21 installed via apt" log_has '^sudo apt-get install -y openjdk-21-jdk$'
   check "mise installed from its apt repo" log_has '^sudo apt-get install -y mise$'
   check "apt repo written before the install" [ "$(grep -nE '^sudo (tee /etc/apt/sources.list.d/mise.list|apt-get install -y mise)' "$LOG" | cut -d: -f2- | tr '\n' '|')" = "sudo tee /etc/apt/sources.list.d/mise.list|sudo apt-get install -y mise|" ]
   check "node lts pinned via mise, once" [ "$(log_count '^mise use -g node@lts$')" -eq 1 ]
@@ -1329,6 +1338,7 @@ test_debian_run_and_rerun() {
   : > "$LOG"
   run_linux
   check "re-run exits 0" [ "$RC" -eq 0 ]
+  check "re-run skips JDK install" log_lacks '^sudo apt-get install -y openjdk-21-jdk$'
   check "re-run skips mise install" has "$OUT" "mise already installed"
   check "re-run adds no mise apt repo" log_lacks 'mise\.list|mise-archive-keyring|apt-get install -y mise'
   check "re-run does not run mise" log_lacks '^mise '
