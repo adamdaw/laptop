@@ -28,7 +28,7 @@ ALL_FORMULAE=(git git-delta stow neovim tmux jq ripgrep fd fzf bat wget gh stars
 ALL_PACKAGES=(agy bash bat bin ghostty git nvim ripgrep ssh starship tmux zsh)
 
 # Calls that would change the machine. None may appear during --dry-run.
-MUTATING='^(sudo|apt-get|chsh|usermod|ujust|ssh-keygen|npm|curl|stow|systemctl|ubuntu-report|unzip|fc-cache)( |$)|^brew install|^rpm-ostree (install|upgrade|reboot)|^flatpak install|^git clone|^git config (--global [^-]|.* --(add|unset|unset-all|replace-all|remove-section|rename-section)( |$))|^mise (use|install|reshim)|^mise-'
+MUTATING='^(sudo|apt-get|chsh|usermod|ujust|ssh-keygen|npm|curl|stow|systemctl|ubuntu-report|unzip|fc-cache)( |$)|^brew install|^rpm-ostree (install|upgrade|reboot)|^flatpak install|^git clone|^git config (--global [^-]|.* --(add|unset|unset-all|replace-all|remove-section|rename-section)( |$))|^mise (use|install|reshim)|^mise-|^gsettings set'
 
 # rpm-ostree status --json shapes. Deployments are listed newest first:
 # staged/pending, then booted, then rollback.
@@ -304,9 +304,10 @@ esac'
   # stow it never overwrites anything it does not own, and never writes into
   # the stow dir.
   stub stow '
-dir="" target="" pkgs=()
+dir="" target="" pkgs=() no_folding=0
 for a; do
   case "$a" in
+    --no-folding) no_folding=1 ;;
     --adopt)   echo "stub stow: --adopt is forbidden" >&2; exit 99 ;;
     --dir=*)   dir="${a#--dir=}" ;;
     --target=*) target="${a#--target=}" ;;
@@ -332,7 +333,8 @@ stow_dir() { # stow_dir SOURCE_DIR TARGET_DIR
     case "$n" in README*|LICENSE*|COPYING|.git|.gitignore|.stow-local-ignore) continue ;; esac
     t="$2/$n"
     if [ -d "$s" ] && [ ! -L "$s" ]; then
-      if [ ! -e "$t" ] && [ ! -L "$t" ]; then ln -s "$s" "$t"          # fold
+      if [ ! -e "$t" ] && [ ! -L "$t" ]; then
+        if (( no_folding )); then mkdir "$t"; stow_dir "$s" "$t"; else ln -s "$s" "$t"; fi
       elif [ -L "$t" ] && same "$t" "$s"; then :
       elif [ -L "$t" ] && [ -d "$t" ] && owned "$t"; then            # unfold
         old="$(realpath "$t")"; rm "$t"; mkdir "$t"; link_children "$old" "$t"; stow_dir "$s" "$t"
@@ -445,7 +447,7 @@ sandboxed() {
     LAPTOP_YUM_REPOS_DIR="$LAPTOP_YUM_REPOS_DIR" LAPTOP_BREW_DIRS="$LAPTOP_BREW_DIRS"
     STUB_LOG="$STUB_LOG" STUB_STATE="$STUB_STATE"
   )
-  for v in STUB_GIT_FAIL STUB_GIT_TRUNC STUB_GIT_ON STUB_GIT_DO STUB_CURL_RC STUB_CURL_FAIL STUB_GPG_RC STUB_MISE_RC STUB_RESHIM_RC STUB_OSTREE_RC; do
+  for v in XDG_CURRENT_DESKTOP STUB_GIT_FAIL STUB_GIT_TRUNC STUB_GIT_ON STUB_GIT_DO STUB_CURL_RC STUB_CURL_FAIL STUB_GPG_RC STUB_MISE_RC STUB_RESHIM_RC STUB_OSTREE_RC; do
     if [ -n "${!v:-}" ]; then vars+=("$v=${!v}"); fi
   done
   "$SANDBOX/sysbin/env" -i "${vars[@]}" "$@"
@@ -1914,9 +1916,142 @@ for ((i = 0; i < 50000; i++)); do echo "/usr/share/fonts/f$i.ttf: Some Other Fon
   teardown
 }
 
+
+# Stateful fake gsettings: all state is JSON inside the guarded sandbox.
+terminal_fixture() {
+  dotfiles_fixture
+  all_done_fixture
+  stub ghostty
+  mkdir -p "$HOME/Projects/Home/dotfiles/xdg/.config"
+  echo com.mitchellh.ghostty.desktop > "$HOME/Projects/Home/dotfiles/xdg/.config/xdg-terminals.list"
+  echo '{}' > "$STATE/gsettings.json"
+  cat > "$STATE/gsettings.py" <<'EOF'
+import ast, json, os, sys
+from pathlib import Path
+f = Path(os.environ['STUB_STATE']) / 'gsettings.json'
+d = json.loads(f.read_text())
+a = sys.argv[1:]
+schema = 'org.gnome.settings-daemon.plugins.media-keys'
+if a == ['list-schemas']:
+    print(schema)
+elif a == ['list-relocatable-schemas']:
+    print(schema + '.custom-keybinding')
+elif a[0] == 'get':
+    value = d.get(a[1] + ' ' + a[2], [] if a[2] == 'custom-keybindings' else '')
+    print(repr(value) if value != [] else '@as []')
+elif a[0] == 'set':
+    d[a[1] + ' ' + a[2]] = ast.literal_eval(a[3])
+    f.write_text(json.dumps(d, sort_keys=True))
+else:
+    raise AssertionError(a)
+EOF
+  stub gsettings 'exec python3 "$STUB_STATE/gsettings.py" "$@"'
+}
+
+test_default_terminal() {
+  local schema=org.gnome.settings-daemon.plugins.media-keys
+  local base=/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings
+  local custom="$schema.custom-keybinding" before state backups
+  setup "Ghostty replaces existing Ctrl+Alt+T, preserving other bindings"
+  bazzite
+  terminal_fixture
+  sandboxed "$STUBS/gsettings" set "$schema" custom-keybindings "['$base/custom0/', '$base/custom7/']"
+  sandboxed "$STUBS/gsettings" set "$custom:$base/custom0/" binding "'<Super>e'"
+  sandboxed "$STUBS/gsettings" set "$custom:$base/custom0/" command "'nautilus'"
+  sandboxed "$STUBS/gsettings" set "$custom:$base/custom7/" binding "'<Control><Alt>t'"
+  sandboxed "$STUBS/gsettings" set "$custom:$base/custom7/" command "'ptyxis --new-window'"
+  echo com.mitchellh.ghostty.desktop > "$HOME/.config/xdg-terminals.list"
+  before="$(home_snapshot)"; state="$(cat "$STATE/gsettings.json")"; : > "$LOG"
+  XDG_CURRENT_DESKTOP=ubuntu:GNOME run_linux --dry-run
+  check "dry run succeeds" [ "$RC" -eq 0 ]
+  check "plans stow without folding" has "$OUT" 'stow --no-folding .* --restow xdg'
+  check "plans existing shortcut update" has "$OUT" 'custom7/ command.*ghostty --gtk-single-instance=true'
+  check "dry run home unchanged" [ "$before" = "$(home_snapshot)" ]
+  check "dry run settings unchanged" [ "$state" = "$(cat "$STATE/gsettings.json")" ]
+  check "dry run never mutates" log_lacks "$MUTATING"
+  XDG_CURRENT_DESKTOP=GNOME run_linux
+  check "run succeeds" [ "$RC" -eq 0 ]
+  check "preference symlink installed" [ -L "$HOME/.config/xdg-terminals.list" ]
+  check "config remains real directory" is_real_dir "$HOME/.config"
+  backups="$(find "$HOME/.local/state/laptop/backups" -name xdg-terminals.list -type f)"
+  check "identical regular file backed up" [ -n "$backups" ]
+  check "backup contents preserved" [ "$(cat "$backups")" = com.mitchellh.ghostty.desktop ]
+  check "only matching shortcut updated" [ "$(grep -c '^gsettings set' "$LOG")" -eq 1 ]
+  check "unrelated command preserved" [ "$(sandboxed "$STUBS/gsettings" get "$custom:$base/custom0/" command)" = "'nautilus'" ]
+  check "binding list preserved" [ "$(sandboxed "$STUBS/gsettings" get "$schema" custom-keybindings)" = "['$base/custom0/', '$base/custom7/']" ]
+  check "correct shortcut updated" log_has 'custom7/ command.*ghostty --gtk-single-instance=true'
+  state="$(cat "$STATE/gsettings.json")"; : > "$LOG"
+  XDG_CURRENT_DESKTOP=GNOME run_linux
+  check "rerun succeeds" [ "$RC" -eq 0 ]
+  check "rerun settings unchanged" [ "$state" = "$(cat "$STATE/gsettings.json")" ]
+  check "rerun writes no settings" log_lacks '^gsettings set'
+  check "rerun creates no backups" lacks "$OUT" 'Backed up \('
+  teardown
+
+  local existing
+  for existing in empty occupied; do
+    setup "new terminal shortcut: $existing"
+    bazzite; terminal_fixture
+    if [ "$existing" = occupied ]; then
+      sandboxed "$STUBS/gsettings" set "$schema" custom-keybindings "['$base/custom0/']"
+      sandboxed "$STUBS/gsettings" set "$custom:$base/custom0/" binding "'<Super>e'"
+    fi
+    : > "$LOG"
+    before="$(home_snapshot)"; state="$(cat "$STATE/gsettings.json")"
+    XDG_CURRENT_DESKTOP=GNOME run_linux --dry-run
+    check "creation dry run succeeds" [ "$RC" -eq 0 ]
+    check "creation dry run home unchanged" [ "$before" = "$(home_snapshot)" ]
+    check "creation dry run settings unchanged" [ "$state" = "$(cat "$STATE/gsettings.json")" ]
+    check "creation dry run never mutates" log_lacks "$MUTATING"
+    check "creation dry run prints list update" has "$OUT" 'gsettings set .* custom-keybindings '
+    XDG_CURRENT_DESKTOP=GNOME run_linux
+    check "creation succeeds" [ "$RC" -eq 0 ]
+    if [ "$existing" = occupied ]; then
+      check "appends without clobbering" log_has "custom-keybindings .*custom0/.*custom1/"
+      check "uses free slot" log_has 'custom1/ command.*ghostty'
+    else
+      check "starts with custom0" log_has 'custom0/ command.*ghostty'
+    fi
+    state="$(cat "$STATE/gsettings.json")"; : > "$LOG"
+    XDG_CURRENT_DESKTOP=GNOME run_linux
+    check "creation rerun is idempotent" [ "$state" = "$(cat "$STATE/gsettings.json")" ]
+    check "creation rerun has no writes" log_lacks '^gsettings set'
+    teardown
+  done
+}
+
+test_default_terminal_skips() {
+  local scenario desktop
+  for scenario in kde absent_desktop missing_ghostty missing_gsettings missing_schema bad_list debian fedora; do
+    setup "default terminal skip: $scenario"
+    bazzite; terminal_fixture; desktop=GNOME
+    case "$scenario" in
+      kde) desktop=KDE ;;
+      absent_desktop) desktop= ;;
+      missing_ghostty) rm "$STUBS/ghostty" ;;
+      missing_gsettings) rm "$STUBS/gsettings" ;;
+      missing_schema) stub gsettings 'exit 0' ;;
+      bad_list) stub gsettings 'case "$1" in list-schemas) echo org.gnome.settings-daemon.plugins.media-keys ;; list-relocatable-schemas) echo org.gnome.settings-daemon.plugins.media-keys.custom-keybinding ;; get) echo invalid ;; esac' ;;
+      debian) os_release pop ubuntu ;;
+      fedora) os_release fedora ;;
+    esac
+    : > "$LOG"
+    XDG_CURRENT_DESKTOP="$desktop" run_linux
+    check "skip succeeds ($scenario)" [ "$RC" -eq 0 ]
+    check "no settings writes ($scenario)" log_lacks '^gsettings set'
+    case "$scenario" in
+      missing_gsettings|missing_schema|bad_list) check "notice ($scenario)" has "$OUT" 'skipped terminal shortcut' ;;
+      *) check "no xdg stow ($scenario)" log_lacks '^stow .* xdg$' ;;
+    esac
+    teardown
+  done
+}
+
 # ── Run ──────────────────────────────────────────────────────────────────────
 
 TESTS=(
+  test_default_terminal
+  test_default_terminal_skips
   test_detection
   test_bazzite_dry_run_fresh
   test_bazzite_dry_run_all_done

@@ -207,3 +207,23 @@ tests/run.sh
 - an rpm-ostree failure.
 
 CI (`.github/workflows/ci.yml`) runs both commands on every push and pull request.
+
+## Ghostty as the Bazzite GNOME default
+
+On Bazzite, with `GNOME` in `XDG_CURRENT_DESKTOP` and `ghostty` on PATH,
+the bootstrap also stows dotfiles' `xdg` package using `--no-folding`.
+Update your dotfiles checkout to include that package first. An existing
+`~/.config/xdg-terminals.list` is backed up through the normal conflict
+handling, even when it already contains `com.mitchellh.ghostty.desktop`.
+This selects Ghostty for `xdg-terminal-exec`; shared config directories stay
+real directories.
+
+The bootstrap finds the GNOME custom shortcut bound to `<Control><Alt>t`
+and changes its command to `ghostty --gtk-single-instance=true`. If none
+exists, it appends a Terminal shortcut at an unused custom path, preserving
+other shortcuts. Re-runs leave an already correct shortcut alone.
+Missing GNOME/gsettings schemas or Ghostty produce a skip notice; when
+Ghostty is only layered for the next boot, re-run after reboot. Debian and
+other Atomic desktops are unaffected. `--dry-run` reports stow, backup and
+shortcut changes without writing them. Tests use a stateful fake gsettings
+inside the existing guarded temporary HOME sandbox, never the host settings.
