@@ -90,6 +90,22 @@ Claude Code is installed only with mise's own npm shim (`~/.local/share/mise/shi
 
 fnm is no longer installed. An existing fnm (`~/.local/share/fnm`, or `fnm` on `PATH`) is left alone and only noted in the output. Remove it yourself when you no longer need it.
 
+### Salesforce
+
+Both Linux paths optionally install `@salesforce/cli` and
+`@salesforce/lwc-language-server` through `mise exec -- npm install -g`,
+then `mise reshim`, followed by `mise exec -- sf plugins install code-analyzer`
+(Java 11+; the bootstrap installs JDK 21). Installed packages and Code Analyzer
+are skipped independently. Failures warn and retry on the next run; unusable
+mise Node skips this step. Dry-run prints the commands without running mise.
+
+To update npm installations explicitly, run
+`mise exec -- npm install -g @salesforce/cli@latest @salesforce/lwc-language-server@latest`
+and `mise reshim`; use `mise exec -- sf plugins update` for plugins.
+`sf update` does not update an npm-installed CLI. No install-script exemption or
+global npm script policy is configured: the inspected scripts only check legacy
+CLI conflicts, protobuf dependency versions, and Yarn/Corepack symlinks.
+
 ## What it configures
 
 - git: `core.hooksPath`, delta pager, `pull.rebase`, `push.autoSetupRemote`, `init.defaultBranch=main` — identity goes in `~/.laptop.local`
