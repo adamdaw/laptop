@@ -22,13 +22,15 @@ FAIL=0
 CURRENT=""
 
 # Core utilities the script (and the stubs) legitimately need.
-CORE_UTILS=(bash env cat grep sed find realpath dirname basename date mkdir mv cp rm ln chmod head tr sort mktemp touch readlink ls wc python3)
+CORE_UTILS=(bash env cat grep sed find realpath dirname basename date mkdir mv cp rm ln chmod head tr sort mktemp touch readlink ls wc python3 sha256sum)
 
-ALL_FORMULAE=(git git-delta stow neovim tmux jq ripgrep fd fzf bat wget gh starship zsh zsh-autosuggestions zsh-syntax-highlighting uv mise openjdk@21)
-ALL_PACKAGES=(agy bash bat bin ghostty git nvim ripgrep ssh starship tmux zsh)
+ALL_FORMULAE=(git git-delta stow neovim tmux jq ripgrep fd fzf bat wget gh starship zsh zsh-autosuggestions zsh-syntax-highlighting uv mise openjdk@21 lazygit tree-sitter-cli shellcheck markdownlint-cli2)
+ALL_PACKAGES=(agy applications bash bat bin ghostty git nvim render-url ripgrep ssh starship tmux zsh)
+# Stowed with --no-folding (as the script does).
+NO_FOLD_PACKAGES=(applications render-url)
 
 # Calls that would change the machine. None may appear during --dry-run.
-MUTATING='^(sudo|apt-get|chsh|usermod|ujust|ssh-keygen|npm|curl|stow|systemctl|ubuntu-report|unzip|fc-cache)( |$)|^brew install|^rpm-ostree (install|upgrade|reboot)|^flatpak install|^git clone|^git config (--global [^-]|.* --(add|unset|unset-all|replace-all|remove-section|rename-section)( |$))|^mise (use|install|reshim)|^mise-|^gsettings set'
+MUTATING='^(sudo|apt-get|chsh|usermod|ujust|ssh-keygen|npm|curl|stow|systemctl|ubuntu-report|unzip|fc-cache)( |$)|^brew install|^rpm-ostree (install|upgrade|reboot)|^flatpak install|^git clone|^git config (--global [^-]|.* --(add|unset|unset-all|replace-all|remove-section|rename-section)( |$))|^mise (use|install|reshim|exec)|^mise-|^gsettings set'
 
 # rpm-ostree status --json shapes. Deployments are listed newest first:
 # staged/pending, then booted, then rollback.
@@ -56,6 +58,9 @@ case "$*" in
                      "$STUB_STATE/node-install" "$("$STUB_STATE/node-install" --pin)" ;;
   reshim)            [ "${STUB_RESHIM_RC:-0}" = 0 ] || exit "$STUB_RESHIM_RC"
                      "$STUB_STATE/node-install" --reshim ;;
+  "exec -- "*)       shift 2  # the pinned node first on PATH, as mise exec does
+                     v="$("$STUB_STATE/node-install" --which)"
+                     PATH="${MISE_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/mise}/installs/node/$v/bin:$PATH" exec "$@" ;;
   *)                 echo "stub mise: unexpected: $*" >&2; exit 2 ;;
 esac'
 
@@ -70,7 +75,9 @@ esac'
 # Each tool logs as "mise-<version>-<tool>" and each shim as "mise-shim-<tool>";
 # a shim runs the pinned version's tool, as mise's shims do. The versioned
 # npm's `install -g @anthropic-ai/claude-code` adds claude to that bin dir, not
-# a shim: only reshim exposes it.
+# a shim: only reshim exposes it. `npm ci` replaces ./node_modules with one
+# holding playwright (STUB_NPM_CI_RC makes it fail); `npx playwright install
+# chromium` puts a Chromium build in Playwright's browser cache.
 write_node_install() {
   cat > "$STATE/node-install" <<'EOF'
 #!@BASH@
@@ -101,6 +108,11 @@ tool() { # tool PATH LABEL
 printf '%s\n' "mise-$2 \$*" >> "\$STUB_LOG"
 if [ "\$*" = "install -g @anthropic-ai/claude-code" ]; then
   printf '#!@BASH@\nexit 0\n' > "\${0%/*}/claude"; chmod +x "\${0%/*}/claude"
+elif [ "\${0##*/} \$*" = "npm ci" ]; then
+  [ "\${STUB_NPM_CI_RC:-0}" = 0 ] || exit "\$STUB_NPM_CI_RC"
+  rm -rf node_modules; mkdir -p node_modules/playwright
+elif [ "\${0##*/} \$*" = "npx playwright install chromium" ]; then
+  mkdir -p "\${XDG_CACHE_HOME:-\$HOME/.cache}/ms-playwright/chromium-1140"
 fi
 TOOL
   chmod +x "$1"
@@ -131,6 +143,7 @@ v="$(resolve "$1")"
 mkdir -p "$dir/$v/bin"
 tool "$dir/$v/bin/node" "$v-node"
 tool "$dir/$v/bin/npm" "$v-npm"
+tool "$dir/$v/bin/npx" "$v-npx"
 ln -sfn "$v" "$dir/${v%%.*}"; ln -sfn "$v" "$dir/${v%.*}"
 if [ "$v" = 22.12.0 ] && [ -z "${NODE_NO_ALIAS:-}" ]; then ln -sfn "$v" "$dir/lts"; ln -sfn "$v" "$dir/latest"; fi
 reshim
@@ -371,6 +384,20 @@ dotfiles_fixture() {
   echo "" > "$d/starship/.config/starship.toml"
   echo "--smart-case" > "$d/ripgrep/.ripgreprc"
   echo "README — must not be stowed" > "$d/bash/README.md"
+  mkdir -p "$d/render-url/.local/share/render-url" "$d/applications/.local/bin" "$d/applications/.local/share/applications"
+  echo '{"name":"render-url","dependencies":{"playwright":"^1.48.0"}}' > "$d/render-url/.local/share/render-url/package.json"
+  echo '{"lockfileVersion":3}' > "$d/render-url/.local/share/render-url/package-lock.json"
+  echo "// render-url" > "$d/render-url/.local/share/render-url/render-url.mjs"
+  echo "#!/bin/sh" > "$d/applications/.local/bin/claude-on-mac"
+  echo "[Desktop Entry]" > "$d/applications/.local/share/applications/claude-on-mac.desktop"
+}
+
+# render-url's dependencies as a successful run leaves them: node_modules
+# stamped with the lockfile's hash, and Chromium in Playwright's cache.
+render_url_done_fixture() {
+  local dir="$HOME/.local/share/render-url"
+  mkdir -p "$dir/node_modules/playwright" "$HOME/.cache/ms-playwright/chromium-1140"
+  sha256sum < "$dir/package-lock.json" > "$dir/node_modules/.laptop-package-lock.sha256"
 }
 
 # mise on PATH, node pinned in its global config and installed, as
@@ -396,7 +423,13 @@ all_done_fixture() {
   printf '#!%s\necho 1.1.0\n' "$SANDBOX/sysbin/bash" > "$HOME/.bun/bin/bun"; chmod +x "$HOME/.bun/bin/bun"
   stub claude
   mise_node_fixture
-  sandboxed "$STUBS/stow" --dir="$HOME/Projects/Home/dotfiles" --target="$HOME" --restow "${ALL_PACKAGES[@]}"
+  local p folded=()
+  for p in "${ALL_PACKAGES[@]}"; do
+    [[ " ${NO_FOLD_PACKAGES[*]} " == *" $p "* ]] || folded+=("$p")
+  done
+  sandboxed "$STUBS/stow" --dir="$HOME/Projects/Home/dotfiles" --target="$HOME" --restow "${folded[@]}"
+  sandboxed "$STUBS/stow" --no-folding --dir="$HOME/Projects/Home/dotfiles" --target="$HOME" --restow "${NO_FOLD_PACKAGES[@]}"
+  render_url_done_fixture
   : > "$LOG"
 }
 
@@ -447,7 +480,7 @@ sandboxed() {
     LAPTOP_YUM_REPOS_DIR="$LAPTOP_YUM_REPOS_DIR" LAPTOP_BREW_DIRS="$LAPTOP_BREW_DIRS"
     STUB_LOG="$STUB_LOG" STUB_STATE="$STUB_STATE"
   )
-  for v in XDG_CURRENT_DESKTOP STUB_GIT_FAIL STUB_GIT_TRUNC STUB_GIT_ON STUB_GIT_DO STUB_CURL_RC STUB_CURL_FAIL STUB_GPG_RC STUB_MISE_RC STUB_RESHIM_RC STUB_OSTREE_RC; do
+  for v in XDG_CURRENT_DESKTOP STUB_GIT_FAIL STUB_GIT_TRUNC STUB_GIT_ON STUB_GIT_DO STUB_CURL_RC STUB_CURL_FAIL STUB_GPG_RC STUB_MISE_RC STUB_RESHIM_RC STUB_OSTREE_RC STUB_NPM_CI_RC PLAYWRIGHT_BROWSERS_PATH; do
     if [ -n "${!v:-}" ]; then vars+=("$v=${!v}"); fi
   done
   "$SANDBOX/sysbin/env" -i "${vars[@]}" "$@"
@@ -522,7 +555,7 @@ test_bazzite_dry_run_fresh() {
   check "detects Bazzite" has "$OUT" "Detected Bazzite"
   check "plans exactly one brew install" [ "$(grep -cF '[dry-run] brew install' <<<"$OUT")" -eq 1 ]
   local f
-  for f in zsh zsh-autosuggestions zsh-syntax-highlighting git-delta neovim ripgrep fd fzf bat jq gh starship uv wget mise openjdk@21; do
+  for f in zsh zsh-autosuggestions zsh-syntax-highlighting git-delta neovim ripgrep fd fzf bat jq gh starship uv wget mise openjdk@21 lazygit tree-sitter-cli shellcheck markdownlint-cli2; do
     check "brew installs $f" has "$brew_line" " $f( |$)"
   done
   check "skips image-provided tmux" lacks "$brew_line" " tmux( |$)"
@@ -1282,6 +1315,8 @@ test_debian_dry_run() {
   check "plans apt install zsh" has "$OUT" "\[dry-run\] sudo apt-get install -y zsh$"
   check "plans gh apt repo" has "$OUT" "/etc/apt/sources.list.d/github-cli.list"
   check "plans JDK 21 via apt" has "$OUT" "\[dry-run\] sudo apt-get install -y openjdk-21-jdk$"
+  check "plans shellcheck via apt" has "$OUT" "\[dry-run\] sudo apt-get install -y shellcheck$"
+  check "plans render-url npm ci through mise" has "$OUT" "\[dry-run\] \(cd $HOME/.local/share/render-url && mise exec -- npm ci\)$"
   check "plans chsh" has "$OUT" "\[dry-run\] chsh -s"
   check "stows tmux" has "$OUT" "\[dry-run\] stow .* --restow tmux$"
   check "never uses --adopt" lacks "$OUT" "--adopt"
@@ -2047,6 +2082,173 @@ test_default_terminal_skips() {
   done
 }
 
+# ── Tests: render-url and the applications package ──────────────────────────
+
+RU_DIR_REL=.local/share/render-url
+ru_log() { log_count "^mise exec -- $1"; }
+
+test_render_url() {
+  local ru before repo_before
+  setup "render-url: bazzite dry-run (fresh)"
+  bazzite
+  dotfiles_fixture
+  ru="$HOME/$RU_DIR_REL"
+  before="$(home_snapshot)"
+  run_linux --dry-run
+  check "exits 0" [ "$RC" -eq 0 ]
+  check "stows render-url without folding" has "$OUT" '\[dry-run\] stow --no-folding .* --restow render-url$'
+  check "stows applications without folding" has "$OUT" '\[dry-run\] stow --no-folding .* --restow applications$'
+  check "folds other packages as before" has "$OUT" '\[dry-run\] stow --dir=.* --restow tmux$'
+  check "never stows claude" lacks "$OUT" '--restow claude$'
+  check "plans npm ci through mise exec" has "$OUT" "\[dry-run\] \(cd $ru && mise exec -- npm ci\)$"
+  check "plans the documented browser install" has "$OUT" "\[dry-run\] \(cd $ru && mise exec -- npx playwright install chromium\)$"
+  check "npm ci planned after stowing render-url" [ "$(grep -n -m1 'restow render-url$' <<<"$OUT" | cut -d: -f1)" -lt "$(grep -n -m1 'npm ci' <<<"$OUT" | cut -d: -f1)" ]
+  check "no mutating command was executed" log_lacks "$MUTATING"
+  check "HOME is untouched" [ "$before" = "$(home_snapshot)" ]
+  teardown
+
+  setup "render-url: bazzite run + re-run (stubbed)"
+  bazzite
+  dotfiles_fixture
+  ru="$HOME/$RU_DIR_REL"
+  repo_before="$(repo_snapshot)"
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "brew installed the new formulae" log_has '^brew install .* lazygit tree-sitter-cli shellcheck markdownlint-cli2( |$)'
+  check "render-url dir is a real dir" is_real_dir "$ru"
+  check "render-url script is stowed" [ "$(realpath "$ru/render-url.mjs")" = "$(realpath "$HOME/Projects/Home/dotfiles/render-url/$RU_DIR_REL/render-url.mjs")" ]
+  check ".local/bin stays a real dir" is_real_dir "$HOME/.local/bin"
+  check ".local/share/applications stays a real dir" is_real_dir "$HOME/.local/share/applications"
+  check "claude-on-mac.desktop is stowed" [ -L "$HOME/.local/share/applications/claude-on-mac.desktop" ]
+  check "claude-on-mac is stowed" [ -L "$HOME/.local/bin/claude-on-mac" ]
+  check "npm ci ran once through mise exec" [ "$(ru_log 'npm ci$')" -eq 1 ]
+  check "mise exec ran the pinned node's npm" log_has '^mise-22.12.0-npm ci$'
+  check "npm ci after node was pinned" logged_before '^mise use -g node@lts$' '^mise exec -- npm ci$'
+  check "browser install after npm ci" logged_before '^mise exec -- npm ci$' '^mise exec -- npx playwright install chromium$'
+  check "the pinned node's npx installed Chromium" log_has '^mise-22.12.0-npx playwright install chromium$'
+  check "node_modules is beside the stowed files" [ -d "$ru/node_modules/playwright" ]
+  check "lockfile hash recorded" [ "$(cat "$ru/node_modules/.laptop-package-lock.sha256")" = "$(sha256sum < "$ru/package-lock.json")" ]
+  check "PATH npm never used" log_lacks '^npm '
+  check "nothing written into the repo" [ "$repo_before" = "$(repo_snapshot)" ]
+  : > "$LOG"
+  run_linux
+  check "re-run exits 0" [ "$RC" -eq 0 ]
+  check "re-run skips npm ci" log_lacks '^mise exec'
+  check "re-run says deps are installed" has "$OUT" "render-url dependencies already installed"
+  check "re-run says Chromium is installed" has "$OUT" "Playwright Chromium already installed"
+  check "re-run has no stow failures" lacks "$OUT" "stow failed"
+
+  : > "$LOG"
+  echo '{"lockfileVersion":3,"changed":true}' > "$HOME/Projects/Home/dotfiles/render-url/$RU_DIR_REL/package-lock.json"
+  run_linux
+  check "changed lockfile: npm ci again" [ "$(ru_log 'npm ci$')" -eq 1 ]
+  check "changed lockfile: browser install re-checked" [ "$(ru_log 'npx playwright install chromium$')" -eq 1 ]
+  check "changed lockfile: new hash recorded" [ "$(cat "$ru/node_modules/.laptop-package-lock.sha256")" = "$(sha256sum < "$ru/package-lock.json")" ]
+
+  : > "$LOG"
+  rm -rf "$HOME/.cache/ms-playwright"
+  run_linux
+  check "browser missing: no npm ci" [ "$(ru_log 'npm ci$')" -eq 0 ]
+  check "browser missing: installs Chromium only" [ "$(ru_log 'npx playwright install chromium$')" -eq 1 ]
+  teardown
+
+  setup "render-url: dry-run when everything is in place"
+  bazzite
+  dotfiles_fixture
+  all_done_fixture
+  before="$(home_snapshot)"
+  run_linux --dry-run
+  check "exits 0" [ "$RC" -eq 0 ]
+  check "says deps are installed" has "$OUT" "render-url dependencies already installed"
+  check "plans no npm or browser install" lacks "$OUT" "npm ci|playwright install"
+  check "HOME is untouched" [ "$before" = "$(home_snapshot)" ]
+  teardown
+
+  setup "render-url: browsers in PLAYWRIGHT_BROWSERS_PATH"
+  bazzite
+  dotfiles_fixture
+  all_done_fixture
+  rm -rf "$HOME/.cache/ms-playwright"
+  mkdir -p "$SANDBOX/pw/chromium_headless_shell-1140"
+  PLAYWRIGHT_BROWSERS_PATH="$SANDBOX/pw" run_linux
+  check "finds Chromium there" has "$OUT" "Playwright Chromium already installed"
+  check "installs nothing" log_lacks '^mise exec'
+  teardown
+
+  setup "render-url: PLAYWRIGHT_BROWSERS_PATH=0 (browsers inside node_modules)"
+  bazzite
+  dotfiles_fixture
+  all_done_fixture
+  rm -rf "$HOME/.cache/ms-playwright"
+  PLAYWRIGHT_BROWSERS_PATH=0 run_linux
+  check "missing there: installs Chromium" [ "$(ru_log 'npx playwright install chromium$')" -eq 1 ]
+  : > "$LOG"
+  mkdir -p "$HOME/$RU_DIR_REL/node_modules/playwright-core/.local-browsers/chromium-1140"
+  rm -rf "$HOME/.cache/ms-playwright"
+  PLAYWRIGHT_BROWSERS_PATH=0 run_linux
+  check "present there: installs nothing" log_lacks '^mise exec'
+  teardown
+
+  setup "render-url: no usable mise Node"
+  bazzite
+  dotfiles_fixture
+  STUB_MISE_RC=1 run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "warns and skips" has "$OUT" "skipped render-url dependencies: no usable mise-managed Node"
+  check "never runs npm" log_lacks '^mise exec|^npm |-npm ci'
+  check "no node_modules" [ ! -e "$HOME/$RU_DIR_REL/node_modules" ]
+  teardown
+
+  setup "render-url: npm ci fails"
+  bazzite
+  dotfiles_fixture
+  STUB_NPM_CI_RC=1 run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "warns about the failure" has "$OUT" "'mise exec -- npm ci' failed"
+  check "no browser install after a failed npm ci" log_lacks 'playwright install'
+  check "no hash recorded" [ ! -e "$HOME/$RU_DIR_REL/node_modules/.laptop-package-lock.sha256" ]
+  : > "$LOG"
+  run_linux
+  check "re-run retries npm ci" [ "$(ru_log 'npm ci$')" -eq 1 ]
+  check "re-run then installs Chromium" [ "$(ru_log 'npx playwright install chromium$')" -eq 1 ]
+  teardown
+
+  setup "render-url: folded into the repo"
+  bazzite
+  dotfiles_fixture
+  mkdir -p "$HOME/.local/share"
+  ln -s ../../Projects/Home/dotfiles/render-url/.local/share/render-url "$HOME/.local/share/render-url"
+  repo_before="$(repo_snapshot)"
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "warns about the fold" has "$OUT" "skipped render-url dependencies: .* resolves into the dotfiles repo"
+  check "never runs npm ci" log_lacks '^mise exec'
+  check "nothing written into the repo" [ "$repo_before" = "$(repo_snapshot)" ]
+  teardown
+
+  setup "render-url: package absent from dotfiles"
+  bazzite
+  dotfiles_fixture
+  rm -rf "$HOME/Projects/Home/dotfiles/render-url"
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "warns the package is missing" has "$OUT" "dotfiles has no 'render-url' package"
+  check "no render-url step" lacks "$OUT" "render-url dependencies"
+  check "never runs npm ci" log_lacks '^mise exec'
+  teardown
+
+  setup "render-url: pop run"
+  os_release pop "ubuntu debian"
+  dotfiles_fixture
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "shellcheck from apt" log_has '^sudo apt-get install -y shellcheck$'
+  check "npm ci through mise exec" [ "$(ru_log 'npm ci$')" -eq 1 ]
+  check "node_modules installed" [ -d "$HOME/$RU_DIR_REL/node_modules/playwright" ]
+  check "PATH npm never used" log_lacks '^npm '
+  teardown
+}
+
 # ── Run ──────────────────────────────────────────────────────────────────────
 
 TESTS=(
@@ -2096,6 +2298,7 @@ TESTS=(
   test_gitconfig_xdg_identity
   test_git_stub_includes
   test_font_detection
+  test_render_url
 )
 
 for t in "${TESTS[@]}"; do

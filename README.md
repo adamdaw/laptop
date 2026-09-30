@@ -42,8 +42,23 @@ bash laptop/linux
 | Python | uv (installer) | uv |
 | JavaScript runtime | Bun (installer, `~/.bun`) | Bun (installer, `~/.bun`) |
 | Font | JetBrains Mono Nerd Font (`~/.local/share/fonts`) | checked; installed to `~/.local/share/fonts` only if missing |
+| Dev tools | shellcheck | lazygit, tree-sitter-cli, shellcheck, markdownlint-cli2 |
+| render-url | npm dependencies + Playwright Chromium (mise's Node) | npm dependencies + Playwright Chromium (mise's Node) |
 
-On Bazzite, a Homebrew formula is skipped when the command is already on `PATH` from the image (for example `tmux` and `git`).
+On Bazzite, a Homebrew formula is skipped when the command is already on `PATH` from the image (for example `tmux` and `git`). lazygit, tree-sitter-cli and markdownlint-cli2 are installed on Bazzite only; Ubuntu 24.04's apt has no suitable packages for them, so install them yourself there if you need them.
+
+### render-url
+
+The dotfiles `render-url` package stows a headless-Chromium URL renderer into `~/.local/share/render-url`. Its npm dependencies (Playwright) are not in the repo, so after stowing the script installs them there, on both platforms, with the commands dotfiles' `bin/render-url` documents, run through mise's Node:
+
+```bash
+cd ~/.local/share/render-url && mise exec -- npm ci && mise exec -- npx playwright install chromium
+```
+
+- `npm ci` runs only when `node_modules` is missing or `package-lock.json` changed since the last install (its SHA-256 is recorded in `node_modules/.laptop-package-lock.sha256`, which `npm ci` wipes).
+- The Chromium download runs only when no Chromium build is in Playwright's browser cache (`PLAYWRIGHT_BROWSERS_PATH`, else `~/.cache/ms-playwright`), or right after a fresh `npm ci`, since a new Playwright may need a new build (Playwright skips builds it already has).
+- Without a usable mise-managed Node, or if `~/.local/share/render-url` resolves into the dotfiles repo (an earlier stow with folding), the step is skipped with a warning; npm never writes into the repo. A failed `npm ci` is a warning too, and the next run retries it.
+- `--dry-run` only prints these commands.
 
 ### Java 21
 
@@ -79,7 +94,7 @@ fnm is no longer installed. An existing fnm (`~/.local/share/fnm`, or `fnm` on `
 
 - git: `core.hooksPath`, delta pager, `pull.rebase`, `push.autoSetupRemote`, `init.defaultBranch=main` — identity goes in `~/.laptop.local`
 - SSH: generates `~/.ssh/id_ed25519` if absent
-- Dotfiles: clones your dotfiles repo and stows `agy bash bat bin ghostty git nvim ripgrep ssh starship tmux zsh` — update `DOTFILES_REPO` at the top of `linux` to point at yours
+- Dotfiles: clones your dotfiles repo and stows `agy applications bash bat bin ghostty git nvim render-url ripgrep ssh starship tmux zsh` — update `DOTFILES_REPO` at the top of `linux` to point at yours. `applications`, `render-url` (and `xdg`, see below) are stowed with `--no-folding`, so `~/.local/bin`, `~/.local/share/applications` and `~/.local/share/render-url` stay real directories and nothing written there lands in the repo.
 - Shell: sets zsh as the login shell on Ubuntu/Pop!_OS. On Bazzite the login shell stays bash (see below).
 
 ### Dotfiles never use `stow --adopt`
@@ -203,6 +218,7 @@ tests/run.sh
 - mise config parsing, each with dry-run and real runs that assert no `mise use` and a byte-identical config: `["tools"]` + `node = "20"`, `[tools]` + `node.version = "20"`, and a multiline string containing a fake `[tools]` header. Invalid TOML, no python3 and no `tomllib` are all treated as uncertain;
 - mise edge cases: a pin matching no installed version (pin 20, only 22 installed), a non-executable `node`, missing shims restored only by `mise reshim` (and a failing reshim), no `installs/node/lts` link (reconciled on every run), `[tools.node]` tables, unparsed pins (never re-pinned), the reshim that exposes `claude`, `node` outside `[tools]`, a leftover fnm, a global config that resolves into the repo or can't be resolved, and a failing mise, with Claude Code skipped and no `npm` used when Node isn't ready;
 - apt key download or dearmor failures on Pop!_OS;
+- render-url: `npm ci` and the Chromium download through `mise exec` (the stubbed `mise exec` runs the pinned Node's own npm/npx), skipped on re-run, re-run after a lockfile change, the browser alone when only it is missing, `PLAYWRIGHT_BROWSERS_PATH`, no usable Node, a failing `npm ci` (retried next run), a fold into the repo, a missing package, and the `--no-folding` stows of `render-url` and `applications`;
 - sandbox guards, including brew prefixes and `HOME` that escape the sandbox through a symlink;
 - an rpm-ostree failure.
 
