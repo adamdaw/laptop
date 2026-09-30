@@ -24,10 +24,10 @@ CURRENT=""
 # Core utilities the script (and the stubs) legitimately need.
 CORE_UTILS=(bash env cat grep sed find realpath dirname basename date mkdir mv cp rm ln chmod head tr sort mktemp touch readlink ls wc python3 sha256sum)
 
-ALL_FORMULAE=(git git-delta stow neovim tmux jq ripgrep fd fzf bat wget gh starship zsh zsh-autosuggestions zsh-syntax-highlighting uv mise openjdk@21 lazygit tree-sitter-cli shellcheck markdownlint-cli2)
-ALL_PACKAGES=(agy applications bash bat bin claude ghostty git nvim render-url ripgrep ssh starship tmux zsh)
+ALL_FORMULAE=(git git-delta stow neovim tmux jq ripgrep fd fzf bat wget gh starship zsh zsh-autosuggestions zsh-syntax-highlighting uv mise openjdk@21 lazygit tree-sitter-cli shellcheck markdownlint-cli2 gitleaks atuin)
+ALL_PACKAGES=(agy applications atuin bash bat bin claude ghostty git nvim render-url ripgrep ssh starship tmux zsh)
 # Stowed with --no-folding (as the script does).
-NO_FOLD_PACKAGES=(applications claude render-url)
+NO_FOLD_PACKAGES=(agy applications atuin bin claude render-url)
 
 # Calls that would change the machine. None may appear during --dry-run.
 MUTATING='^(sudo|apt-get|chsh|usermod|ujust|ssh-keygen|npm|curl|stow|systemctl|ubuntu-report|unzip|fc-cache)( |$)|^brew install|^rpm-ostree (install|upgrade|reboot)|^flatpak install|^git clone|^git config (--global [^-]|.* --(add|unset|unset-all|replace-all|remove-section|rename-section)( |$))|^mise (use|install|reshim|exec)|^mise-|^gsettings set'
@@ -58,6 +58,8 @@ case "$*" in
                      "$STUB_STATE/node-install" "$("$STUB_STATE/node-install" --pin)" ;;
   reshim)            [ "${STUB_RESHIM_RC:-0}" = 0 ] || exit "$STUB_RESHIM_RC"
                      "$STUB_STATE/node-install" --reshim ;;
+  "exec node@lts -- "*) shift 3  # Node LTS first on PATH, whatever the pin
+                     PATH="${MISE_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/mise}/installs/node/lts/bin:$PATH" exec "$@" ;;
   "exec -- "*)       shift 2  # the pinned node first on PATH, as mise exec does
                      v="$("$STUB_STATE/node-install" --which)"
                      PATH="${MISE_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/mise}/installs/node/$v/bin:$PATH" exec "$@" ;;
@@ -74,8 +76,13 @@ esac'
 #   --pin / --which    the config's node selection / the version it resolves to
 # Each tool logs as "mise-<version>-<tool>" and each shim as "mise-shim-<tool>";
 # a shim runs the pinned version's tool, as mise's shims do. The versioned
-# npm's `install -g @anthropic-ai/claude-code` adds claude to that bin dir, not
-# a shim: only reshim exposes it. `npm ci` replaces ./node_modules with one
+# npm's `install -g` of @anthropic-ai/claude-code, @openai/codex or
+# @earendil-works/pi-coding-agent adds claude, codex or pi to that bin dir, not
+# a shim: only reshim exposes it (STUB_AGENT_FAIL=<package> makes that install
+# fail). Its `install -g corepack` adds corepack there (STUB_AGENT_FAIL=corepack
+# makes it fail). `corepack enable pnpm` adds pnpm next to the corepack that runs, as
+# real corepack does for the first corepack on PATH (STUB_COREPACK_RC makes it
+# fail). `npm ci` replaces ./node_modules with one
 # holding playwright (STUB_NPM_CI_RC makes it fail). `npx playwright install
 # chromium` behaves like Playwright: it needs its pinned revision (1140) of
 # both chromium and chromium_headless_shell in ~/.cache/ms-playwright and
@@ -111,8 +118,16 @@ tool() { # tool PATH LABEL
 printf '%s\n' "mise-$2 \$*" >> "\$STUB_LOG"
 if [ "\${0##*/}" = node ] && [ -f "\$STUB_STATE/sf-node-fail" ]; then
   exit 1
-elif [ "\$*" = "install -g @anthropic-ai/claude-code" ]; then
-  printf '#!@BASH@\nexit 0\n' > "\${0%/*}/claude"; chmod +x "\${0%/*}/claude"
+elif [ "\${0##*/}" = npm ] && [ "\${1:-} \${2:-}" = "install -g" ] && [[ "\${3:-}" =~ ^(@anthropic-ai/claude-code|@openai/codex|@earendil-works/pi-coding-agent)$ ]]; then
+  [ "\${STUB_AGENT_FAIL:-}" != "\$3" ] || exit 1
+  case "\$3" in *claude-code) c=claude ;; *codex) c=codex ;; *) c=pi ;; esac
+  printf '#!@BASH@\nexit 0\n' > "\${0%/*}/\$c"; chmod +x "\${0%/*}/\$c"
+elif [ "\${0##*/} \$*" = "npm install -g corepack" ]; then
+  [ "\${STUB_AGENT_FAIL:-}" != corepack ] || exit 1
+  sed 's/-npm \\\$\*/-corepack \$*/' "\$0" > "\${0%/*}/corepack"; chmod +x "\${0%/*}/corepack"
+elif [ "\${0##*/} \$*" = "corepack enable pnpm" ]; then
+  [ "\${STUB_COREPACK_RC:-0}" = 0 ] || exit "\$STUB_COREPACK_RC"
+  printf '#!@BASH@\nexit 0\n' > "\${0%/*}/pnpm"; chmod +x "\${0%/*}/pnpm"
 elif [ "\${0##*/}" = npm ] && [ "\${1:-}" = list ]; then
   [ -f "\$STUB_STATE/\${!#}" ]; exit \$?
 elif [ "\${0##*/}" = npm ] && [ "\${1:-}" = install ]; then
@@ -168,6 +183,7 @@ mkdir -p "$dir/$v/bin"
 tool "$dir/$v/bin/node" "$v-node"
 tool "$dir/$v/bin/npm" "$v-npm"
 tool "$dir/$v/bin/npx" "$v-npx"
+tool "$dir/$v/bin/corepack" "$v-corepack"
 ln -sfn "$v" "$dir/${v%%.*}"; ln -sfn "$v" "$dir/${v%.*}"
 if [ "$v" = 22.12.0 ] && [ -z "${NODE_NO_ALIAS:-}" ]; then ln -sfn "$v" "$dir/lts"; ln -sfn "$v" "$dir/latest"; fi
 reshim
@@ -393,7 +409,17 @@ stow_dir() { # stow_dir SOURCE_DIR TARGET_DIR
     else ln -s "$s" "$t"; fi
   done
 }
-for p in "${pkgs[@]}"; do stow_dir "$dir/$p" "$target"; done'
+for p in "${pkgs[@]}"; do
+  # Real stow plans a whole package before touching anything, and refuses one
+  # it must traverse (always, with --no-folding) that holds an absolute
+  # symlink: "source is an absolute symlink", all operations aborted.
+  if (( no_folding )); then
+    while IFS= read -r l; do
+      [[ "$(readlink "$l")" == /* ]] && conflict "$l (source is an absolute symlink)"
+    done < <(find "$dir/$p" -type l)
+  fi
+  stow_dir "$dir/$p" "$target"
+done'
 }
 
 teardown() { rm -rf "$SANDBOX"; }
@@ -428,6 +454,10 @@ dotfiles_fixture() {
   mkdir -p "$d/claude/.claude/skills/route-local"
   echo "# dotfiles CLAUDE.md" > "$d/claude/.claude/CLAUDE.md"
   echo "# route-local" > "$d/claude/.claude/skills/route-local/SKILL.md"
+  mkdir -p "$d/atuin/.config/atuin" "$d/atuin/.config/atuin-ai-server" "$d/atuin/.config/containers/systemd"
+  echo "# dotfiles atuin" > "$d/atuin/.config/atuin/config.toml"
+  echo "# dotfiles atuin-ai-server" > "$d/atuin/.config/atuin-ai-server/config.toml"
+  echo "[Container]" > "$d/atuin/.config/containers/systemd/atuin-ai-server.container"
 }
 
 # render-url's dependencies as a successful run leaves them: node_modules
@@ -448,10 +478,37 @@ mise_node_fixture() { # mise_node_fixture [PIN] [INSTALLED_VERSION]
   sandboxed "$STATE/node-install" "${2:-${1:-lts}}"
 }
 
+# True if the first line of $OUT matching $1 comes before the first matching $2.
+logged_before_out() {
+  local a b
+  a="$(grep -nE -m1 -- "$1" <<<"$OUT" | cut -d: -f1)"; b="$(grep -nE -m1 -- "$2" <<<"$OUT" | cut -d: -f1)"
+  [ -n "$a" ] && [ -n "$b" ] && [ "$b" -gt "$a" ]
+}
+
 # Line number of the first log entry matching $1 (0 if none).
 log_line() { local n; n="$(grep -nE -m1 -- "$1" "$LOG" | cut -d: -f1)"; echo "${n:-0}"; }
 # True if the first match of $1 is logged before the first match of $2.
 logged_before() { local a b; a="$(log_line "$1")"; b="$(log_line "$2")"; [ "$a" -gt 0 ] && [ "$b" -gt "$a" ]; }
+
+AGENT_TOOLS=(claude codex pi)
+# Linked straight into Node LTS: the agent CLIs and pnpm. The rest go to shims.
+LTS_LINKED=(claude codex pi pnpm)
+NODE_TOOLS=(node npm npx corepack)
+
+# The agent CLIs and pnpm installed under mise's Node LTS, reshimmed, and
+# linked from ~/.local/bin, as a successful run leaves them. Needs
+# mise_node_fixture first.
+agent_clis_fixture() {
+  local data="$HOME/.local/share/mise" t
+  for t in "${AGENT_TOOLS[@]}" pnpm; do
+    printf '#!%s\nexit 0\n' "$SANDBOX/sysbin/bash" > "$data/installs/node/22.12.0/bin/$t"
+    chmod +x "$data/installs/node/22.12.0/bin/$t"
+  done
+  sandboxed "$STATE/node-install" --reshim
+  mkdir -p "$HOME/.local/bin"
+  for t in "${LTS_LINKED[@]}"; do ln -s "$data/installs/node/lts/bin/$t" "$HOME/.local/bin/$t"; done
+  for t in "${NODE_TOOLS[@]}"; do ln -s "$data/shims/$t" "$HOME/.local/bin/$t"; done
+}
 
 # Everything already in place, as after a successful run.
 all_done_fixture() {
@@ -460,8 +517,8 @@ all_done_fixture() {
   mkdir -p "$HOME/.ssh" "$HOME/.bun/bin"
   touch "$HOME/.ssh/id_ed25519"
   printf '#!%s\necho 1.1.0\n' "$SANDBOX/sysbin/bash" > "$HOME/.bun/bin/bun"; chmod +x "$HOME/.bun/bin/bun"
-  stub claude
   mise_node_fixture
+  agent_clis_fixture
   local p folded=()
   for p in "${ALL_PACKAGES[@]}"; do
     [[ " ${NO_FOLD_PACKAGES[*]} " == *" $p "* ]] || folded+=("$p")
@@ -519,7 +576,7 @@ sandboxed() {
     LAPTOP_YUM_REPOS_DIR="$LAPTOP_YUM_REPOS_DIR" LAPTOP_BREW_DIRS="$LAPTOP_BREW_DIRS"
     STUB_LOG="$STUB_LOG" STUB_STATE="$STUB_STATE"
   )
-  for v in XDG_CURRENT_DESKTOP STUB_GIT_FAIL STUB_GIT_TRUNC STUB_GIT_ON STUB_GIT_DO STUB_CURL_RC STUB_CURL_FAIL STUB_GPG_RC STUB_MISE_RC STUB_RESHIM_RC STUB_OSTREE_RC STUB_NPM_CI_RC STUB_PW_RC; do
+  for v in XDG_CURRENT_DESKTOP STUB_GIT_FAIL STUB_GIT_TRUNC STUB_GIT_ON STUB_GIT_DO STUB_CURL_RC STUB_CURL_FAIL STUB_GPG_RC STUB_MISE_RC STUB_RESHIM_RC STUB_OSTREE_RC STUB_NPM_CI_RC STUB_PW_RC STUB_AGENT_FAIL STUB_COREPACK_RC; do
     if [ -n "${!v:-}" ]; then vars+=("$v=${!v}"); fi
   done
   "$SANDBOX/sysbin/env" -i "${vars[@]}" "$@"
@@ -594,7 +651,7 @@ test_bazzite_dry_run_fresh() {
   check "detects Bazzite" has "$OUT" "Detected Bazzite"
   check "plans exactly one brew install" [ "$(grep -cF '[dry-run] brew install' <<<"$OUT")" -eq 1 ]
   local f
-  for f in zsh zsh-autosuggestions zsh-syntax-highlighting git-delta neovim ripgrep fd fzf bat jq gh starship uv wget mise openjdk@21 lazygit tree-sitter-cli shellcheck markdownlint-cli2; do
+  for f in zsh zsh-autosuggestions zsh-syntax-highlighting git-delta neovim ripgrep fd fzf bat jq gh starship uv wget mise openjdk@21 lazygit tree-sitter-cli shellcheck markdownlint-cli2 gitleaks atuin; do
     check "brew installs $f" has "$brew_line" " $f( |$)"
   done
   check "skips image-provided tmux" lacks "$brew_line" " tmux( |$)"
@@ -641,6 +698,7 @@ test_bazzite_dry_run_all_done() {
   check "mise is not run; node found on disk" [ "$(log_count '^mise ')" -eq 0 ]
   check "reports node installed via mise" has "$OUT" 'node already installed via mise \(tools.node = lts in '
   check "no mise use/install planned" lacks "$OUT" "\[dry-run\] mise "
+  check "no agent CLI, pnpm or link planned" lacks "$OUT" "\[dry-run\] .*(node@lts --|ln -sfn)"
   check "no mutating command was executed" log_lacks "$MUTATING"
   teardown
 }
@@ -844,7 +902,7 @@ test_folded_into_other_package() {
   check "mise config not written through the fold" [ ! -e "$d/agy/.config/mise" ]
   check "mise was not asked to pin node" log_lacks '^mise use'
   check "says why node was not pinned" has "$OUT" "mise's global config .* resolves into the dotfiles repo; not writing to it"
-  check "skips Claude with a clear warning" has "$OUT" "skipped Claude Code: no usable mise-managed Node"
+  check "skips Claude with a clear warning" has "$OUT" "skipped agent CLIs: no usable mise-managed Node"
   check "competing PATH npm never used" log_lacks '^npm '
   check "no npm through mise either" log_lacks '^mise-'
   check "no backups made" [ ! -e "$HOME/.local/state/laptop/backups" ]
@@ -871,7 +929,7 @@ test_node_readiness() {
   check "runs mise install node" log_has '^mise install node$'
   check "node 20 is now installed" [ -x "$HOME/.local/share/mise/installs/node/20.18.1/bin/node" ]
   check "pin unchanged" [ "$conf_before" = "$(cat "$HOME/.config/mise/config.toml")" ]
-  check "claude through mise's npm shim, after node" logged_before '^mise install node$' '^mise-shim-npm install -g @anthropic-ai/claude-code$'
+  check "claude through Node LTS's npm, after node" logged_before '^mise install node$' '^mise exec node@lts -- npm install -g @anthropic-ai/claude-code$'
   check "PATH npm never used" log_lacks '^npm '
   teardown
 
@@ -898,7 +956,7 @@ test_node_readiness() {
   check "not counted as ready" lacks "$OUT" "node already installed"
   check "reshims after install" logged_before '^mise install node$' '^mise reshim$'
   check "shims restored (install alone is a no-op)" [ -x "$HOME/.local/share/mise/shims/npm" ]
-  check "claude through the restored shim" log_has '^mise-shim-npm install -g @anthropic-ai/claude-code$'
+  check "claude through the restored shim" log_has '^mise exec node@lts -- npm install -g @anthropic-ai/claude-code$'
   teardown
 
   setup "shims missing, reshim fails"
@@ -910,7 +968,7 @@ test_node_readiness() {
   check "run completes" [ "$RC" -eq 0 ]
   check "reshim failure has its own warning" has "$OUT" "'mise reshim' failed after installing node"
   check "not reported as an install failure" lacks "$OUT" "'mise install node' failed"
-  check "skips Claude" has "$OUT" "skipped Claude Code"
+  check "skips Claude" has "$OUT" "skipped agent CLIs"
   check "no npm of any kind" log_lacks 'npm'
   teardown
 
@@ -965,7 +1023,7 @@ test_node_readiness() {
   rm "$STUBS/npm"
   run_linux
   check "run exits 0" [ "$RC" -eq 0 ]
-  check "skips Claude with a clear warning" has "$OUT" "skipped Claude Code: no usable mise-managed Node"
+  check "skips Claude with a clear warning" has "$OUT" "skipped agent CLIs: no usable mise-managed Node"
   check "no npm call of any kind" log_lacks 'npm'
   check "no command-not-found noise" lacks "$OUT" "npm: command not found"
   teardown
@@ -975,8 +1033,8 @@ test_node_readiness() {
   dotfiles_fixture
   STUB_RESHIM_RC=1 run_linux
   check "run completes" [ "$RC" -eq 0 ]
-  check "claude was installed by npm" log_has '^mise-shim-npm install -g @anthropic-ai/claude-code$'
-  check "warns claude has no shim" has "$OUT" "installed Claude Code, but 'mise reshim' failed"
+  check "claude was installed by npm" log_has '^mise exec node@lts -- npm install -g @anthropic-ai/claude-code$'
+  check "warns claude has no shim" has "$OUT" "'mise reshim' failed after installing agent CLIs"
   check "no shim was made" [ ! -e "$HOME/.local/share/mise/shims/claude" ]
   teardown
 
@@ -986,7 +1044,7 @@ test_node_readiness() {
   STUB_MISE_RC=1 run_linux
   check "run completes" [ "$RC" -eq 0 ]
   check "reports the failure" has "$OUT" "'mise use -g node@lts' failed"
-  check "skips Claude" has "$OUT" "skipped Claude Code"
+  check "skips Claude" has "$OUT" "skipped agent CLIs"
   check "competing PATH npm never used" log_lacks '^npm '
   teardown
 
@@ -1001,7 +1059,7 @@ test_node_readiness() {
   check "run: fails closed" has "$OUT" "could not resolve mise's global config"
   check "run: mise use never ran" log_lacks '^mise use'
   check "run: no config written" [ ! -e "$HOME/.config/mise/config.toml" ]
-  check "run: Claude skipped" has "$OUT" "skipped Claude Code"
+  check "run: Claude skipped" has "$OUT" "skipped agent CLIs"
   teardown
 }
 
@@ -1073,7 +1131,7 @@ exec "$STUB_STATE/../sysbin/python3" "$@"' ;;
     check "run exits 0" [ "$RC" -eq 0 ]
     check "run: no mise use or install" log_lacks '^mise (use|install)'
     check "run: config byte-identical" same_config
-    check "run: Claude skipped" has "$OUT" "skipped Claude Code"
+    check "run: Claude skipped" has "$OUT" "skipped agent CLIs"
     check "run: no npm of any kind" log_lacks 'npm'
     teardown
   done
@@ -1303,9 +1361,9 @@ test_bazzite_run_and_rerun() {
   check "mise wrote its global config" [ "$(cat "$HOME/.config/mise/config.toml" 2>/dev/null)" = "$(printf '[tools]\nnode = "lts"')" ]
   check "node is installed under mise" [ -x "$HOME/.local/share/mise/installs/node/22.12.0/bin/node" ]
   check "fnm never involved" log_lacks '^fnm |fnm'
-  check "claude installed through mise's npm shim, after node" logged_before '^mise use -g node@lts$' '^mise-shim-npm install -g @anthropic-ai/claude-code$'
+  check "claude installed through Node LTS's npm, after node" logged_before '^mise use -g node@lts$' '^mise exec node@lts -- npm install -g @anthropic-ai/claude-code$'
   check "the shim ran the pinned node's npm" log_has '^mise-22.12.0-npm install -g @anthropic-ai/claude-code$'
-  check "reshim after the claude install" logged_before '^mise-shim-npm install -g' '^mise reshim$'
+  check "reshim after the claude install" logged_before '^mise exec node@lts -- npm install -g' '^mise reshim$'
   check "reshim exposed claude" [ -x "$HOME/.local/share/mise/shims/claude" ]
   check "PATH npm never used" log_lacks '^npm '
 
@@ -1356,6 +1414,8 @@ test_debian_dry_run() {
   check "plans gh apt repo" has "$OUT" "/etc/apt/sources.list.d/github-cli.list"
   check "plans JDK 21 via apt" has "$OUT" "\[dry-run\] sudo apt-get install -y openjdk-21-jdk$"
   check "plans shellcheck via apt" has "$OUT" "\[dry-run\] sudo apt-get install -y shellcheck$"
+  check "plans tmux via apt" has "$OUT" "\[dry-run\] sudo apt-get install -y tmux$"
+  check "no gitleaks via apt (24.04's is older than 8.20.0)" lacks "$OUT" "apt-get install -y gitleaks"
   check "plans render-url npm ci through mise" has "$OUT" "\[dry-run\] \(cd $HOME/.local/share/render-url && mise exec -- npm ci\)$"
   check "plans chsh" has "$OUT" "\[dry-run\] chsh -s"
   check "stows tmux" has "$OUT" "\[dry-run\] stow .* --restow tmux$"
@@ -1364,7 +1424,7 @@ test_debian_dry_run() {
   check "no brew / rpm-ostree" lacks "$OUT" "(brew install|rpm-ostree)"
   check "plans mise's apt signing key, 0644" has "$OUT" "\[dry-run\] .*curl -fsSL https://mise.jdx.dev/gpg-key.pub \| gpg --dearmor > \"\\\$tmp\" && sudo install -m 644 \"\\\$tmp\" /etc/apt/keyrings/mise-archive-keyring.gpg$"
   check "plans an apt-readable sources file" has "$OUT" "\[dry-run\] sudo chmod 644 /etc/apt/sources.list.d/mise.list$"
-  check "plans claude through mise's npm shim" has "$OUT" "\[dry-run\] $HOME/.local/share/mise/shims/npm install -g @anthropic-ai/claude-code$"
+  check "plans claude through Node LTS's npm" has "$OUT" "\[dry-run\] .*mise exec node@lts -- npm install -g @anthropic-ai/claude-code$"
   check "plans mise's apt repo" has "$OUT" "https://mise.jdx.dev/deb stable main.*sudo tee /etc/apt/sources.list.d/mise.list"
   check "plans apt install mise" has "$OUT" "\[dry-run\] sudo apt-get install -y mise$"
   check "plans node lts via mise" has "$OUT" "\[dry-run\] mise use -g node@lts$"
@@ -1407,8 +1467,8 @@ test_debian_run_and_rerun() {
   check "no fnm installer" log_lacks 'fnm'
   check "keyring installed 0644" log_has '^sudo install -m 644 .* /etc/apt/keyrings/mise-archive-keyring.gpg$'
   check "sources file made 0644" log_has '^sudo chmod 644 /etc/apt/sources.list.d/mise.list$'
-  check "claude installed through mise's npm shim, after node" logged_before '^mise use -g node@lts$' '^mise-shim-npm install -g @anthropic-ai/claude-code$'
-  check "reshim after the claude install" logged_before '^mise-shim-npm install -g' '^mise reshim$'
+  check "claude installed through Node LTS's npm, after node" logged_before '^mise use -g node@lts$' '^mise exec node@lts -- npm install -g @anthropic-ai/claude-code$'
+  check "reshim after the claude install" logged_before '^mise exec node@lts -- npm install -g' '^mise reshim$'
   check "reshim exposed claude" [ -x "$HOME/.local/share/mise/shims/claude" ]
   check "PATH npm never used" log_lacks '^npm '
   local conf_before; conf_before="$(cat "$HOME/.config/mise/config.toml")"
@@ -2502,6 +2562,520 @@ test_claude_package() {
   teardown
 }
 
+# ── Tests: bin and agy are not folded ────────────────────────────────────────
+
+# Installers drop scripts into ~/bin and agy writes into ~/.config/agy, so
+# neither may be a folded link into the repo. A machine stowed before this
+# change has both folded: a --restow --no-folding must turn them into real
+# directories without backups or conflicts.
+test_bin_agy_no_folding() {
+  local os repo repo_before before
+  for os in bazzite pop; do
+    setup "bin/agy: $os fresh HOME"
+    if [ "$os" = bazzite ]; then bazzite; else os_release pop "ubuntu debian"; fi
+    dotfiles_fixture
+    repo="$HOME/Projects/Home/dotfiles"
+    before="$(home_snapshot)"
+    run_linux --dry-run
+    check "dry run plans bin without folding" has "$OUT" "\[dry-run\] stow --no-folding --dir=$repo --target=$HOME --restow bin$"
+    check "dry run plans agy without folding" has "$OUT" "\[dry-run\] stow --no-folding --dir=$repo --target=$HOME --restow agy$"
+    check "dry run changes nothing" [ "$before" = "$(home_snapshot)" ]
+    run_linux
+    check "run exits 0" [ "$RC" -eq 0 ]
+    check "HOME/bin is a real dir" is_real_dir "$HOME/bin"
+    check "HOME/.config/agy is a real dir" is_real_dir "$HOME/.config/agy"
+    check "bin script is stowed" [ "$(realpath "$HOME/bin/hello")" = "$(realpath "$repo/bin/bin/hello")" ]
+    check "agy config is stowed" [ "$(realpath "$HOME/.config/agy/permissions.json")" = "$(realpath "$repo/agy/.config/agy/permissions.json")" ]
+    repo_before="$(repo_snapshot)"
+    echo "#!/bin/sh" > "$HOME/bin/installed-by-something"
+    echo "{}" > "$HOME/.config/agy/state.json"
+    check "new files stay out of the repo" [ "$repo_before" = "$(repo_snapshot)" ]
+    teardown
+  done
+
+  setup "bin/agy: folded by an earlier stow"
+  bazzite
+  dotfiles_fixture
+  repo="$HOME/Projects/Home/dotfiles"
+  mkdir -p "$HOME/.config"
+  ln -s Projects/Home/dotfiles/bin/bin "$HOME/bin"
+  ln -s ../Projects/Home/dotfiles/agy/.config/agy "$HOME/.config/agy"
+  before="$(home_snapshot)"; repo_before="$(repo_snapshot)"
+  run_linux --dry-run
+  check "dry run exits 0" [ "$RC" -eq 0 ]
+  check "dry run plans no backups" lacks "$OUT" "back up"
+  check "dry run changes nothing" [ "$before" = "$(home_snapshot)" ]
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "no stow failures" lacks "$OUT" "stow failed|skipped stowing"
+  check "nothing backed up" lacks "$OUT" "backed up"
+  check "HOME/bin unfolded into a real dir" is_real_dir "$HOME/bin"
+  check "HOME/.config/agy unfolded into a real dir" is_real_dir "$HOME/.config/agy"
+  check "bin script still stowed" [ "$(realpath "$HOME/bin/hello")" = "$(realpath "$repo/bin/bin/hello")" ]
+  check "agy config still stowed" [ "$(realpath "$HOME/.config/agy/permissions.json")" = "$(realpath "$repo/agy/.config/agy/permissions.json")" ]
+  check "repo unchanged by the unfold" [ "$repo_before" = "$(repo_snapshot)" ]
+  echo "#!/bin/sh" > "$HOME/bin/installed-by-something"
+  check "new ~/bin files stay out of the repo" [ "$repo_before" = "$(repo_snapshot)" ]
+  run_linux
+  check "re-run exits 0" [ "$RC" -eq 0 ]
+  check "re-run has no stow failures" lacks "$OUT" "stow failed|skipped stowing"
+  check "re-run keeps ~/bin a real dir" is_real_dir "$HOME/bin"
+  check "re-run keeps the foreign file" [ -f "$HOME/bin/installed-by-something" ] && [ ! -L "$HOME/bin/installed-by-something" ]
+  teardown
+}
+
+# An earlier stow folded ~/bin into the repo, and an installer then put links
+# into ~/bin, so they are in the package. Absolute ones make stow refuse the
+# unfold; the script moves them to the backup dir first (never deletes them).
+# $1 is a label; the stow on PATH decides whether this is the stub or real stow.
+evict_scenario() {
+  local repo="$HOME/Projects/Home/dotfiles" before repo_before backup
+  bazzite
+  dotfiles_fixture
+  ln -s Projects/Home/dotfiles/bin/bin "$HOME/bin"
+  ln -s /nonexistent/external "$HOME/bin/installer-link"   # dangling
+  ln -s "$SANDBOX/sysbin/bash" "$HOME/bin/abs-valid"       # valid
+  ln -s hello "$HOME/bin/rel-link"                         # relative: stow copes
+  echo "#!/bin/sh" > "$HOME/bin/installed-file"
+  before="$(home_snapshot)"; repo_before="$(repo_snapshot)"
+  run_linux --dry-run
+  check "$1: dry run plans moving the dangling link" has "$OUT" "would back up ~/bin/installer-link \("
+  check "$1: dry run plans moving the valid link" has "$OUT" "would back up ~/bin/abs-valid \("
+  check "$1: dry run leaves relative links" lacks "$OUT" "back up ~/bin/(rel-link|installed-file)"
+  check "$1: dry run changes nothing" [ "$before" = "$(home_snapshot)" ] && [ "$repo_before" = "$(repo_snapshot)" ]
+  run_linux
+  check "$1: run exits 0" [ "$RC" -eq 0 ]
+  check "$1: bin stowed" lacks "$OUT" "stow failed for bin|skipped stowing bin"
+  check "$1: HOME/bin unfolded into a real dir" is_real_dir "$HOME/bin"
+  check "$1: absolute links are out of the repo" [ ! -L "$repo/bin/bin/installer-link" ] && [ ! -L "$repo/bin/bin/abs-valid" ]
+  backup="$(find "$HOME/.local/state/laptop/backups" -path '*/bin/installer-link')"
+  check "$1: dangling link kept in the backup" [ "$(readlink "$backup")" = /nonexistent/external ]
+  backup="$(find "$HOME/.local/state/laptop/backups" -path '*/bin/abs-valid')"
+  check "$1: valid link kept in the backup" [ "$(readlink "$backup")" = "$SANDBOX/sysbin/bash" ]
+  check "$1: summary lists them" has "$OUT" "$HOME/bin/installer-link -> $HOME/.local/state/laptop/backups/"
+  check "$1: warns how to restore" has "$OUT" "absolute symlink ~/bin/abs-valid, written into the repo through the old ~/bin fold"
+  check "$1: package script still stowed" [ "$(realpath "$HOME/bin/hello")" = "$(realpath "$repo/bin/bin/hello")" ]
+  check "$1: relative link survives" [ "$(realpath "$HOME/bin/rel-link")" = "$(realpath "$repo/bin/bin/hello")" ]
+  check "$1: installer's file survives" grep -qx "#!/bin/sh" "$HOME/bin/installed-file"
+  run_linux
+  check "$1: re-run exits 0" [ "$RC" -eq 0 ]
+  check "$1: re-run moves nothing" lacks "$OUT" "back up|backed up"
+  check "$1: re-run has no stow failures" lacks "$OUT" "stow failed|skipped stowing"
+}
+
+test_bin_absolute_links() {
+  setup "bin: absolute links in the old fold (stub stow)"
+  evict_scenario stub
+  teardown
+
+  local repo
+  # Only a fold into the package's own directory is evicted from: a real
+  # ~/bin (its links live in HOME, not the repo) is left as it is, and so is
+  # an absolute link the package itself holds (stow reports that one).
+  setup "bin: real ~/bin with an absolute link (no eviction)"
+  bazzite
+  dotfiles_fixture
+  repo="$HOME/Projects/Home/dotfiles"
+  mkdir -p "$HOME/bin"
+  ln -s /nonexistent/external "$HOME/bin/installer-link"
+  ln -s /nonexistent/in-package "$repo/bin/bin/package-link"
+  run_linux --dry-run
+  check "dry run plans no move" lacks "$OUT" "back up ~/bin/|absolute symlink ~/bin/"
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "nothing moved" lacks "$OUT" "back(ed)? up ~/bin/|absolute symlink ~/bin/"
+  check "the link is untouched" [ "$(readlink "$HOME/bin/installer-link")" = /nonexistent/external ]
+  check "the package's own link stays in the repo" [ "$(readlink "$repo/bin/bin/package-link")" = /nonexistent/in-package ]
+  check "stow's refusal is reported, not hidden" has "$OUT" "stow failed for bin"
+  teardown
+
+  # ~/bin linked to some other directory of the repo (not bin's own): not a
+  # fold of this package, so nothing in it is moved.
+  setup "bin: ~/bin linked to another repo dir (no eviction)"
+  bazzite
+  dotfiles_fixture
+  repo="$HOME/Projects/Home/dotfiles"
+  mkdir -p "$repo/elsewhere/bin"
+  ln -s /nonexistent/external "$repo/elsewhere/bin/installer-link"
+  ln -s /nonexistent/in-package "$repo/bin/bin/package-link"
+  ln -s Projects/Home/dotfiles/elsewhere/bin "$HOME/bin"
+  run_linux --dry-run
+  check "dry run plans no move" lacks "$OUT" "back up ~/bin/|absolute symlink ~/bin/"
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "nothing moved" lacks "$OUT" "back(ed)? up ~/bin/|absolute symlink ~/bin/"
+  check "the link stays in the other dir" [ "$(readlink "$repo/elsewhere/bin/installer-link")" = /nonexistent/external ]
+  check "the package's own link stays in the repo" [ "$(readlink "$repo/bin/bin/package-link")" = /nonexistent/in-package ]
+  teardown
+
+  # The same against GNU Stow itself, when there is one: LAPTOP_TEST_REAL_STOW,
+  # or stow in /usr/bin or /bin (never Homebrew's unless named). It only reads
+  # the sandbox's dotfiles and writes its HOME.
+  local real="${LAPTOP_TEST_REAL_STOW:-$(PATH=/usr/bin:/bin type -P stow)}"
+  setup "bin: absolute links in the old fold (real stow)"
+  if [ -z "$real" ] || [ ! -x "$real" ]; then
+    printf "  skip no real GNU Stow (set LAPTOP_TEST_REAL_STOW): real-stow unfold not tested\n"
+  else
+    stub stow "exec $(printf %q "$real") \"\$@\""
+    evict_scenario real
+    # Control: without the script's move, real stow refuses this unfold.
+    ln -s /nonexistent/external "$HOME/Projects/Home/dotfiles/bin/bin/control-link"
+    rm -r "${HOME:?}/bin"; ln -s Projects/Home/dotfiles/bin/bin "$HOME/bin"
+    sandboxed "$STUBS/stow" --no-folding --dir="$HOME/Projects/Home/dotfiles" --target="$HOME" --restow bin >/dev/null 2>&1
+    check "real: control: real stow refuses an absolute link" [ $? -ne 0 ] && [ -L "$HOME/bin" ]
+  fi
+  teardown
+}
+
+# ── Tests: agent CLIs and ~/.local/bin links ─────────────────────────────────
+
+# Links a fresh run must leave: claude/codex/pi straight into Node LTS's bin
+# dir (Omnigent's renamed argv[0] breaks mise shims), and pnpm too (it is only
+# under Node LTS, and a shim follows the pin); node/npm/npx/corepack to shims.
+agent_links_ok() {
+  local data="$HOME/.local/share/mise" t
+  for t in "${LTS_LINKED[@]}"; do
+    [ "$(readlink "$HOME/.local/bin/$t")" = "$data/installs/node/lts/bin/$t" ] && [ -x "$HOME/.local/bin/$t" ] || return 1
+  done
+  for t in "${NODE_TOOLS[@]}"; do
+    [ "$(readlink "$HOME/.local/bin/$t")" = "$data/shims/$t" ] && [ -x "$HOME/.local/bin/$t" ] || return 1
+  done
+}
+
+test_agent_clis() {
+  local os before data pkg links_before backup
+  for os in bazzite pop; do
+    setup "agent CLIs: $os fresh"
+    if [ "$os" = bazzite ]; then bazzite; else os_release pop "ubuntu debian"; fi
+    dotfiles_fixture
+    data="$HOME/.local/share/mise"
+    before="$(home_snapshot)"
+    run_linux --dry-run
+    check "dry run exits 0" [ "$RC" -eq 0 ]
+    for pkg in @anthropic-ai/claude-code @openai/codex @earendil-works/pi-coding-agent; do
+      check "dry run plans $pkg through Node LTS's npm" has "$OUT" "\[dry-run\] .*mise exec node@lts -- npm install -g $pkg$"
+    done
+    check "dry run plans corepack enable pnpm" has "$OUT" "\[dry-run\] .*mise exec node@lts -- corepack enable pnpm$"
+    check "dry run plans claude's link into Node LTS" has "$OUT" "\[dry-run\] ln -sfn $data/installs/node/lts/bin/claude $HOME/.local/bin/claude$"
+    check "dry run plans node's link to its shim" has "$OUT" "\[dry-run\] ln -sfn $data/shims/node $HOME/.local/bin/node$"
+    check "dry run plans 8 links" [ "$(grep -c '\[dry-run\] ln -sfn' <<<"$OUT")" -eq 8 ]
+    check "dry run plans pnpm's link into Node LTS" has "$OUT" "\[dry-run\] ln -sfn $data/installs/node/lts/bin/pnpm $HOME/.local/bin/pnpm$"
+    check "says Node LTS may be downloaded, once, before the installs" [ "$(grep -c "note: 'mise exec node@lts' may download and install Node LTS first" <<<"$OUT")" -eq 1 ] && logged_before_out "may download and install Node LTS" "node@lts -- npm install -g"
+    check "dry run changes nothing" [ "$before" = "$(home_snapshot)" ]
+    check "dry run never mutates" log_lacks "$MUTATING"
+    run_linux
+    check "run exits 0" [ "$RC" -eq 0 ]
+    for pkg in @anthropic-ai/claude-code @openai/codex @earendil-works/pi-coding-agent; do
+      check "installs $pkg through Node LTS's npm, after node" logged_before '^mise (use -g node@lts|install node)$' "^mise exec node@lts -- npm install -g $pkg$"
+    done
+    check "pnpm enabled with Node's own corepack" log_has '^mise-22.12.0-corepack enable pnpm$'
+    check "pnpm landed in Node's bin dir" [ -x "$data/installs/node/22.12.0/bin/pnpm" ]
+    check "reshim after the installs" logged_before '^mise-22.12.0-corepack enable pnpm$' '^mise reshim$'
+    check "pnpm has a shim" [ -x "$data/shims/pnpm" ]
+    check "every ~/.local/bin link is right" agent_links_ok
+    check "no agent CLI warnings" lacks "$OUT" "! .*(agent CLIs|not linking|pnpm|corepack)"
+    check "PATH npm never used" log_lacks '^npm '
+    links_before="$(ls -l "$HOME/.local/bin")"
+    : > "$LOG"
+    run_linux
+    check "re-run exits 0" [ "$RC" -eq 0 ]
+    check "re-run installs nothing with npm" log_lacks 'npm install'
+    check "re-run does not run corepack" log_lacks 'corepack'
+    check "re-run does not reshim" log_lacks '^mise reshim'
+    check "re-run has no Node LTS download note" lacks "$OUT" "may download and install Node LTS"
+    check "re-run reports the links" has "$OUT" "already linked: ~/.local/bin/claude -> $data/installs/node/lts/bin/claude"
+    check "re-run leaves the links alone" [ "$links_before" = "$(ls -l "$HOME/.local/bin")" ]
+    teardown
+  done
+
+  setup "agent CLIs: existing ~/.local/bin entries"
+  bazzite
+  dotfiles_fixture
+  data="$HOME/.local/share/mise"
+  mkdir -p "$HOME/.local/bin"
+  echo "my own claude" > "$HOME/.local/bin/claude"
+  ln -s /nonexistent/codex "$HOME/.local/bin/codex"                       # dangling
+  ln -s "$HOME/.local/share/claude/versions/1.0" "$HOME/.local/bin/pi"    # some other link
+  ln -s "$data/shims/node" "$HOME/.local/bin/node"                         # already right
+  before="$(home_snapshot)"
+  run_linux --dry-run
+  check "dry run plans the claude backup" has "$OUT" "would back up ~/.local/bin/claude \("
+  check "dry run backs up nothing else" [ "$(grep -c 'would back up ~/.local/bin/' <<<"$OUT")" -eq 1 ]
+  check "dry run changes nothing" [ "$before" = "$(home_snapshot)" ]
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  backup="$(find "$HOME/.local/state/laptop/backups" -path '*/.local/bin/claude' -type f)"
+  check "regular claude backed up once" [ "$(grep -c . <<<"$backup")" -eq 1 ]
+  check "backup keeps its contents" [ "$(cat "$backup")" = "my own claude" ]
+  check "every ~/.local/bin link is right" agent_links_ok
+  check "only the regular file was backed up" [ "$(find "$HOME/.local/state/laptop/backups" -path '*/.local/bin/*' | wc -l)" -eq 1 ]
+  teardown
+
+  setup "agent CLIs: one npm install fails"
+  bazzite
+  dotfiles_fixture
+  data="$HOME/.local/share/mise"
+  STUB_AGENT_FAIL=@openai/codex run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "warns about codex" has "$OUT" "'npm install -g @openai/codex' failed; next run will retry"
+  check "still installs pi after the failure" log_has '^mise exec node@lts -- npm install -g @earendil-works/pi-coding-agent$'
+  check "warns codex is not linked" has "$OUT" "not linking ~/.local/bin/codex: $data/installs/node/lts/bin/codex is missing"
+  check "no codex link" [ ! -e "$HOME/.local/bin/codex" ] && [ ! -L "$HOME/.local/bin/codex" ]
+  check "claude still linked" [ "$(readlink "$HOME/.local/bin/claude")" = "$data/installs/node/lts/bin/claude" ]
+  : > "$LOG"
+  run_linux
+  check "re-run retries only codex" [ "$(log_count '^mise exec node@lts -- npm install -g')" -eq 1 ] && log_has '^mise exec node@lts -- npm install -g @openai/codex$'
+  check "re-run links everything" agent_links_ok
+  teardown
+
+  setup "agent CLIs: corepack fails"
+  bazzite
+  dotfiles_fixture
+  STUB_COREPACK_RC=1 run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "warns about corepack" has "$OUT" "'corepack enable pnpm' failed; next run will retry"
+  check "no pnpm link" [ ! -L "$HOME/.local/bin/pnpm" ]
+  check "agent CLIs still linked" [ -x "$HOME/.local/bin/claude" ] && [ -x "$HOME/.local/bin/pi" ]
+  teardown
+
+  setup "agent CLIs: Node LTS without corepack (Node 25+)"
+  bazzite
+  dotfiles_fixture
+  mise_node_fixture
+  data="$HOME/.local/share/mise"
+  rm "$data/installs/node/22.12.0/bin/corepack"
+  run_linux --dry-run
+  check "dry run plans corepack from Node LTS's npm" has "$OUT" "\[dry-run\] .*mise exec node@lts -- npm install -g corepack$"
+  check "dry run never mutates" log_lacks "$MUTATING"
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "corepack installed with Node LTS's npm" log_has '^mise exec node@lts -- npm install -g corepack$'
+  check "corepack installed before pnpm is enabled" logged_before '^mise exec node@lts -- npm install -g corepack$' '^mise exec node@lts -- corepack enable pnpm$'
+  check "corepack landed in Node LTS" [ -x "$data/installs/node/lts/bin/corepack" ]
+  check "the new corepack enabled pnpm" log_has '^mise-22.12.0-corepack enable pnpm$'
+  check "every ~/.local/bin link is right" agent_links_ok
+  teardown
+
+  setup "agent CLIs: corepack bootstrap fails"
+  bazzite
+  dotfiles_fixture
+  mise_node_fixture
+  rm "$HOME/.local/share/mise/installs/node/22.12.0/bin/corepack"
+  STUB_AGENT_FAIL=corepack run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "warns about the corepack install" has "$OUT" "'npm install -g corepack' failed; next run will retry"
+  check "warns pnpm is skipped" has "$OUT" "skipped pnpm: Node LTS has no corepack"
+  check "corepack enable never run" log_lacks 'corepack enable'
+  check "no corepack/pnpm links" [ ! -L "$HOME/.local/bin/corepack" ] && [ ! -L "$HOME/.local/bin/pnpm" ]
+  check "agent CLIs still linked" [ -x "$HOME/.local/bin/claude" ] && [ -x "$HOME/.local/bin/pi" ]
+  teardown
+
+  # A preserved pin that isn't lts: the shims (and so mise's npm shim) run
+  # Node 20, but the agent CLIs must still go to, and link from, Node LTS.
+  setup "agent CLIs: node pinned to 20, Node LTS installed too"
+  bazzite
+  dotfiles_fixture
+  mise_node_fixture 20
+  sandboxed "$STATE/node-install" lts
+  data="$HOME/.local/share/mise"
+  local conf_before; conf_before="$(cat "$HOME/.config/mise/config.toml")"
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  for pkg in @anthropic-ai/claude-code @openai/codex @earendil-works/pi-coding-agent; do
+    check "$pkg installed with Node LTS's npm" log_has "^mise-22.12.0-npm install -g $pkg$"
+  done
+  check "nothing installed under the pinned Node 20" [ ! -e "$data/installs/node/20.18.1/bin/claude" ] && log_lacks '^mise-20.18.1-npm install'
+  check "pnpm enabled in Node LTS" [ -x "$data/installs/node/22.12.0/bin/pnpm" ]
+  check "every ~/.local/bin link is right" agent_links_ok
+  check "no missing-target warnings" lacks "$OUT" "not linking"
+  check "pin unchanged" [ "$conf_before" = "$(cat "$HOME/.config/mise/config.toml")" ]
+  check ".local/bin/pnpm runs under the Node 20 pin" sandboxed "$HOME/.local/bin/pnpm" --version
+  check ".local/bin/claude runs under the Node 20 pin" sandboxed "$HOME/.local/bin/claude" --version
+  : > "$LOG"
+  run_linux
+  check "re-run installs nothing with npm" log_lacks 'npm install'
+  check "re-run does not run corepack" log_lacks 'corepack'
+  teardown
+
+  # Node LTS moves to a new major: installs/node/lts points at a fresh Node
+  # without the CLIs, pnpm or corepack, while the old shims (pnpm included)
+  # are still there. Everything is reinstalled under the new LTS.
+  setup "agent CLIs: lts moved to a new Node, stale shims"
+  bazzite
+  dotfiles_fixture
+  all_done_fixture
+  data="$HOME/.local/share/mise"
+  sandboxed "$STATE/node-install" 26.0.0
+  rm "$data/installs/node/26.0.0/bin/corepack"
+  ln -sfn 26.0.0 "$data/installs/node/lts"
+  sandboxed "$STATE/node-install" --reshim
+  check "fixture: a stale pnpm shim exists" [ -x "$data/shims/pnpm" ]
+  run_linux --dry-run
+  check "dry run does not call pnpm enabled" lacks "$OUT" "pnpm already enabled"
+  check "dry run plans the CLIs again" has "$OUT" "\[dry-run\] .*mise exec node@lts -- npm install -g @openai/codex$"
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  for t in claude codex pi corepack pnpm; do
+    check "$t now in the new Node LTS" [ -x "$data/installs/node/26.0.0/bin/$t" ]
+  done
+  check "installed with the new LTS's npm" log_has '^mise-26.0.0-npm install -g @anthropic-ai/claude-code$'
+  check "reshim after the reinstall" log_has '^mise reshim$'
+  check "every ~/.local/bin link is right" agent_links_ok
+  teardown
+
+  # Earlier versions of this change linked pnpm to its shim: a symlink, so
+  # it is retargeted into Node LTS, not backed up.
+  setup "agent CLIs: old pnpm link to the shim"
+  bazzite
+  dotfiles_fixture
+  all_done_fixture
+  data="$HOME/.local/share/mise"
+  ln -sfn "$data/shims/pnpm" "$HOME/.local/bin/pnpm"
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "pnpm link retargeted into Node LTS" [ "$(readlink "$HOME/.local/bin/pnpm")" = "$data/installs/node/lts/bin/pnpm" ]
+  check "nothing backed up" lacks "$OUT" "back(ed)? up ~/.local/bin"
+  check "no Node LTS installs" log_lacks 'node@lts -- '
+  teardown
+
+  setup "agent CLIs: pnpm shim without pnpm in Node LTS"
+  bazzite
+  dotfiles_fixture
+  all_done_fixture
+  data="$HOME/.local/share/mise"
+  rm "$data/installs/node/22.12.0/bin/pnpm"
+  check "fixture: the pnpm shim is still there" [ -x "$data/shims/pnpm" ]
+  STUB_COREPACK_RC=1 run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "pnpm not reported as linked" lacks "$OUT" "already linked: ~/.local/bin/pnpm"
+  check "warns pnpm is missing from Node LTS" has "$OUT" "not linking ~/.local/bin/pnpm: $data/installs/node/lts/bin/pnpm is missing"
+  teardown
+
+  setup "agent CLIs: ~/.local/bin folded into the repo"
+  bazzite
+  dotfiles_fixture
+  mkdir -p "$HOME/.local"
+  ln -s ../Projects/Home/dotfiles/applications/.local/bin "$HOME/.local/bin"
+  local repo_before; repo_before="$(repo_snapshot)"
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "warns and skips the links" has "$OUT" "skipped ~/.local/bin links: $HOME/.local/bin resolves into the dotfiles repo"
+  check "nothing linked into the repo" [ "$repo_before" = "$(repo_snapshot)" ]
+  teardown
+}
+
+# ── Tests: the atuin package ─────────────────────────────────────────────────
+
+# atuin, podman and other Quadlet units write into ~/.config/atuin,
+# ~/.config/atuin-ai-server and ~/.config/containers/systemd, so none may be
+# folded into the repo. atuin writes its own config.toml on first run: a
+# regular file, backed up before stowing. The Quadlet unit is never started.
+test_atuin_package() {
+  local df before repo_before backups os
+  for os in bazzite pop; do
+    setup "atuin: $os, generated config.toml, podman present"
+    if [ "$os" = bazzite ]; then bazzite; else os_release pop "ubuntu debian"; fi
+    dotfiles_fixture
+    stub podman
+    df="$HOME/Projects/Home/dotfiles/atuin/.config"
+    mkdir -p "$HOME/.config/atuin" "$HOME/.config/containers/systemd"
+    echo "# atuin's generated default" > "$HOME/.config/atuin/config.toml"
+    echo "[Container]" > "$HOME/.config/containers/systemd/other.container"
+    echo "unqualified-search-registries = []" > "$HOME/.config/containers/registries.conf"
+    before="$(home_snapshot)"; repo_before="$(repo_snapshot)"
+    run_linux --dry-run
+    check "dry run plans atuin without folding" has "$OUT" '\[dry-run\] stow --no-folding .* --restow atuin$'
+    check "dry run plans the config.toml backup" has "$OUT" "would back up ~/.config/atuin/config.toml \("
+    check "dry run changes nothing" [ "$before" = "$(home_snapshot)" ]
+    check "dry run never mutates" log_lacks "$MUTATING"
+    run_linux
+    check "run exits 0" [ "$RC" -eq 0 ]
+    backups="$(find "$HOME/.local/state/laptop/backups" -path '*/.config/atuin/config.toml' -type f)"
+    check "generated config.toml backed up once" [ "$(grep -c . <<<"$backups")" -eq 1 ]
+    check "backup keeps atuin's content" [ "$(cat "$backups")" = "# atuin's generated default" ]
+    check "config.toml is now the stowed link" [ "$(realpath "$HOME/.config/atuin/config.toml")" = "$(realpath "$df/atuin/config.toml")" ]
+    check "never adopted into the repo" [ "$repo_before" = "$(repo_snapshot)" ]
+    for d in atuin atuin-ai-server containers containers/systemd; do
+      check "HOME/.config/$d is a real dir" is_real_dir "$HOME/.config/$d"
+    done
+    check "the Quadlet unit is stowed" [ "$(realpath "$HOME/.config/containers/systemd/atuin-ai-server.container")" = "$(realpath "$df/containers/systemd/atuin-ai-server.container")" ]
+    check "other Quadlet units untouched" [ -f "$HOME/.config/containers/systemd/other.container" ] && [ ! -L "$HOME/.config/containers/systemd/other.container" ]
+    check "podman's own config untouched" [ ! -L "$HOME/.config/containers/registries.conf" ]
+    check "summary hints how to start atuin-ai-server" has "$OUT" "systemctl --user daemon-reload && systemctl --user start atuin-ai-server$"
+    check "the hint names llama-swap on :8080" has "$OUT" "needs llama-swap on :8080"
+    check "the unit is never enabled or started" log_lacks '^systemctl --user|^podman '
+    echo "[Container]" > "$HOME/.config/containers/systemd/new.container"
+    echo "x" > "$HOME/.config/atuin/history.db"
+    check "later writes stay out of the repo" [ "$repo_before" = "$(repo_snapshot)" ]
+    teardown
+  done
+
+  setup "atuin: no podman, no hint"
+  bazzite
+  dotfiles_fixture
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "atuin stowed" [ -L "$HOME/.config/atuin/config.toml" ]
+  check "no atuin-ai-server hint without podman" lacks "$OUT" "atuin-ai-server"
+  teardown
+
+  setup "atuin: formula on Bazzite only"
+  bazzite
+  dotfiles_fixture
+  run_linux --dry-run
+  check "Bazzite brew installs atuin" has "$(grep -F '[dry-run] brew install' <<<"$OUT")" " atuin( |$)"
+  teardown
+  setup "atuin: not installed on Ubuntu"
+  os_release pop "ubuntu debian"
+  dotfiles_fixture
+  run_linux --dry-run
+  check "no atuin package via apt" lacks "$OUT" "apt-get install -y atuin"
+  teardown
+}
+
+# ── Tests: package lists match the dotfiles repo ─────────────────────────────
+
+# Top-level package directories of adamdaw/dotfiles (main), without docs/,
+# tests/ and dot-dirs. Update with the dotfiles repo. Set
+# LAPTOP_TEST_DOTFILES_DIR to a checkout to check this list against it too
+# (read-only; skipped otherwise, so the tests need no network or checkout).
+DOTFILES_PACKAGES=(agy applications atuin bash bat bin claude ghostty git nvim render-url ripgrep ssh starship tmux xdg zsh)
+# In dotfiles but not in STOW_PACKAGES, on purpose: xdg makes Ghostty the
+# default terminal, so it is stowed only on Bazzite GNOME with Ghostty present
+# (prepare_default_terminal adds it; see test_default_terminal).
+CONDITIONAL_PACKAGES=(xdg)
+
+script_list() { sed -n "s/^$1=(\(.*\))\$/\1/p" "$SCRIPT"; }
+sorted() { printf '%s\n' "$@" | sort | tr '\n' ' '; }
+
+test_stow_packages_match_dotfiles() {
+  setup "STOW_PACKAGES matches the dotfiles packages"
+  local -a stow nofold dirs=()
+  read -ra stow <<<"$(script_list STOW_PACKAGES)"
+  read -ra nofold <<<"$(script_list NO_FOLD_PACKAGES)"
+  local p
+  check "parsed STOW_PACKAGES" [ "${#stow[@]}" -gt 0 ]
+  check "STOW_PACKAGES + conditional = dotfiles packages" [ "$(sorted "${stow[@]}" "${CONDITIONAL_PACKAGES[@]}")" = "$(sorted "${DOTFILES_PACKAGES[@]}")" ]
+  for p in "${CONDITIONAL_PACKAGES[@]}"; do
+    check "$p is not stowed unconditionally" lacks " ${stow[*]} " " $p "
+  done
+  for p in "${nofold[@]}"; do
+    check "--no-folding package $p is a dotfiles package" has " ${DOTFILES_PACKAGES[*]} " " $p "
+  done
+  check "tests' ALL_PACKAGES = STOW_PACKAGES" [ "$(sorted "${ALL_PACKAGES[@]}")" = "$(sorted "${stow[@]}")" ]
+  check "tests' NO_FOLD_PACKAGES = NO_FOLD_PACKAGES minus conditional" [ "$(sorted "${NO_FOLD_PACKAGES[@]}" "${CONDITIONAL_PACKAGES[@]}")" = "$(sorted "${nofold[@]}")" ]
+  if [ -n "${LAPTOP_TEST_DOTFILES_DIR:-}" ]; then
+    for p in "$LAPTOP_TEST_DOTFILES_DIR"/*/; do
+      p="${p%/}"; p="${p##*/}"
+      case "$p" in docs|tests) ;; *) dirs+=("$p") ;; esac
+    done
+    check "DOTFILES_PACKAGES = $LAPTOP_TEST_DOTFILES_DIR's top-level dirs" [ "$(sorted "${dirs[@]}")" = "$(sorted "${DOTFILES_PACKAGES[@]}")" ]
+  else
+    printf "  skip LAPTOP_TEST_DOTFILES_DIR unset: DOTFILES_PACKAGES not checked against a checkout\n"
+  fi
+  teardown
+}
+
 # ── Run ──────────────────────────────────────────────────────────────────────
 
 TESTS=(
@@ -2562,6 +3136,11 @@ TESTS=(
   test_render_url
   test_claude_package
   test_stow_preview_matches_run
+  test_bin_agy_no_folding
+  test_bin_absolute_links
+  test_agent_clis
+  test_stow_packages_match_dotfiles
+  test_atuin_package
 )
 
 for t in "${TESTS[@]}"; do
