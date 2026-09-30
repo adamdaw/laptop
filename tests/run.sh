@@ -22,13 +22,15 @@ FAIL=0
 CURRENT=""
 
 # Core utilities the script (and the stubs) legitimately need.
-CORE_UTILS=(bash env cat grep sed find realpath dirname basename date mkdir mv cp rm ln chmod head tr sort mktemp touch readlink ls wc python3)
+CORE_UTILS=(bash env cat grep sed find realpath dirname basename date mkdir mv cp rm ln chmod head tr sort mktemp touch readlink ls wc python3 sha256sum)
 
-ALL_FORMULAE=(git git-delta stow neovim tmux jq ripgrep fd fzf bat wget gh starship zsh zsh-autosuggestions zsh-syntax-highlighting uv mise openjdk@21)
-ALL_PACKAGES=(agy bash bat bin ghostty git nvim ripgrep ssh starship tmux zsh)
+ALL_FORMULAE=(git git-delta stow neovim tmux jq ripgrep fd fzf bat wget gh starship zsh zsh-autosuggestions zsh-syntax-highlighting uv mise openjdk@21 lazygit tree-sitter-cli shellcheck markdownlint-cli2)
+ALL_PACKAGES=(agy applications bash bat bin ghostty git nvim render-url ripgrep ssh starship tmux zsh)
+# Stowed with --no-folding (as the script does).
+NO_FOLD_PACKAGES=(applications render-url)
 
 # Calls that would change the machine. None may appear during --dry-run.
-MUTATING='^(sudo|apt-get|chsh|usermod|ujust|ssh-keygen|npm|curl|stow|systemctl|ubuntu-report|unzip|fc-cache)( |$)|^brew install|^rpm-ostree (install|upgrade|reboot)|^flatpak install|^git clone|^git config (--global [^-]|.* --(add|unset|unset-all|replace-all|remove-section|rename-section)( |$))|^mise (use|install|reshim)|^mise-|^gsettings set'
+MUTATING='^(sudo|apt-get|chsh|usermod|ujust|ssh-keygen|npm|curl|stow|systemctl|ubuntu-report|unzip|fc-cache)( |$)|^brew install|^rpm-ostree (install|upgrade|reboot)|^flatpak install|^git clone|^git config (--global [^-]|.* --(add|unset|unset-all|replace-all|remove-section|rename-section)( |$))|^mise (use|install|reshim|exec)|^mise-|^gsettings set'
 
 # rpm-ostree status --json shapes. Deployments are listed newest first:
 # staged/pending, then booted, then rollback.
@@ -56,6 +58,9 @@ case "$*" in
                      "$STUB_STATE/node-install" "$("$STUB_STATE/node-install" --pin)" ;;
   reshim)            [ "${STUB_RESHIM_RC:-0}" = 0 ] || exit "$STUB_RESHIM_RC"
                      "$STUB_STATE/node-install" --reshim ;;
+  "exec -- "*)       shift 2  # the pinned node first on PATH, as mise exec does
+                     v="$("$STUB_STATE/node-install" --which)"
+                     PATH="${MISE_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/mise}/installs/node/$v/bin:$PATH" exec "$@" ;;
   *)                 echo "stub mise: unexpected: $*" >&2; exit 2 ;;
 esac'
 
@@ -70,7 +75,12 @@ esac'
 # Each tool logs as "mise-<version>-<tool>" and each shim as "mise-shim-<tool>";
 # a shim runs the pinned version's tool, as mise's shims do. The versioned
 # npm's `install -g @anthropic-ai/claude-code` adds claude to that bin dir, not
-# a shim: only reshim exposes it.
+# a shim: only reshim exposes it. `npm ci` replaces ./node_modules with one
+# holding playwright (STUB_NPM_CI_RC makes it fail). `npx playwright install
+# chromium` behaves like Playwright: it needs its pinned revision (1140) of
+# both chromium and chromium_headless_shell in ~/.cache/ms-playwright and
+# downloads (logged to $STUB_STATE/pw-downloads) only the ones missing;
+# STUB_PW_RC makes it fail before downloading anything.
 write_node_install() {
   cat > "$STATE/node-install" <<'EOF'
 #!@BASH@
@@ -101,6 +111,15 @@ tool() { # tool PATH LABEL
 printf '%s\n' "mise-$2 \$*" >> "\$STUB_LOG"
 if [ "\$*" = "install -g @anthropic-ai/claude-code" ]; then
   printf '#!@BASH@\nexit 0\n' > "\${0%/*}/claude"; chmod +x "\${0%/*}/claude"
+elif [ "\${0##*/} \$*" = "npm ci" ]; then
+  [ "\${STUB_NPM_CI_RC:-0}" = 0 ] || exit "\$STUB_NPM_CI_RC"
+  rm -rf node_modules; mkdir -p node_modules/playwright
+elif [ "\${0##*/} \$*" = "npx playwright install chromium" ]; then
+  [ "\${STUB_PW_RC:-0}" = 0 ] || { echo "Failed to install browsers" >&2; exit "\$STUB_PW_RC"; }
+  for b in chromium-1140 chromium_headless_shell-1140; do
+    c="\${XDG_CACHE_HOME:-\$HOME/.cache}/ms-playwright/\$b"
+    [ -d "\$c" ] || { mkdir -p "\$c"; echo "\$b" >> "\$STUB_STATE/pw-downloads"; }
+  done
 fi
 TOOL
   chmod +x "$1"
@@ -131,6 +150,7 @@ v="$(resolve "$1")"
 mkdir -p "$dir/$v/bin"
 tool "$dir/$v/bin/node" "$v-node"
 tool "$dir/$v/bin/npm" "$v-npm"
+tool "$dir/$v/bin/npx" "$v-npx"
 ln -sfn "$v" "$dir/${v%%.*}"; ln -sfn "$v" "$dir/${v%.*}"
 if [ "$v" = 22.12.0 ] && [ -z "${NODE_NO_ALIAS:-}" ]; then ln -sfn "$v" "$dir/lts"; ln -sfn "$v" "$dir/latest"; fi
 reshim
@@ -335,7 +355,10 @@ stow_dir() { # stow_dir SOURCE_DIR TARGET_DIR
     if [ -d "$s" ] && [ ! -L "$s" ]; then
       if [ ! -e "$t" ] && [ ! -L "$t" ]; then
         if (( no_folding )); then mkdir "$t"; stow_dir "$s" "$t"; else ln -s "$s" "$t"; fi
-      elif [ -L "$t" ] && same "$t" "$s"; then :
+      elif [ -L "$t" ] && same "$t" "$s"; then                      # our own fold
+        # --restow unstows (removing the fold), then stows again: with
+        # --no-folding that makes a real directory, as real stow does.
+        if (( no_folding )); then rm "$t"; mkdir "$t"; stow_dir "$s" "$t"; fi
       elif [ -L "$t" ] && [ -d "$t" ] && owned "$t"; then            # unfold
         old="$(realpath "$t")"; rm "$t"; mkdir "$t"; link_children "$old" "$t"; stow_dir "$s" "$t"
       elif [ -d "$t" ] && [ ! -L "$t" ]; then stow_dir "$s" "$t"
@@ -371,6 +394,21 @@ dotfiles_fixture() {
   echo "" > "$d/starship/.config/starship.toml"
   echo "--smart-case" > "$d/ripgrep/.ripgreprc"
   echo "README — must not be stowed" > "$d/bash/README.md"
+  mkdir -p "$d/render-url/.local/share/render-url" "$d/applications/.local/bin" "$d/applications/.local/share/applications"
+  echo '{"name":"render-url","dependencies":{"playwright":"^1.48.0"}}' > "$d/render-url/.local/share/render-url/package.json"
+  echo '{"lockfileVersion":3}' > "$d/render-url/.local/share/render-url/package-lock.json"
+  echo "// render-url" > "$d/render-url/.local/share/render-url/render-url.mjs"
+  echo "#!/bin/sh" > "$d/applications/.local/bin/claude-on-mac"
+  echo "[Desktop Entry]" > "$d/applications/.local/share/applications/claude-on-mac.desktop"
+}
+
+# render-url's dependencies as a successful run leaves them: node_modules
+# stamped with the lockfile's hash, and Chromium in Playwright's cache.
+render_url_done_fixture() {
+  local dir="$HOME/.local/share/render-url"
+  mkdir -p "$dir/node_modules/playwright" "$HOME/.cache/ms-playwright/chromium-1140" \
+           "$HOME/.cache/ms-playwright/chromium_headless_shell-1140"
+  sha256sum < "$dir/package-lock.json" > "$dir/node_modules/.laptop-package-lock.sha256"
 }
 
 # mise on PATH, node pinned in its global config and installed, as
@@ -396,7 +434,13 @@ all_done_fixture() {
   printf '#!%s\necho 1.1.0\n' "$SANDBOX/sysbin/bash" > "$HOME/.bun/bin/bun"; chmod +x "$HOME/.bun/bin/bun"
   stub claude
   mise_node_fixture
-  sandboxed "$STUBS/stow" --dir="$HOME/Projects/Home/dotfiles" --target="$HOME" --restow "${ALL_PACKAGES[@]}"
+  local p folded=()
+  for p in "${ALL_PACKAGES[@]}"; do
+    [[ " ${NO_FOLD_PACKAGES[*]} " == *" $p "* ]] || folded+=("$p")
+  done
+  sandboxed "$STUBS/stow" --dir="$HOME/Projects/Home/dotfiles" --target="$HOME" --restow "${folded[@]}"
+  sandboxed "$STUBS/stow" --no-folding --dir="$HOME/Projects/Home/dotfiles" --target="$HOME" --restow "${NO_FOLD_PACKAGES[@]}"
+  render_url_done_fixture
   : > "$LOG"
 }
 
@@ -447,7 +491,7 @@ sandboxed() {
     LAPTOP_YUM_REPOS_DIR="$LAPTOP_YUM_REPOS_DIR" LAPTOP_BREW_DIRS="$LAPTOP_BREW_DIRS"
     STUB_LOG="$STUB_LOG" STUB_STATE="$STUB_STATE"
   )
-  for v in XDG_CURRENT_DESKTOP STUB_GIT_FAIL STUB_GIT_TRUNC STUB_GIT_ON STUB_GIT_DO STUB_CURL_RC STUB_CURL_FAIL STUB_GPG_RC STUB_MISE_RC STUB_RESHIM_RC STUB_OSTREE_RC; do
+  for v in XDG_CURRENT_DESKTOP STUB_GIT_FAIL STUB_GIT_TRUNC STUB_GIT_ON STUB_GIT_DO STUB_CURL_RC STUB_CURL_FAIL STUB_GPG_RC STUB_MISE_RC STUB_RESHIM_RC STUB_OSTREE_RC STUB_NPM_CI_RC STUB_PW_RC; do
     if [ -n "${!v:-}" ]; then vars+=("$v=${!v}"); fi
   done
   "$SANDBOX/sysbin/env" -i "${vars[@]}" "$@"
@@ -522,7 +566,7 @@ test_bazzite_dry_run_fresh() {
   check "detects Bazzite" has "$OUT" "Detected Bazzite"
   check "plans exactly one brew install" [ "$(grep -cF '[dry-run] brew install' <<<"$OUT")" -eq 1 ]
   local f
-  for f in zsh zsh-autosuggestions zsh-syntax-highlighting git-delta neovim ripgrep fd fzf bat jq gh starship uv wget mise openjdk@21; do
+  for f in zsh zsh-autosuggestions zsh-syntax-highlighting git-delta neovim ripgrep fd fzf bat jq gh starship uv wget mise openjdk@21 lazygit tree-sitter-cli shellcheck markdownlint-cli2; do
     check "brew installs $f" has "$brew_line" " $f( |$)"
   done
   check "skips image-provided tmux" lacks "$brew_line" " tmux( |$)"
@@ -1248,7 +1292,8 @@ test_bazzite_run_and_rerun() {
   check "re-run makes no new backups" [ "$(find "$HOME/.local/state/laptop/backups" -type f | wc -l)" -eq "$backups_before" ]
   check "re-run does not regenerate the SSH key" log_lacks '^ssh-keygen'
   check "re-run has no stow failures" lacks "$OUT" "stow failed"
-  check "re-run does not run mise" log_lacks '^mise '
+  check "re-run does not re-pin, install or reshim node" log_lacks '^mise (use|install|reshim)'
+  check "re-run runs mise only for Playwright's own check" [ "$(log_count '^mise ')" -eq "$(log_count '^mise exec -- npx playwright install chromium$')" ]
   check "re-run reports node installed via mise" has "$OUT" "node already installed via mise"
   check "re-run leaves mise config unchanged" [ "$mise_conf_before" = "$(cat "$HOME/.config/mise/config.toml")" ]
   check "re-run finds claude, installs nothing with npm" log_lacks 'npm install'
@@ -1282,6 +1327,8 @@ test_debian_dry_run() {
   check "plans apt install zsh" has "$OUT" "\[dry-run\] sudo apt-get install -y zsh$"
   check "plans gh apt repo" has "$OUT" "/etc/apt/sources.list.d/github-cli.list"
   check "plans JDK 21 via apt" has "$OUT" "\[dry-run\] sudo apt-get install -y openjdk-21-jdk$"
+  check "plans shellcheck via apt" has "$OUT" "\[dry-run\] sudo apt-get install -y shellcheck$"
+  check "plans render-url npm ci through mise" has "$OUT" "\[dry-run\] \(cd $HOME/.local/share/render-url && mise exec -- npm ci\)$"
   check "plans chsh" has "$OUT" "\[dry-run\] chsh -s"
   check "stows tmux" has "$OUT" "\[dry-run\] stow .* --restow tmux$"
   check "never uses --adopt" lacks "$OUT" "--adopt"
@@ -1343,7 +1390,8 @@ test_debian_run_and_rerun() {
   check "re-run skips JDK install" log_lacks '^sudo apt-get install -y openjdk-21-jdk$'
   check "re-run skips mise install" has "$OUT" "mise already installed"
   check "re-run adds no mise apt repo" log_lacks 'mise\.list|mise-archive-keyring|apt-get install -y mise'
-  check "re-run does not run mise" log_lacks '^mise '
+  check "re-run does not re-pin, install or reshim node" log_lacks '^mise (use|install|reshim)'
+  check "re-run runs mise only for Playwright's own check" [ "$(log_count '^mise ')" -eq "$(log_count '^mise exec -- npx playwright install chromium$')" ]
   check "re-run leaves mise config unchanged" [ "$conf_before" = "$(cat "$HOME/.config/mise/config.toml")" ]
   teardown
 }
@@ -2047,6 +2095,207 @@ test_default_terminal_skips() {
   done
 }
 
+# ── Tests: render-url and the applications package ──────────────────────────
+
+RU_DIR_REL=.local/share/render-url
+ru_log() { log_count "^mise exec -- $1"; }
+
+test_render_url() {
+  local ru before repo_before pw
+  setup "render-url: bazzite dry-run (fresh)"
+  bazzite
+  dotfiles_fixture
+  ru="$HOME/$RU_DIR_REL"
+  before="$(home_snapshot)"
+  run_linux --dry-run
+  check "exits 0" [ "$RC" -eq 0 ]
+  check "stows render-url without folding" has "$OUT" '\[dry-run\] stow --no-folding .* --restow render-url$'
+  check "stows applications without folding" has "$OUT" '\[dry-run\] stow --no-folding .* --restow applications$'
+  check "folds other packages as before" has "$OUT" '\[dry-run\] stow --dir=.* --restow tmux$'
+  check "never stows claude" lacks "$OUT" '--restow claude$'
+  check "plans npm ci through mise exec" has "$OUT" "\[dry-run\] \(cd $ru && mise exec -- npm ci\)$"
+  check "plans the documented browser install" has "$OUT" "\[dry-run\] \(cd $ru && mise exec -- npx playwright install chromium\)$"
+  check "npm ci planned after stowing render-url" [ "$(grep -n -m1 'restow render-url$' <<<"$OUT" | cut -d: -f1)" -lt "$(grep -n -m1 'npm ci' <<<"$OUT" | cut -d: -f1)" ]
+  check "no mutating command was executed" log_lacks "$MUTATING"
+  check "HOME is untouched" [ "$before" = "$(home_snapshot)" ]
+  teardown
+
+  setup "render-url: bazzite run + re-run (stubbed)"
+  bazzite
+  dotfiles_fixture
+  ru="$HOME/$RU_DIR_REL"
+  repo_before="$(repo_snapshot)"
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "brew installed the new formulae" log_has '^brew install .* lazygit tree-sitter-cli shellcheck markdownlint-cli2( |$)'
+  check "render-url dir is a real dir" is_real_dir "$ru"
+  check "render-url script is stowed" [ "$(realpath "$ru/render-url.mjs")" = "$(realpath "$HOME/Projects/Home/dotfiles/render-url/$RU_DIR_REL/render-url.mjs")" ]
+  check ".local/bin stays a real dir" is_real_dir "$HOME/.local/bin"
+  check ".local/share/applications stays a real dir" is_real_dir "$HOME/.local/share/applications"
+  check "claude-on-mac.desktop is stowed" [ -L "$HOME/.local/share/applications/claude-on-mac.desktop" ]
+  check "claude-on-mac is stowed" [ -L "$HOME/.local/bin/claude-on-mac" ]
+  check "npm ci ran once through mise exec" [ "$(ru_log 'npm ci$')" -eq 1 ]
+  check "mise exec ran the pinned node's npm" log_has '^mise-22.12.0-npm ci$'
+  check "npm ci after node was pinned" logged_before '^mise use -g node@lts$' '^mise exec -- npm ci$'
+  check "browser install after npm ci" logged_before '^mise exec -- npm ci$' '^mise exec -- npx playwright install chromium$'
+  check "the pinned node's npx installed Chromium" log_has '^mise-22.12.0-npx playwright install chromium$'
+  check "node_modules is beside the stowed files" [ -d "$ru/node_modules/playwright" ]
+  check "lockfile hash recorded" [ "$(cat "$ru/node_modules/.laptop-package-lock.sha256")" = "$(sha256sum < "$ru/package-lock.json")" ]
+  check "PATH npm never used" log_lacks '^npm '
+  check "nothing written into the repo" [ "$repo_before" = "$(repo_snapshot)" ]
+  : > "$LOG"
+  run_linux
+  check "re-run exits 0" [ "$RC" -eq 0 ]
+  check "re-run skips npm ci" [ "$(ru_log 'npm ci$')" -eq 0 ]
+  check "re-run says deps are installed" has "$OUT" "render-url dependencies already installed"
+  check "re-run still asks Playwright" [ "$(ru_log 'npx playwright install chromium$')" -eq 1 ]
+  check "re-run downloads nothing (Playwright has its build)" [ "$(wc -l < "$STATE/pw-downloads")" -eq 2 ]
+  check "re-run has no stow failures" lacks "$OUT" "stow failed"
+
+  : > "$LOG"
+  echo '{"lockfileVersion":3,"changed":true}' > "$HOME/Projects/Home/dotfiles/render-url/$RU_DIR_REL/package-lock.json"
+  run_linux
+  check "changed lockfile: npm ci again" [ "$(ru_log 'npm ci$')" -eq 1 ]
+  check "changed lockfile: browser install re-checked" [ "$(ru_log 'npx playwright install chromium$')" -eq 1 ]
+  check "changed lockfile: new hash recorded" [ "$(cat "$ru/node_modules/.laptop-package-lock.sha256")" = "$(sha256sum < "$ru/package-lock.json")" ]
+
+  : > "$LOG"
+  rm -rf "$HOME/.cache/ms-playwright"
+  run_linux
+  check "browser missing: no npm ci" [ "$(ru_log 'npm ci$')" -eq 0 ]
+  check "browser missing: installs Chromium" [ "$(ru_log 'npx playwright install chromium$')" -eq 1 ]
+  teardown
+
+  setup "render-url: dry-run when everything is in place"
+  bazzite
+  dotfiles_fixture
+  all_done_fixture
+  before="$(home_snapshot)"
+  run_linux --dry-run
+  check "exits 0" [ "$RC" -eq 0 ]
+  check "says deps are installed" has "$OUT" "render-url dependencies already installed"
+  check "plans no npm ci" lacks "$OUT" "npm ci"
+  check "still plans Playwright's own check" has "$OUT" "\[dry-run\] \(cd .* && .*mise exec -- npx playwright install chromium\)$"
+  check "HOME is untouched" [ "$before" = "$(home_snapshot)" ]
+  teardown
+
+  setup "render-url: an older cached Chromium"
+  bazzite
+  dotfiles_fixture
+  all_done_fixture
+  pw="$HOME/.cache/ms-playwright"
+  rm -rf "$pw"; mkdir -p "$pw/chromium-1100" "$pw/chromium_headless_shell-1100"
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "install still invoked" [ "$(ru_log 'npx playwright install chromium$')" -eq 1 ]
+  check "the required revision was fetched" is_real_dir "$pw/chromium-1140"
+  check "no npm ci" [ "$(ru_log 'npm ci$')" -eq 0 ]
+  teardown
+
+  setup "render-url: headless shell missing"
+  bazzite
+  dotfiles_fixture
+  all_done_fixture
+  pw="$HOME/.cache/ms-playwright"
+  rm -rf "$pw/chromium_headless_shell-1140"
+  run_linux
+  check "install invoked" [ "$(ru_log 'npx playwright install chromium$')" -eq 1 ]
+  check "only the headless shell was downloaded" [ "$(cat "$STATE/pw-downloads")" = chromium_headless_shell-1140 ]
+  teardown
+
+  setup "render-url: browser install fails, then the re-run"
+  bazzite
+  dotfiles_fixture
+  mkdir -p "$HOME/.cache/ms-playwright/chromium-1100"   # an old build must not count
+  STUB_PW_RC=1 run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "warns about the failure" has "$OUT" "'npx playwright install chromium' failed.*retried on the next run"
+  check "npm ci's stamp was still recorded" [ -s "$HOME/$RU_DIR_REL/node_modules/.laptop-package-lock.sha256" ]
+  : > "$LOG"
+  STUB_PW_RC=1 run_linux
+  check "second failing run retries the install" [ "$(ru_log 'npx playwright install chromium$')" -eq 1 ]
+  check "does not claim Chromium is installed" lacks "$OUT" "Playwright Chromium .*is installed"
+  : > "$LOG"
+  run_linux
+  check "re-run retries the install" [ "$(ru_log 'npx playwright install chromium$')" -eq 1 ]
+  check "re-run does not repeat npm ci" [ "$(ru_log 'npm ci$')" -eq 0 ]
+  check "re-run fetched the required build" is_real_dir "$HOME/.cache/ms-playwright/chromium_headless_shell-1140"
+  teardown
+
+  setup "render-url: no usable mise Node"
+  bazzite
+  dotfiles_fixture
+  STUB_MISE_RC=1 run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "warns and skips" has "$OUT" "skipped render-url dependencies: no usable mise-managed Node"
+  check "never runs npm" log_lacks '^mise exec|^npm |-npm ci'
+  check "no node_modules" [ ! -e "$HOME/$RU_DIR_REL/node_modules" ]
+  teardown
+
+  setup "render-url: npm ci fails"
+  bazzite
+  dotfiles_fixture
+  STUB_NPM_CI_RC=1 run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "warns about the failure" has "$OUT" "'mise exec -- npm ci' failed"
+  check "no browser install after a failed npm ci" log_lacks 'playwright install'
+  check "no hash recorded" [ ! -e "$HOME/$RU_DIR_REL/node_modules/.laptop-package-lock.sha256" ]
+  : > "$LOG"
+  run_linux
+  check "re-run retries npm ci" [ "$(ru_log 'npm ci$')" -eq 1 ]
+  check "re-run then installs Chromium" [ "$(ru_log 'npx playwright install chromium$')" -eq 1 ]
+  teardown
+
+  setup "render-url: folded into the repo by an earlier stow"
+  bazzite
+  dotfiles_fixture
+  mkdir -p "$HOME/.local/share"
+  ln -s ../../Projects/Home/dotfiles/render-url/.local/share/render-url "$HOME/.local/share/render-url"
+  repo_before="$(repo_snapshot)"
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "restow --no-folding unfolded it" is_real_dir "$HOME/$RU_DIR_REL"
+  check "npm ci ran in the real dir" [ -d "$HOME/$RU_DIR_REL/node_modules/playwright" ]
+  check "nothing written into the repo" [ "$repo_before" = "$(repo_snapshot)" ]
+  teardown
+
+  setup "render-url: still a link into the repo after stowing"
+  bazzite
+  dotfiles_fixture
+  stub stow   # stows nothing, so the fold stays
+  mkdir -p "$HOME/.local/share"
+  ln -s ../../Projects/Home/dotfiles/render-url/.local/share/render-url "$HOME/.local/share/render-url"
+  repo_before="$(repo_snapshot)"
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "warns about the link" has "$OUT" "skipped render-url dependencies: .* resolves into the dotfiles repo"
+  check "never runs npm" log_lacks '^mise exec'
+  check "nothing written into the repo" [ "$repo_before" = "$(repo_snapshot)" ]
+  teardown
+
+  setup "render-url: package absent from dotfiles"
+  bazzite
+  dotfiles_fixture
+  rm -rf "$HOME/Projects/Home/dotfiles/render-url"
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "warns the package is missing" has "$OUT" "dotfiles has no 'render-url' package"
+  check "no render-url step" lacks "$OUT" "render-url dependencies"
+  check "never runs npm ci" log_lacks '^mise exec'
+  teardown
+
+  setup "render-url: pop run"
+  os_release pop "ubuntu debian"
+  dotfiles_fixture
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "shellcheck from apt" log_has '^sudo apt-get install -y shellcheck$'
+  check "npm ci through mise exec" [ "$(ru_log 'npm ci$')" -eq 1 ]
+  check "node_modules installed" [ -d "$HOME/$RU_DIR_REL/node_modules/playwright" ]
+  check "PATH npm never used" log_lacks '^npm '
+  teardown
+}
+
 # ── Run ──────────────────────────────────────────────────────────────────────
 
 TESTS=(
@@ -2096,6 +2345,7 @@ TESTS=(
   test_gitconfig_xdg_identity
   test_git_stub_includes
   test_font_detection
+  test_render_url
 )
 
 for t in "${TESTS[@]}"; do
