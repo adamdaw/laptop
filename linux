@@ -965,31 +965,20 @@ run_in() {
   (cd -- "$dir" && "$@")
 }
 
-# True if a Chromium build from `playwright install chromium` is in Playwright's
-# browser cache (PLAYWRIGHT_BROWSERS_PATH, 0 meaning inside node_modules, else
-# ~/.cache/ms-playwright, as Playwright resolves it on Linux).
-playwright_chromium_present() {
-  local cache="${PLAYWRIGHT_BROWSERS_PATH:-${XDG_CACHE_HOME:-$HOME/.cache}/ms-playwright}" d
-  if [ "$cache" = 0 ]; then
-    cache="$1/node_modules/playwright-core/.local-browsers"
-  fi
-  for d in "$cache"/chromium-* "$cache"/chromium_headless_shell-*; do
-    [ -d "$d" ] && return 0
-  done
-  return 1
-}
+# Where stow puts the package (and where dotfiles' bin/render-url looks).
+RENDER_URL_DIR="$HOME/.local/share/render-url"
 
 # render-url's dependencies (playwright) are not in dotfiles: install them next
 # to the stowed files with mise's Node, the way dotfiles' bin/render-url says
-# (`npm ci && npx playwright install chromium`). Skipped when node_modules was
-# installed from the current package-lock.json (a stamp inside node_modules,
-# which `npm ci` wipes); the browser is fetched only when it is missing, or
-# after a fresh `npm ci` (a new playwright may need a new build; a no-op
-# otherwise).
-# Where stow puts the package (and where dotfiles' bin/render-url looks).
-RENDER_URL_DIR="$HOME/.local/share/render-url"
+# (`npm ci && npx playwright install chromium`). `npm ci` is skipped when
+# node_modules was installed from the current package-lock.json (a stamp
+# inside node_modules, written only after `npm ci` succeeds, which `npm ci`
+# wipes). The browser install always runs: only Playwright knows the exact
+# builds it needs (Chromium and its headless shell, at its pinned revision),
+# and it skips those it already has, so a failed or stale install is always
+# retried on the next run.
 install_render_url() {
-  local dir="$RENDER_URL_DIR" lock stamp lock_sum="" fresh=0
+  local dir="$RENDER_URL_DIR" lock stamp lock_sum=""
   (( RENDER_URL_STOWED )) || return 0
   step "Installing render-url dependencies"
   lock="$dir/package-lock.json"
@@ -998,8 +987,9 @@ install_render_url() {
     warn "skipped render-url dependencies: $lock not found after stowing"
     return 0
   fi
-  if [ -e "$dir" ] && in_repo "$dir"; then
-    # A fold (e.g. an earlier plain `stow render-url`): npm would write into the repo.
+  if (( ! DRY_RUN )) && in_repo "$dir"; then
+    # Still a link into the repo after `stow --restow --no-folding` (which
+    # unfolds this package's own folds): npm would write into the repo.
     warn "skipped render-url dependencies: $dir resolves into the dotfiles repo; unstow render-url and re-run so it is stowed with --no-folding"
     return 0
   fi
@@ -1013,7 +1003,6 @@ install_render_url() {
   if [ -n "$lock_sum" ] && [ -d "$dir/node_modules/playwright" ] && [ "$(cat -- "$stamp" 2>/dev/null)" = "$lock_sum" ]; then
     ok "render-url dependencies already installed (package-lock.json unchanged)"
   elif run_in "$dir" "$MISE_BIN" exec -- npm ci; then
-    fresh=1
     if (( ! DRY_RUN )) && ! { [ -n "$lock_sum" ] && printf '%s\n' "$lock_sum" > "$stamp"; }; then
       warn "could not record render-url's lockfile hash; the next run will run npm ci again"
     fi
@@ -1022,12 +1011,10 @@ install_render_url() {
     warn "'mise exec -- npm ci' failed in $dir; render-url will not work until it succeeds"
     return 0
   fi
-  if (( ! fresh )) && playwright_chromium_present "$dir"; then
-    ok "Playwright Chromium already installed"
-  elif run_in "$dir" "$MISE_BIN" exec -- npx playwright install chromium; then
-    did "installed Playwright Chromium for render-url"
+  if run_in "$dir" "$MISE_BIN" exec -- npx playwright install chromium; then
+    did "Playwright Chromium for render-url is installed (playwright install chromium)"
   else
-    warn "'npx playwright install chromium' failed in $dir; render-url cannot launch a browser until it succeeds"
+    warn "'npx playwright install chromium' failed in $dir; render-url cannot launch a browser until it succeeds (retried on the next run)"
   fi
 }
 
