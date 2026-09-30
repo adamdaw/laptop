@@ -24,10 +24,10 @@ CURRENT=""
 # Core utilities the script (and the stubs) legitimately need.
 CORE_UTILS=(bash env cat grep sed find realpath dirname basename date mkdir mv cp rm ln chmod head tr sort mktemp touch readlink ls wc python3 sha256sum)
 
-ALL_FORMULAE=(git git-delta stow neovim tmux jq ripgrep fd fzf bat wget gh starship zsh zsh-autosuggestions zsh-syntax-highlighting uv mise openjdk@21 lazygit tree-sitter-cli shellcheck markdownlint-cli2 gitleaks)
-ALL_PACKAGES=(agy applications bash bat bin claude ghostty git nvim render-url ripgrep ssh starship tmux zsh)
+ALL_FORMULAE=(git git-delta stow neovim tmux jq ripgrep fd fzf bat wget gh starship zsh zsh-autosuggestions zsh-syntax-highlighting uv mise openjdk@21 lazygit tree-sitter-cli shellcheck markdownlint-cli2 gitleaks atuin)
+ALL_PACKAGES=(agy applications atuin bash bat bin claude ghostty git nvim render-url ripgrep ssh starship tmux zsh)
 # Stowed with --no-folding (as the script does).
-NO_FOLD_PACKAGES=(agy applications bin claude render-url)
+NO_FOLD_PACKAGES=(agy applications atuin bin claude render-url)
 
 # Calls that would change the machine. None may appear during --dry-run.
 MUTATING='^(sudo|apt-get|chsh|usermod|ujust|ssh-keygen|npm|curl|stow|systemctl|ubuntu-report|unzip|fc-cache)( |$)|^brew install|^rpm-ostree (install|upgrade|reboot)|^flatpak install|^git clone|^git config (--global [^-]|.* --(add|unset|unset-all|replace-all|remove-section|rename-section)( |$))|^mise (use|install|reshim|exec)|^mise-|^gsettings set'
@@ -454,6 +454,10 @@ dotfiles_fixture() {
   mkdir -p "$d/claude/.claude/skills/route-local"
   echo "# dotfiles CLAUDE.md" > "$d/claude/.claude/CLAUDE.md"
   echo "# route-local" > "$d/claude/.claude/skills/route-local/SKILL.md"
+  mkdir -p "$d/atuin/.config/atuin" "$d/atuin/.config/atuin-ai-server" "$d/atuin/.config/containers/systemd"
+  echo "# dotfiles atuin" > "$d/atuin/.config/atuin/config.toml"
+  echo "# dotfiles atuin-ai-server" > "$d/atuin/.config/atuin-ai-server/config.toml"
+  echo "[Container]" > "$d/atuin/.config/containers/systemd/atuin-ai-server.container"
 }
 
 # render-url's dependencies as a successful run leaves them: node_modules
@@ -647,7 +651,7 @@ test_bazzite_dry_run_fresh() {
   check "detects Bazzite" has "$OUT" "Detected Bazzite"
   check "plans exactly one brew install" [ "$(grep -cF '[dry-run] brew install' <<<"$OUT")" -eq 1 ]
   local f
-  for f in zsh zsh-autosuggestions zsh-syntax-highlighting git-delta neovim ripgrep fd fzf bat jq gh starship uv wget mise openjdk@21 lazygit tree-sitter-cli shellcheck markdownlint-cli2 gitleaks; do
+  for f in zsh zsh-autosuggestions zsh-syntax-highlighting git-delta neovim ripgrep fd fzf bat jq gh starship uv wget mise openjdk@21 lazygit tree-sitter-cli shellcheck markdownlint-cli2 gitleaks atuin; do
     check "brew installs $f" has "$brew_line" " $f( |$)"
   done
   check "skips image-provided tmux" lacks "$brew_line" " tmux( |$)"
@@ -2960,13 +2964,82 @@ test_agent_clis() {
   teardown
 }
 
+# ── Tests: the atuin package ─────────────────────────────────────────────────
+
+# atuin, podman and other Quadlet units write into ~/.config/atuin,
+# ~/.config/atuin-ai-server and ~/.config/containers/systemd, so none may be
+# folded into the repo. atuin writes its own config.toml on first run: a
+# regular file, backed up before stowing. The Quadlet unit is never started.
+test_atuin_package() {
+  local df before repo_before backups os
+  for os in bazzite pop; do
+    setup "atuin: $os, generated config.toml, podman present"
+    if [ "$os" = bazzite ]; then bazzite; else os_release pop "ubuntu debian"; fi
+    dotfiles_fixture
+    stub podman
+    df="$HOME/Projects/Home/dotfiles/atuin/.config"
+    mkdir -p "$HOME/.config/atuin" "$HOME/.config/containers/systemd"
+    echo "# atuin's generated default" > "$HOME/.config/atuin/config.toml"
+    echo "[Container]" > "$HOME/.config/containers/systemd/other.container"
+    echo "unqualified-search-registries = []" > "$HOME/.config/containers/registries.conf"
+    before="$(home_snapshot)"; repo_before="$(repo_snapshot)"
+    run_linux --dry-run
+    check "dry run plans atuin without folding" has "$OUT" '\[dry-run\] stow --no-folding .* --restow atuin$'
+    check "dry run plans the config.toml backup" has "$OUT" "would back up ~/.config/atuin/config.toml \("
+    check "dry run changes nothing" [ "$before" = "$(home_snapshot)" ]
+    check "dry run never mutates" log_lacks "$MUTATING"
+    run_linux
+    check "run exits 0" [ "$RC" -eq 0 ]
+    backups="$(find "$HOME/.local/state/laptop/backups" -path '*/.config/atuin/config.toml' -type f)"
+    check "generated config.toml backed up once" [ "$(grep -c . <<<"$backups")" -eq 1 ]
+    check "backup keeps atuin's content" [ "$(cat "$backups")" = "# atuin's generated default" ]
+    check "config.toml is now the stowed link" [ "$(realpath "$HOME/.config/atuin/config.toml")" = "$(realpath "$df/atuin/config.toml")" ]
+    check "never adopted into the repo" [ "$repo_before" = "$(repo_snapshot)" ]
+    for d in atuin atuin-ai-server containers containers/systemd; do
+      check "HOME/.config/$d is a real dir" is_real_dir "$HOME/.config/$d"
+    done
+    check "the Quadlet unit is stowed" [ "$(realpath "$HOME/.config/containers/systemd/atuin-ai-server.container")" = "$(realpath "$df/containers/systemd/atuin-ai-server.container")" ]
+    check "other Quadlet units untouched" [ -f "$HOME/.config/containers/systemd/other.container" ] && [ ! -L "$HOME/.config/containers/systemd/other.container" ]
+    check "podman's own config untouched" [ ! -L "$HOME/.config/containers/registries.conf" ]
+    check "summary hints how to start atuin-ai-server" has "$OUT" "systemctl --user daemon-reload && systemctl --user start atuin-ai-server$"
+    check "the hint names llama-swap on :8080" has "$OUT" "needs llama-swap on :8080"
+    check "the unit is never enabled or started" log_lacks '^systemctl --user|^podman '
+    echo "[Container]" > "$HOME/.config/containers/systemd/new.container"
+    echo "x" > "$HOME/.config/atuin/history.db"
+    check "later writes stay out of the repo" [ "$repo_before" = "$(repo_snapshot)" ]
+    teardown
+  done
+
+  setup "atuin: no podman, no hint"
+  bazzite
+  dotfiles_fixture
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "atuin stowed" [ -L "$HOME/.config/atuin/config.toml" ]
+  check "no atuin-ai-server hint without podman" lacks "$OUT" "atuin-ai-server"
+  teardown
+
+  setup "atuin: formula on Bazzite only"
+  bazzite
+  dotfiles_fixture
+  run_linux --dry-run
+  check "Bazzite brew installs atuin" has "$(grep -F '[dry-run] brew install' <<<"$OUT")" " atuin( |$)"
+  teardown
+  setup "atuin: not installed on Ubuntu"
+  os_release pop "ubuntu debian"
+  dotfiles_fixture
+  run_linux --dry-run
+  check "no atuin package via apt" lacks "$OUT" "apt-get install -y atuin"
+  teardown
+}
+
 # ── Tests: package lists match the dotfiles repo ─────────────────────────────
 
 # Top-level package directories of adamdaw/dotfiles (main), without docs/,
 # tests/ and dot-dirs. Update with the dotfiles repo. Set
 # LAPTOP_TEST_DOTFILES_DIR to a checkout to check this list against it too
 # (read-only; skipped otherwise, so the tests need no network or checkout).
-DOTFILES_PACKAGES=(agy applications bash bat bin claude ghostty git nvim render-url ripgrep ssh starship tmux xdg zsh)
+DOTFILES_PACKAGES=(agy applications atuin bash bat bin claude ghostty git nvim render-url ripgrep ssh starship tmux xdg zsh)
 # In dotfiles but not in STOW_PACKAGES, on purpose: xdg makes Ghostty the
 # default terminal, so it is stowed only on Bazzite GNOME with Ghostty present
 # (prepare_default_terminal adds it; see test_default_terminal).
@@ -3067,6 +3140,7 @@ TESTS=(
   test_bin_absolute_links
   test_agent_clis
   test_stow_packages_match_dotfiles
+  test_atuin_package
 )
 
 for t in "${TESTS[@]}"; do
