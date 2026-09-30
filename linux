@@ -22,11 +22,12 @@ BREW_DIRS="${LAPTOP_BREW_DIRS:-/home/linuxbrew/.linuxbrew $HOME/.linuxbrew}"
 
 # Dotfiles packages to stow (one directory each in the dotfiles repo).
 STOW_PACKAGES=(agy applications bash bat bin claude ghostty git nvim render-url ripgrep ssh starship tmux zsh)
-# Stowed with --no-folding: their target dirs (~/.local/bin, ~/.local/share/...,
-# ~/.config, ~/.claude) must stay real directories, so nothing written there
-# (render-url's node_modules, Claude Code's sessions and credentials, other
-# apps' files) ever lands in the dotfiles repo.
-NO_FOLD_PACKAGES=(applications claude render-url xdg)
+# Stowed with --no-folding: their target dirs (~/bin, ~/.local/bin,
+# ~/.local/share/..., ~/.config, ~/.config/agy, ~/.claude) must stay real
+# directories, so nothing written there (scripts other installers drop into
+# ~/bin, agy's own files, render-url's node_modules, Claude Code's sessions and
+# credentials, other apps' files) ever lands in the dotfiles repo.
+NO_FOLD_PACKAGES=(agy applications bin claude render-url xdg)
 
 # Existing files that conflict with a stowed file are moved into a fresh,
 # uniquely named directory under here (created on first use), never adopted.
@@ -63,6 +64,7 @@ BREW_FORMULAE=(
   tree-sitter-cli:tree-sitter
   shellcheck:shellcheck
   markdownlint-cli2:markdownlint-cli2
+  gitleaks: # dotfiles' pre-commit hook needs >= 8.20.0; a system copy may be older
 )
 
 # Bazzite / Fedora Atomic: GUI apps come from Flatpak — none are needed yet.
@@ -420,21 +422,103 @@ install_salesforce() {
   fi
 }
 
-install_claude() {
-  step "Installing Claude Code"
-  if cmd_exists claude; then
-    ok "claude already installed"
-  elif [ -z "$NODE_NPM" ]; then
-    warn "skipped Claude Code: no usable mise-managed Node (see above). Once Node works: npm install -g @anthropic-ai/claude-code"
-  else
-    run "$NODE_NPM" install -g @anthropic-ai/claude-code
-    # npm put claude in node's own bin dir; a shim makes it reachable on PATH.
-    if run "$MISE_BIN" reshim; then
-      did "installed claude"
-    else
-      warn "installed Claude Code, but 'mise reshim' failed, so claude has no shim; run 'mise reshim'"
-    fi
+# Agent CLIs, as "npm package:command", installed globally with mise's npm.
+AGENT_CLIS=(
+  @anthropic-ai/claude-code:claude
+  @openai/codex:codex
+  @earendil-works/pi-coding-agent:pi
+)
+# Node's own tools, linked from ~/.local/bin to mise's shims.
+NODE_TOOLS=(node npm npx corepack pnpm)
+
+# Link $2 (in ~/.local/bin) to $1. Only a symlink is replaced; anything else
+# there is backed up first, like any other conflict, never overwritten.
+link_local_bin() {
+  local target="$1" link="$2" rel="${2#"$HOME"/}"
+  if (( ! DRY_RUN )) && [ ! -x "$target" ]; then
+    warn "not linking ~/$rel: $target is missing"
+    return 0
   fi
+  if [ -L "$link" ] && [ "$(readlink "$link")" = "$target" ]; then
+    ok "already linked: ~/$rel -> $target"
+    return 0
+  fi
+  if [ -e "$link" ] && [ ! -L "$link" ]; then
+    backup_file "$link" "$rel" || return 0
+  fi
+  if run ln -sfn "$target" "$link"; then
+    did "linked ~/$rel -> $target"
+  else
+    warn "could not link ~/$rel to $target"
+  fi
+}
+
+# claude, codex and pi under mise's Node LTS, each installed only if its
+# command is missing from Node LTS's bin dir (decided from disk, so a dry run
+# and a real run agree), plus pnpm through corepack. Omnigent starts
+# claude/codex/pi with a renamed argv[0], which mise's shims reject, so their
+# ~/.local/bin links point straight at Node LTS's bin dir; node, npm, npx,
+# corepack and pnpm link to mise's shims. Every failure is a warning.
+install_agent_clis() {
+  step "Installing agent CLIs (claude, codex, pi) and pnpm"
+  local data lts_bin shims entry package tool changed=0
+  if [ -z "$NODE_NPM" ]; then
+    warn "skipped agent CLIs: no usable mise-managed Node (see above). Once Node works: npm install -g ${AGENT_CLIS[*]%%:*}"
+    return 0
+  fi
+  data="$(mise_data_dir)"
+  lts_bin="$data/installs/node/lts/bin"
+  shims="$data/shims"
+  if (( ! DRY_RUN )) && [ ! -d "$data/installs/node/lts" ]; then
+    warn "skipped agent CLIs: mise has no Node LTS at $data/installs/node/lts, where they are linked from"
+    return 0
+  fi
+  for entry in "${AGENT_CLIS[@]}"; do
+    package="${entry%%:*}" tool="${entry#*:}"
+    if [ -x "$lts_bin/$tool" ]; then
+      ok "$tool already installed ($package)"
+    elif run "$NODE_NPM" install -g "$package"; then
+      changed=1
+      did "installed $tool ($package)"
+    else
+      warn "'npm install -g $package' failed; next run will retry"
+    fi
+  done
+  if [ -x "$lts_bin/pnpm" ]; then
+    ok "pnpm already enabled"
+  elif (( ! DRY_RUN )) && [ ! -x "$lts_bin/corepack" ]; then
+    warn "skipped pnpm: Node LTS has no corepack ($lts_bin/corepack)"
+  # corepack puts pnpm next to the first corepack on PATH; mise exec puts
+  # Node's own bin dir first, so pnpm lands there, not among the shims.
+  elif run "$MISE_BIN" exec -- corepack enable pnpm; then
+    changed=1
+    did "enabled pnpm (corepack enable pnpm)"
+  else
+    warn "'corepack enable pnpm' failed; next run will retry"
+  fi
+  # npm and corepack put their commands in Node's bin dir; reshim gives them shims.
+  for tool in "${NODE_TOOLS[@]}"; do
+    [ -x "$shims/$tool" ] || changed=1
+  done
+  if (( changed )) && ! run "$MISE_BIN" reshim; then
+    warn "'mise reshim' failed after installing agent CLIs; next run will retry"
+  fi
+
+  local dir="$HOME/.local/bin"
+  if in_repo "$dir"; then
+    warn "skipped ~/.local/bin links: $dir resolves into the dotfiles repo"
+    return 0
+  fi
+  if [ ! -d "$dir" ] && ! run mkdir -p "$dir"; then
+    warn "could not create $dir; not linking agent CLIs"
+    return 0
+  fi
+  for entry in "${AGENT_CLIS[@]}"; do
+    link_local_bin "$lts_bin/${entry#*:}" "$dir/${entry#*:}"
+  done
+  for tool in "${NODE_TOOLS[@]}"; do
+    link_local_bin "$shims/$tool" "$dir/$tool"
+  done
 }
 
 # npm settings, only through the mise-managed npm.
@@ -1135,10 +1219,13 @@ install_debian() {
     fzf \
     bat \
     xclip \
+    tmux \
     shellcheck \
     openjdk-21-jdk \
     zsh-autosuggestions \
     zsh-syntax-highlighting
+  # No gitleaks: Ubuntu 24.04's package is 8.16.0, and dotfiles' pre-commit
+  # hook needs >= 8.20.0 (it skips the scan with a warning without one).
 
   step "Installing gh CLI"
   if cmd_exists gh; then
@@ -1169,7 +1256,7 @@ install_debian() {
     did "installed mise"
   fi
   install_node
-  install_claude
+  install_agent_clis
   install_salesforce
   install_bun
 
@@ -1340,7 +1427,7 @@ install_atomic() {
   install_brew_formulae
 
   install_node
-  install_claude
+  install_agent_clis
   install_salesforce
   install_bun
 
