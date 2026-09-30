@@ -64,6 +64,8 @@ LAYERED_PACKAGES=(
   ghostty # no Flatpak exists and the Homebrew formula is macOS-only; Terra (enabled on Bazzite) packages it
 )
 
+DEFAULT_TERMINAL=0
+XDG_CURRENT_DESKTOP="${XDG_CURRENT_DESKTOP:-}"
 DRY_RUN=0
 BREW_MISSING=0
 BACKUPS=()
@@ -825,6 +827,80 @@ gitconfig_conflicts() {
   ! in_repo "$a"
 }
 
+# Only Bazzite's GNOME session opts into the Linux terminal preference.
+prepare_default_terminal() {
+  grep -Eq '^ID=("bazzite"|bazzite)$' "$OS_RELEASE_FILE" || return 0
+  if [[ ":${XDG_CURRENT_DESKTOP^^}:" != *:GNOME:* ]]; then
+    warn "skipped default terminal: GNOME desktop is absent"
+    return 0
+  fi
+  if ! cmd_exists ghostty; then
+    warn "skipped default terminal: Ghostty is not available (re-run after reboot if layered)"
+    return 0
+  fi
+  STOW_PACKAGES+=(xdg)
+  DEFAULT_TERMINAL=1
+}
+
+configure_default_terminal() {
+  (( DEFAULT_TERMINAL )) || return 0
+  local schema=org.gnome.settings-daemon.plugins.media-keys
+  local custom=org.gnome.settings-daemon.plugins.media-keys.custom-keybinding
+  local base=/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings
+  local schemas relocatable raw remaining path binding command i list
+  local -a paths=()
+  if ! cmd_exists gsettings || ! schemas="$(gsettings list-schemas)" ||
+     ! relocatable="$(gsettings list-relocatable-schemas)" ||
+     ! grep -Fxq "$schema" <<<"$schemas" || ! grep -Fxq "$custom" <<<"$relocatable"; then
+    warn "skipped terminal shortcut: gsettings/GNOME schemas are absent"
+    return 0
+  fi
+  if ! raw="$(gsettings get "$schema" custom-keybindings)"; then
+    warn "skipped terminal shortcut: cannot read GNOME custom keybindings"
+    return 0
+  fi
+  # Parse GVariant's array of object paths without eval. Reject unfamiliar
+  # output instead of risking replacement of an existing custom binding list.
+  remaining="${raw#@as }"
+  local array_re="^\[([[:space:]]*'(/[A-Za-z0-9_/-]+/)'[[:space:]]*,?)*[[:space:]]*\]$"
+  local path_re="'(/[A-Za-z0-9_/-]+/)'"
+  if [[ ! "$remaining" =~ $array_re ]]; then
+    warn "skipped terminal shortcut: unrecognised custom keybinding list"
+    return 0
+  fi
+  while [[ "$remaining" =~ $path_re ]]; do
+    path="${BASH_REMATCH[1]}"
+    paths+=("$path")
+    remaining="${remaining#*"${BASH_REMATCH[0]}"}"
+  done
+  for path in "${paths[@]}"; do
+    if ! binding="$(gsettings get "$custom:$path" binding)"; then
+      warn "skipped terminal shortcut: cannot read binding at $path"
+      return 0
+    fi
+    if [ "$binding" = "'<Control><Alt>t'" ]; then
+      command="$(gsettings get "$custom:$path" command)" || return 1
+      if [ "$command" != "'ghostty --gtk-single-instance=true'" ]; then
+        run gsettings set "$custom:$path" command "'ghostty --gtk-single-instance=true'"
+      else
+        ok "Ctrl+Alt+T already opens Ghostty"
+      fi
+      return 0
+    fi
+  done
+  i=0
+  while [[ " ${paths[*]} " == *" $base/custom$i/ "* ]]; do i=$((i + 1)); done
+  path="$base/custom$i/"
+  run gsettings set "$custom:$path" name "'Terminal'"
+  run gsettings set "$custom:$path" binding "'<Control><Alt>t'"
+  run gsettings set "$custom:$path" command "'ghostty --gtk-single-instance=true'"
+  paths+=("$path")
+  list="["
+  for path in "${paths[@]}"; do list+="'$path', "; done
+  list="${list%, }]"
+  run gsettings set "$schema" custom-keybindings "$list"
+}
+
 apply_dotfiles() {
   step "Cloning and applying dotfiles"
   if [ ! -d "$HOME_PROJECTS_DIR" ]; then
@@ -833,13 +909,14 @@ apply_dotfiles() {
   clone_if_absent "$DOTFILES_REPO" "$DOTFILES_DIR"
   if [ ! -d "$DOTFILES_DIR" ]; then
     # Only reachable under --dry-run: conflicts are checked once cloned.
-    run stow --dir="$DOTFILES_DIR" --target="$HOME" --restow "${STOW_PACKAGES[@]}"
+    run stow --no-folding --dir="$DOTFILES_DIR" --target="$HOME" --restow "${STOW_PACKAGES[@]}"
     GIT_STOWED=1
     return 0
   fi
 
   cd "$DOTFILES_DIR"
   local pkg
+  local -a stow_flags
   for pkg in "${STOW_PACKAGES[@]}"; do
     if [ ! -d "$DOTFILES_DIR/$pkg" ]; then
       warn "dotfiles has no '$pkg' package — skipping"
@@ -854,7 +931,9 @@ apply_dotfiles() {
       continue
     fi
     # Never --adopt: that would pull existing files into the dotfiles repo.
-    if run stow --dir="$DOTFILES_DIR" --target="$HOME" --restow "$pkg"; then
+    stow_flags=()
+    if [ "$pkg" = xdg ]; then stow_flags+=(--no-folding); fi
+    if run stow "${stow_flags[@]}" --dir="$DOTFILES_DIR" --target="$HOME" --restow "$pkg"; then
       if [ "$pkg" = git ]; then GIT_STOWED=1; fi
       did "stowed $pkg"
     else
@@ -1138,7 +1217,9 @@ install_atomic() {
   ok "telemetry disabled"
 
   setup_ssh
+  prepare_default_terminal
   apply_dotfiles
+  configure_default_terminal
   configure_git
 
   step "Login shell"
