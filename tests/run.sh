@@ -474,13 +474,22 @@ mise_node_fixture() { # mise_node_fixture [PIN] [INSTALLED_VERSION]
   sandboxed "$STATE/node-install" "${2:-${1:-lts}}"
 }
 
+# True if the first line of $OUT matching $1 comes before the first matching $2.
+logged_before_out() {
+  local a b
+  a="$(grep -nE -m1 -- "$1" <<<"$OUT" | cut -d: -f1)"; b="$(grep -nE -m1 -- "$2" <<<"$OUT" | cut -d: -f1)"
+  [ -n "$a" ] && [ -n "$b" ] && [ "$b" -gt "$a" ]
+}
+
 # Line number of the first log entry matching $1 (0 if none).
 log_line() { local n; n="$(grep -nE -m1 -- "$1" "$LOG" | cut -d: -f1)"; echo "${n:-0}"; }
 # True if the first match of $1 is logged before the first match of $2.
 logged_before() { local a b; a="$(log_line "$1")"; b="$(log_line "$2")"; [ "$a" -gt 0 ] && [ "$b" -gt "$a" ]; }
 
 AGENT_TOOLS=(claude codex pi)
-NODE_TOOLS=(node npm npx corepack pnpm)
+# Linked straight into Node LTS: the agent CLIs and pnpm. The rest go to shims.
+LTS_LINKED=(claude codex pi pnpm)
+NODE_TOOLS=(node npm npx corepack)
 
 # The agent CLIs and pnpm installed under mise's Node LTS, reshimmed, and
 # linked from ~/.local/bin, as a successful run leaves them. Needs
@@ -493,7 +502,7 @@ agent_clis_fixture() {
   done
   sandboxed "$STATE/node-install" --reshim
   mkdir -p "$HOME/.local/bin"
-  for t in "${AGENT_TOOLS[@]}"; do ln -s "$data/installs/node/lts/bin/$t" "$HOME/.local/bin/$t"; done
+  for t in "${LTS_LINKED[@]}"; do ln -s "$data/installs/node/lts/bin/$t" "$HOME/.local/bin/$t"; done
   for t in "${NODE_TOOLS[@]}"; do ln -s "$data/shims/$t" "$HOME/.local/bin/$t"; done
 }
 
@@ -2655,6 +2664,46 @@ test_bin_absolute_links() {
   evict_scenario stub
   teardown
 
+  local repo
+  # Only a fold into the package's own directory is evicted from: a real
+  # ~/bin (its links live in HOME, not the repo) is left as it is, and so is
+  # an absolute link the package itself holds (stow reports that one).
+  setup "bin: real ~/bin with an absolute link (no eviction)"
+  bazzite
+  dotfiles_fixture
+  repo="$HOME/Projects/Home/dotfiles"
+  mkdir -p "$HOME/bin"
+  ln -s /nonexistent/external "$HOME/bin/installer-link"
+  ln -s /nonexistent/in-package "$repo/bin/bin/package-link"
+  run_linux --dry-run
+  check "dry run plans no move" lacks "$OUT" "back up ~/bin/|absolute symlink ~/bin/"
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "nothing moved" lacks "$OUT" "back(ed)? up ~/bin/|absolute symlink ~/bin/"
+  check "the link is untouched" [ "$(readlink "$HOME/bin/installer-link")" = /nonexistent/external ]
+  check "the package's own link stays in the repo" [ "$(readlink "$repo/bin/bin/package-link")" = /nonexistent/in-package ]
+  check "stow's refusal is reported, not hidden" has "$OUT" "stow failed for bin"
+  teardown
+
+  # ~/bin linked to some other directory of the repo (not bin's own): not a
+  # fold of this package, so nothing in it is moved.
+  setup "bin: ~/bin linked to another repo dir (no eviction)"
+  bazzite
+  dotfiles_fixture
+  repo="$HOME/Projects/Home/dotfiles"
+  mkdir -p "$repo/elsewhere/bin"
+  ln -s /nonexistent/external "$repo/elsewhere/bin/installer-link"
+  ln -s /nonexistent/in-package "$repo/bin/bin/package-link"
+  ln -s Projects/Home/dotfiles/elsewhere/bin "$HOME/bin"
+  run_linux --dry-run
+  check "dry run plans no move" lacks "$OUT" "back up ~/bin/|absolute symlink ~/bin/"
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "nothing moved" lacks "$OUT" "back(ed)? up ~/bin/|absolute symlink ~/bin/"
+  check "the link stays in the other dir" [ "$(readlink "$repo/elsewhere/bin/installer-link")" = /nonexistent/external ]
+  check "the package's own link stays in the repo" [ "$(readlink "$repo/bin/bin/package-link")" = /nonexistent/in-package ]
+  teardown
+
   # The same against GNU Stow itself, when there is one: LAPTOP_TEST_REAL_STOW,
   # or stow in /usr/bin or /bin (never Homebrew's unless named). It only reads
   # the sandbox's dotfiles and writes its HOME.
@@ -2677,10 +2726,11 @@ test_bin_absolute_links() {
 # ── Tests: agent CLIs and ~/.local/bin links ─────────────────────────────────
 
 # Links a fresh run must leave: claude/codex/pi straight into Node LTS's bin
-# dir (Omnigent's renamed argv[0] breaks mise shims), Node's own tools to shims.
+# dir (Omnigent's renamed argv[0] breaks mise shims), and pnpm too (it is only
+# under Node LTS, and a shim follows the pin); node/npm/npx/corepack to shims.
 agent_links_ok() {
   local data="$HOME/.local/share/mise" t
-  for t in "${AGENT_TOOLS[@]}"; do
+  for t in "${LTS_LINKED[@]}"; do
     [ "$(readlink "$HOME/.local/bin/$t")" = "$data/installs/node/lts/bin/$t" ] && [ -x "$HOME/.local/bin/$t" ] || return 1
   done
   for t in "${NODE_TOOLS[@]}"; do
@@ -2705,6 +2755,8 @@ test_agent_clis() {
     check "dry run plans claude's link into Node LTS" has "$OUT" "\[dry-run\] ln -sfn $data/installs/node/lts/bin/claude $HOME/.local/bin/claude$"
     check "dry run plans node's link to its shim" has "$OUT" "\[dry-run\] ln -sfn $data/shims/node $HOME/.local/bin/node$"
     check "dry run plans 8 links" [ "$(grep -c '\[dry-run\] ln -sfn' <<<"$OUT")" -eq 8 ]
+    check "dry run plans pnpm's link into Node LTS" has "$OUT" "\[dry-run\] ln -sfn $data/installs/node/lts/bin/pnpm $HOME/.local/bin/pnpm$"
+    check "says Node LTS may be downloaded, once, before the installs" [ "$(grep -c "note: 'mise exec node@lts' may download and install Node LTS first" <<<"$OUT")" -eq 1 ] && logged_before_out "may download and install Node LTS" "node@lts -- npm install -g"
     check "dry run changes nothing" [ "$before" = "$(home_snapshot)" ]
     check "dry run never mutates" log_lacks "$MUTATING"
     run_linux
@@ -2726,6 +2778,7 @@ test_agent_clis() {
     check "re-run installs nothing with npm" log_lacks 'npm install'
     check "re-run does not run corepack" log_lacks 'corepack'
     check "re-run does not reshim" log_lacks '^mise reshim'
+    check "re-run has no Node LTS download note" lacks "$OUT" "may download and install Node LTS"
     check "re-run reports the links" has "$OUT" "already linked: ~/.local/bin/claude -> $data/installs/node/lts/bin/claude"
     check "re-run leaves the links alone" [ "$links_before" = "$(ls -l "$HOME/.local/bin")" ]
     teardown
@@ -2832,6 +2885,8 @@ test_agent_clis() {
   check "every ~/.local/bin link is right" agent_links_ok
   check "no missing-target warnings" lacks "$OUT" "not linking"
   check "pin unchanged" [ "$conf_before" = "$(cat "$HOME/.config/mise/config.toml")" ]
+  check ".local/bin/pnpm runs under the Node 20 pin" sandboxed "$HOME/.local/bin/pnpm" --version
+  check ".local/bin/claude runs under the Node 20 pin" sandboxed "$HOME/.local/bin/claude" --version
   : > "$LOG"
   run_linux
   check "re-run installs nothing with npm" log_lacks 'npm install'
@@ -2862,6 +2917,21 @@ test_agent_clis() {
   check "installed with the new LTS's npm" log_has '^mise-26.0.0-npm install -g @anthropic-ai/claude-code$'
   check "reshim after the reinstall" log_has '^mise reshim$'
   check "every ~/.local/bin link is right" agent_links_ok
+  teardown
+
+  # Earlier versions of this change linked pnpm to its shim: a symlink, so
+  # it is retargeted into Node LTS, not backed up.
+  setup "agent CLIs: old pnpm link to the shim"
+  bazzite
+  dotfiles_fixture
+  all_done_fixture
+  data="$HOME/.local/share/mise"
+  ln -sfn "$data/shims/pnpm" "$HOME/.local/bin/pnpm"
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "pnpm link retargeted into Node LTS" [ "$(readlink "$HOME/.local/bin/pnpm")" = "$data/installs/node/lts/bin/pnpm" ]
+  check "nothing backed up" lacks "$OUT" "back(ed)? up ~/.local/bin"
+  check "no Node LTS installs" log_lacks 'node@lts -- '
   teardown
 
   setup "agent CLIs: pnpm shim without pnpm in Node LTS"

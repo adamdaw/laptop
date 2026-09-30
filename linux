@@ -428,8 +428,21 @@ AGENT_CLIS=(
   @openai/codex:codex
   @earendil-works/pi-coding-agent:pi
 )
-# Node's own tools, linked from ~/.local/bin to mise's shims.
-NODE_TOOLS=(node npm npx corepack pnpm)
+# Node's own tools, linked from ~/.local/bin to mise's shims. (pnpm is not one:
+# it is enabled under Node LTS only, so it is linked there, like the CLIs.)
+NODE_TOOLS=(node npm npx corepack)
+
+# Run a command with Node LTS first on PATH (`mise exec node@lts`), or only
+# print it under --dry-run. The first call says that mise may download Node
+# LTS first (when its lts isn't installed, or a newer LTS is out).
+LTS_NOTED=0
+run_lts() {
+  if (( ! LTS_NOTED )); then
+    printf "  \033[2mnote:\033[0m 'mise exec node@lts' may download and install Node LTS first\n"
+    LTS_NOTED=1
+  fi
+  run "$MISE_BIN" exec node@lts -- "$@"
+}
 
 # Link $2 (in ~/.local/bin) to $1, if $1 and every further argument (what the
 # link needs to work) exist. Only a symlink is replaced; anything else there is
@@ -465,12 +478,12 @@ link_local_bin() {
 # config pins (never changed here), so install, check and links all use
 # installs/node/lts. Omnigent starts
 # claude/codex/pi with a renamed argv[0], which mise's shims reject, so their
-# ~/.local/bin links point straight at Node LTS's bin dir; node, npm, npx,
-# corepack and pnpm link to mise's shims. Every failure is a warning.
+# ~/.local/bin links point straight at Node LTS's bin dir, as pnpm's does (a
+# shim follows the pin, whose node may have no pnpm); node, npm, npx and
+# corepack link to mise's shims. Every failure is a warning.
 install_agent_clis() {
   step "Installing agent CLIs (claude, codex, pi) and pnpm"
   local data lts_bin shims entry package tool changed=0
-  local -a lts
   if [ -z "$NODE_NPM" ]; then
     warn "skipped agent CLIs: no usable mise-managed Node (see above). Once Node works: npm install -g ${AGENT_CLIS[*]%%:*}"
     return 0
@@ -482,12 +495,11 @@ install_agent_clis() {
     warn "skipped agent CLIs: mise has no Node LTS at $data/installs/node/lts, where they are linked from"
     return 0
   fi
-  lts=("$MISE_BIN" exec node@lts --)
   for entry in "${AGENT_CLIS[@]}"; do
     package="${entry%%:*}" tool="${entry#*:}"
     if [ -x "$lts_bin/$tool" ]; then
       ok "$tool already installed ($package)"
-    elif run "${lts[@]}" npm install -g "$package"; then
+    elif run_lts npm install -g "$package"; then
       changed=1
       did "installed $tool ($package)"
     else
@@ -500,7 +512,7 @@ install_agent_clis() {
     # Node 25 and later no longer ship corepack: get it from npm. (Only known
     # once Node LTS is installed; a dry run on a fresh machine can't tell.)
     if [ -d "$lts_bin" ] && [ ! -x "$lts_bin/corepack" ]; then
-      if run "${lts[@]}" npm install -g corepack; then
+      if run_lts npm install -g corepack; then
         changed=1
         did "installed corepack (Node LTS has none)"
       else
@@ -511,7 +523,7 @@ install_agent_clis() {
       warn "skipped pnpm: Node LTS has no corepack ($lts_bin/corepack)"
     # corepack puts pnpm next to the first corepack on PATH; mise exec puts
     # Node LTS's bin dir first, so pnpm lands there, not among the shims.
-    elif run "${lts[@]}" corepack enable pnpm; then
+    elif run_lts corepack enable pnpm; then
       changed=1
       did "enabled pnpm (corepack enable pnpm)"
     else
@@ -535,8 +547,8 @@ install_agent_clis() {
     warn "could not create $dir; not linking agent CLIs"
     return 0
   fi
-  for entry in "${AGENT_CLIS[@]}"; do
-    link_local_bin "$lts_bin/${entry#*:}" "$dir/${entry#*:}"
+  for tool in "${AGENT_CLIS[@]#*:}" pnpm; do
+    link_local_bin "$lts_bin/$tool" "$dir/$tool"
   done
   for tool in "${NODE_TOOLS[@]}"; do
     # A shim alone proves nothing: it runs for any installed version.
