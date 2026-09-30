@@ -25,9 +25,9 @@ CURRENT=""
 CORE_UTILS=(bash env cat grep sed find realpath dirname basename date mkdir mv cp rm ln chmod head tr sort mktemp touch readlink ls wc python3 sha256sum)
 
 ALL_FORMULAE=(git git-delta stow neovim tmux jq ripgrep fd fzf bat wget gh starship zsh zsh-autosuggestions zsh-syntax-highlighting uv mise openjdk@21 lazygit tree-sitter-cli shellcheck markdownlint-cli2)
-ALL_PACKAGES=(agy applications bash bat bin ghostty git nvim render-url ripgrep ssh starship tmux zsh)
+ALL_PACKAGES=(agy applications bash bat bin claude ghostty git nvim render-url ripgrep ssh starship tmux zsh)
 # Stowed with --no-folding (as the script does).
-NO_FOLD_PACKAGES=(applications render-url)
+NO_FOLD_PACKAGES=(applications claude render-url)
 
 # Calls that would change the machine. None may appear during --dry-run.
 MUTATING='^(sudo|apt-get|chsh|usermod|ujust|ssh-keygen|npm|curl|stow|systemctl|ubuntu-report|unzip|fc-cache)( |$)|^brew install|^rpm-ostree (install|upgrade|reboot)|^flatpak install|^git clone|^git config (--global [^-]|.* --(add|unset|unset-all|replace-all|remove-section|rename-section)( |$))|^mise (use|install|reshim|exec)|^mise-|^gsettings set'
@@ -400,6 +400,9 @@ dotfiles_fixture() {
   echo "// render-url" > "$d/render-url/.local/share/render-url/render-url.mjs"
   echo "#!/bin/sh" > "$d/applications/.local/bin/claude-on-mac"
   echo "[Desktop Entry]" > "$d/applications/.local/share/applications/claude-on-mac.desktop"
+  mkdir -p "$d/claude/.claude/skills/route-local"
+  echo "# dotfiles CLAUDE.md" > "$d/claude/.claude/CLAUDE.md"
+  echo "# route-local" > "$d/claude/.claude/skills/route-local/SKILL.md"
 }
 
 # render-url's dependencies as a successful run leaves them: node_modules
@@ -2112,7 +2115,6 @@ test_render_url() {
   check "stows render-url without folding" has "$OUT" '\[dry-run\] stow --no-folding .* --restow render-url$'
   check "stows applications without folding" has "$OUT" '\[dry-run\] stow --no-folding .* --restow applications$'
   check "folds other packages as before" has "$OUT" '\[dry-run\] stow --dir=.* --restow tmux$'
-  check "never stows claude" lacks "$OUT" '--restow claude$'
   check "plans npm ci through mise exec" has "$OUT" "\[dry-run\] \(cd $ru && mise exec -- npm ci\)$"
   check "plans the documented browser install" has "$OUT" "\[dry-run\] \(cd $ru && mise exec -- npx playwright install chromium\)$"
   check "npm ci planned after stowing render-url" [ "$(grep -n -m1 'restow render-url$' <<<"$OUT" | cut -d: -f1)" -lt "$(grep -n -m1 'npm ci' <<<"$OUT" | cut -d: -f1)" ]
@@ -2296,6 +2298,103 @@ test_render_url() {
   teardown
 }
 
+# The stow commands a preview prints must be exactly the ones a real run runs,
+# per package (folding and --no-folding alike), whether or not the dotfiles
+# repo is cloned yet.
+test_stow_preview_matches_run() {
+  local repo preview_missing preview_cloned ran
+  setup "stow preview matches the real run"
+  bazzite
+  repo="$HOME/Projects/Home/dotfiles"
+  run_linux --dry-run
+  check "missing-repo dry run exits 0" [ "$RC" -eq 0 ]
+  preview_missing="$(sed -n 's/^ *\[dry-run\] \(stow .*\)$/\1/p' <<<"$OUT")"
+  dotfiles_fixture
+  run_linux --dry-run
+  check "cloned-repo dry run exits 0" [ "$RC" -eq 0 ]
+  preview_cloned="$(sed -n 's/^ *\[dry-run\] \(stow .*\)$/\1/p' <<<"$OUT")"
+  : > "$LOG"
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  ran="$(grep '^stow ' "$LOG")"
+  check "run stowed every package" [ "$(grep -c . <<<"$ran")" -eq "${#ALL_PACKAGES[@]}" ]
+  check "run folds tmux" has "$ran" "^stow --dir=$repo --target=$HOME --restow tmux$"
+  check "run does not fold claude" has "$ran" "^stow --no-folding --dir=$repo --target=$HOME --restow claude$"
+  check "missing-repo preview = real run" [ "$preview_missing" = "$ran" ]
+  check "cloned-repo preview = real run" [ "$preview_cloned" = "$ran" ]
+  teardown
+}
+
+# ── Tests: the claude package ────────────────────────────────────────────────
+
+# Claude Code writes sessions, credentials and history under ~/.claude, so the
+# package must never fold ~/.claude (or ~/.claude/skills) into the repo.
+test_claude_package() {
+  local df before repo_before os backups
+  for os in bazzite pop; do
+    setup "claude: $os fresh HOME (no ~/.claude)"
+    if [ "$os" = bazzite ]; then bazzite; else os_release pop "ubuntu debian"; fi
+    dotfiles_fixture
+    df="$HOME/Projects/Home/dotfiles/claude/.claude"
+    before="$(home_snapshot)"
+    run_linux --dry-run
+    check "dry run exits 0" [ "$RC" -eq 0 ]
+    check "plans stowing claude without folding" has "$OUT" '\[dry-run\] stow --no-folding .* --restow claude$'
+    check "dry run changes nothing" [ "$before" = "$(home_snapshot)" ]
+    check "dry run never mutates" log_lacks "$MUTATING"
+    repo_before="$(repo_snapshot)"
+    run_linux
+    check "run exits 0" [ "$RC" -eq 0 ]
+    check ".claude is a real dir" is_real_dir "$HOME/.claude"
+    check ".claude/skills is a real dir" is_real_dir "$HOME/.claude/skills"
+    check "CLAUDE.md is a link" [ -L "$HOME/.claude/CLAUDE.md" ]
+    check "CLAUDE.md resolves into the package" [ "$(realpath "$HOME/.claude/CLAUDE.md")" = "$(realpath "$df/CLAUDE.md")" ]
+    check "route-local skill is stowed" [ "$(realpath "$HOME/.claude/skills/route-local/SKILL.md")" = "$(realpath "$df/skills/route-local/SKILL.md")" ]
+    echo '{"token":"x"}' > "$HOME/.claude/.credentials.json"
+    mkdir -p "$HOME/.claude/skills/new-skill"
+    check "Claude Code's writes stay out of the repo" [ "$repo_before" = "$(repo_snapshot)" ]
+    teardown
+  done
+
+  setup "claude: existing ~/.claude with other content"
+  bazzite
+  dotfiles_fixture
+  mkdir -p "$HOME/.claude/projects/p" "$HOME/.claude/skills/mine"
+  echo '{"token":"x"}' > "$HOME/.claude/.credentials.json"
+  echo '{"session":1}' > "$HOME/.claude/projects/p/s.jsonl"
+  echo "# my skill" > "$HOME/.claude/skills/mine/SKILL.md"
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check ".claude is still a real dir" is_real_dir "$HOME/.claude"
+  check ".claude/skills is still a real dir" is_real_dir "$HOME/.claude/skills"
+  check "credentials untouched" [ "$(cat "$HOME/.claude/.credentials.json")" = '{"token":"x"}' ]
+  check "credentials still a real file" [ ! -L "$HOME/.claude/.credentials.json" ]
+  check "sessions untouched" [ "$(cat "$HOME/.claude/projects/p/s.jsonl")" = '{"session":1}' ]
+  check "own skill untouched" [ "$(cat "$HOME/.claude/skills/mine/SKILL.md")" = "# my skill" ]
+  check "CLAUDE.md is stowed" [ -L "$HOME/.claude/CLAUDE.md" ]
+  check "nothing backed up" lacks "$OUT" "backed up ~/.claude"
+  teardown
+
+  setup "claude: existing real CLAUDE.md is backed up, never adopted"
+  bazzite
+  dotfiles_fixture
+  mkdir -p "$HOME/.claude"
+  echo "# my local CLAUDE.md" > "$HOME/.claude/CLAUDE.md"
+  before="$(home_snapshot)"; repo_before="$(repo_snapshot)"
+  run_linux --dry-run
+  check "dry run plans the backup" has "$OUT" "would back up ~/.claude/CLAUDE.md \("
+  check "dry run changes nothing" [ "$before" = "$(home_snapshot)" ]
+  check "dry run never mutates" log_lacks "$MUTATING"
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  backups="$(find "$HOME/.local/state/laptop/backups" -path '*/.claude/CLAUDE.md' -type f)"
+  check "backed up once" [ "$(grep -c . <<<"$backups")" -eq 1 ]
+  check "backup keeps its contents" [ "$(cat "$backups")" = "# my local CLAUDE.md" ]
+  check "CLAUDE.md is now the stowed link" [ -L "$HOME/.claude/CLAUDE.md" ]
+  check "never adopted into the repo" [ "$repo_before" = "$(repo_snapshot)" ]
+  teardown
+}
+
 # ── Run ──────────────────────────────────────────────────────────────────────
 
 TESTS=(
@@ -2346,6 +2445,8 @@ TESTS=(
   test_git_stub_includes
   test_font_detection
   test_render_url
+  test_claude_package
+  test_stow_preview_matches_run
 )
 
 for t in "${TESTS[@]}"; do

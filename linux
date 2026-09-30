@@ -21,11 +21,12 @@ YUM_REPOS_DIR="${LAPTOP_YUM_REPOS_DIR:-/etc/yum.repos.d}"
 BREW_DIRS="${LAPTOP_BREW_DIRS:-/home/linuxbrew/.linuxbrew $HOME/.linuxbrew}"
 
 # Dotfiles packages to stow (one directory each in the dotfiles repo).
-STOW_PACKAGES=(agy applications bash bat bin ghostty git nvim render-url ripgrep ssh starship tmux zsh)
+STOW_PACKAGES=(agy applications bash bat bin claude ghostty git nvim render-url ripgrep ssh starship tmux zsh)
 # Stowed with --no-folding: their target dirs (~/.local/bin, ~/.local/share/...,
-# ~/.config) must stay real directories, so nothing written there (render-url's
-# node_modules, other apps' files) ever lands in the dotfiles repo.
-NO_FOLD_PACKAGES=(applications render-url xdg)
+# ~/.config, ~/.claude) must stay real directories, so nothing written there
+# (render-url's node_modules, Claude Code's sessions and credentials, other
+# apps' files) ever lands in the dotfiles repo.
+NO_FOLD_PACKAGES=(applications claude render-url xdg)
 
 # Existing files that conflict with a stowed file are moved into a fresh,
 # uniquely named directory under here (created on first use), never adopted.
@@ -911,23 +912,31 @@ configure_default_terminal() {
   run gsettings set "$schema" custom-keybindings "$list"
 }
 
+# Stow one package, or only print the command under --dry-run. The single place
+# the stow command is built, so a preview shows exactly what a real run runs.
+stow_package() {
+  local -a stow_flags=()
+  # Never --adopt: that would pull existing files into the dotfiles repo.
+  if [[ " ${NO_FOLD_PACKAGES[*]} " == *" $1 "* ]]; then stow_flags+=(--no-folding); fi
+  run stow "${stow_flags[@]}" --dir="$DOTFILES_DIR" --target="$HOME" --restow "$1"
+}
+
 apply_dotfiles() {
   step "Cloning and applying dotfiles"
   if [ ! -d "$HOME_PROJECTS_DIR" ]; then
     run mkdir -p "$HOME_PROJECTS_DIR"
   fi
   clone_if_absent "$DOTFILES_REPO" "$DOTFILES_DIR"
+  local pkg
   if [ ! -d "$DOTFILES_DIR" ]; then
     # Only reachable under --dry-run: conflicts are checked once cloned.
-    run stow --no-folding --dir="$DOTFILES_DIR" --target="$HOME" --restow "${STOW_PACKAGES[@]}"
+    for pkg in "${STOW_PACKAGES[@]}"; do stow_package "$pkg"; done
     GIT_STOWED=1
     RENDER_URL_STOWED=1
     return 0
   fi
 
   cd "$DOTFILES_DIR"
-  local pkg
-  local -a stow_flags
   for pkg in "${STOW_PACKAGES[@]}"; do
     if [ ! -d "$DOTFILES_DIR/$pkg" ]; then
       warn "dotfiles has no '$pkg' package — skipping"
@@ -941,10 +950,7 @@ apply_dotfiles() {
       warn "skipped stowing $pkg"
       continue
     fi
-    # Never --adopt: that would pull existing files into the dotfiles repo.
-    stow_flags=()
-    if [[ " ${NO_FOLD_PACKAGES[*]} " == *" $pkg "* ]]; then stow_flags+=(--no-folding); fi
-    if run stow "${stow_flags[@]}" --dir="$DOTFILES_DIR" --target="$HOME" --restow "$pkg"; then
+    if stow_package "$pkg"; then
       if [ "$pkg" = git ]; then GIT_STOWED=1; fi
       if [ "$pkg" = render-url ]; then RENDER_URL_STOWED=1; fi
       did "stowed $pkg"

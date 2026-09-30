@@ -94,7 +94,7 @@ fnm is no longer installed. An existing fnm (`~/.local/share/fnm`, or `fnm` on `
 
 - git: `core.hooksPath`, delta pager, `pull.rebase`, `push.autoSetupRemote`, `init.defaultBranch=main` — identity goes in `~/.laptop.local`
 - SSH: generates `~/.ssh/id_ed25519` if absent
-- Dotfiles: clones your dotfiles repo and stows `agy applications bash bat bin ghostty git nvim render-url ripgrep ssh starship tmux zsh` — update `DOTFILES_REPO` at the top of `linux` to point at yours. `applications`, `render-url` (and `xdg`, see below) are stowed with `--no-folding`, so `~/.local/bin`, `~/.local/share/applications` and `~/.local/share/render-url` stay real directories and nothing written there lands in the repo.
+- Dotfiles: clones your dotfiles repo and stows `agy applications bash bat bin claude ghostty git nvim render-url ripgrep ssh starship tmux zsh` — update `DOTFILES_REPO` at the top of `linux` to point at yours. `applications`, `claude`, `render-url` (and `xdg`, see below) are stowed with `--no-folding`, so `~/.local/bin`, `~/.local/share/applications`, `~/.local/share/render-url`, `~/.claude` and `~/.claude/skills` stay real directories and nothing written there lands in the repo. For `claude` that matters most: Claude Code keeps its sessions, credentials and history in `~/.claude`, so only `CLAUDE.md` and the `route-local` skill are links; an existing `~/.claude/CLAUDE.md` is backed up like any other conflict. `--dry-run` prints each package's stow command exactly as a real run would run it (with or without `--no-folding`), even before the repo is cloned.
 - Shell: sets zsh as the login shell on Ubuntu/Pop!_OS. On Bazzite the login shell stays bash (see below).
 
 ### Dotfiles never use `stow --adopt`
@@ -219,6 +219,8 @@ tests/run.sh
 - mise edge cases: a pin matching no installed version (pin 20, only 22 installed), a non-executable `node`, missing shims restored only by `mise reshim` (and a failing reshim), no `installs/node/lts` link (reconciled on every run), `[tools.node]` tables, unparsed pins (never re-pinned), the reshim that exposes `claude`, `node` outside `[tools]`, a leftover fnm, a global config that resolves into the repo or can't be resolved, and a failing mise, with Claude Code skipped and no `npm` used when Node isn't ready;
 - apt key download or dearmor failures on Pop!_OS;
 - render-url: `npm ci` and `playwright install chromium` through `mise exec` (the stubbed `mise exec` runs the pinned Node's own npm/npx; the stub npx models Playwright's pinned revision and downloads only missing builds). Covered: `npm ci` skipped on re-run while Playwright is still asked, `npm ci` again after a lockfile change, an older cached Chromium, a missing headless shell, a failed browser install retried on the next run, no usable Node, a failing `npm ci` (retried next run), a fold unfolded by `--restow --no-folding` (the stow stub models that), a link still into the repo after stowing, a missing package, and the `--no-folding` stows of `render-url` and `applications`;
+- the claude package on both platforms: a fresh `HOME` gets real `~/.claude` and `~/.claude/skills` directories with only the package's files linked, existing `~/.claude` content is left alone, an existing `CLAUDE.md` is backed up (never adopted), and a dry run changes nothing;
+- the stow commands a dry run prints (with the repo cloned or not) match the real run's, per package;
 - sandbox guards, including brew prefixes and `HOME` that escape the sandbox through a symlink;
 - an rpm-ostree failure.
 
