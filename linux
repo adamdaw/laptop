@@ -431,13 +431,18 @@ AGENT_CLIS=(
 # Node's own tools, linked from ~/.local/bin to mise's shims.
 NODE_TOOLS=(node npm npx corepack pnpm)
 
-# Link $2 (in ~/.local/bin) to $1. Only a symlink is replaced; anything else
-# there is backed up first, like any other conflict, never overwritten.
+# Link $2 (in ~/.local/bin) to $1, if $1 and every further argument (what the
+# link needs to work) exist. Only a symlink is replaced; anything else there is
+# backed up first, like any other conflict, never overwritten.
 link_local_bin() {
-  local target="$1" link="$2" rel="${2#"$HOME"/}"
-  if (( ! DRY_RUN )) && [ ! -x "$target" ]; then
-    warn "not linking ~/$rel: $target is missing"
-    return 0
+  local target="$1" link="$2" rel="${2#"$HOME"/}" path
+  if (( ! DRY_RUN )); then
+    for path in "$target" "${@:3}"; do
+      if [ ! -x "$path" ]; then
+        warn "not linking ~/$rel: $path is missing"
+        return 0
+      fi
+    done
   fi
   if [ -L "$link" ] && [ "$(readlink "$link")" = "$target" ]; then
     ok "already linked: ~/$rel -> $target"
@@ -455,13 +460,17 @@ link_local_bin() {
 
 # claude, codex and pi under mise's Node LTS, each installed only if its
 # command is missing from Node LTS's bin dir (decided from disk, so a dry run
-# and a real run agree), plus pnpm through corepack. Omnigent starts
+# and a real run agree), plus pnpm through corepack. Everything runs with Node
+# LTS's own npm and corepack (`mise exec node@lts`), whatever node mise's
+# config pins (never changed here), so install, check and links all use
+# installs/node/lts. Omnigent starts
 # claude/codex/pi with a renamed argv[0], which mise's shims reject, so their
 # ~/.local/bin links point straight at Node LTS's bin dir; node, npm, npx,
 # corepack and pnpm link to mise's shims. Every failure is a warning.
 install_agent_clis() {
   step "Installing agent CLIs (claude, codex, pi) and pnpm"
   local data lts_bin shims entry package tool changed=0
+  local -a lts
   if [ -z "$NODE_NPM" ]; then
     warn "skipped agent CLIs: no usable mise-managed Node (see above). Once Node works: npm install -g ${AGENT_CLIS[*]%%:*}"
     return 0
@@ -473,11 +482,12 @@ install_agent_clis() {
     warn "skipped agent CLIs: mise has no Node LTS at $data/installs/node/lts, where they are linked from"
     return 0
   fi
+  lts=("$MISE_BIN" exec node@lts --)
   for entry in "${AGENT_CLIS[@]}"; do
     package="${entry%%:*}" tool="${entry#*:}"
     if [ -x "$lts_bin/$tool" ]; then
       ok "$tool already installed ($package)"
-    elif run "$NODE_NPM" install -g "$package"; then
+    elif run "${lts[@]}" npm install -g "$package"; then
       changed=1
       did "installed $tool ($package)"
     else
@@ -486,15 +496,27 @@ install_agent_clis() {
   done
   if [ -x "$lts_bin/pnpm" ]; then
     ok "pnpm already enabled"
-  elif (( ! DRY_RUN )) && [ ! -x "$lts_bin/corepack" ]; then
-    warn "skipped pnpm: Node LTS has no corepack ($lts_bin/corepack)"
-  # corepack puts pnpm next to the first corepack on PATH; mise exec puts
-  # Node's own bin dir first, so pnpm lands there, not among the shims.
-  elif run "$MISE_BIN" exec -- corepack enable pnpm; then
-    changed=1
-    did "enabled pnpm (corepack enable pnpm)"
   else
-    warn "'corepack enable pnpm' failed; next run will retry"
+    # Node 25 and later no longer ship corepack: get it from npm. (Only known
+    # once Node LTS is installed; a dry run on a fresh machine can't tell.)
+    if [ -d "$lts_bin" ] && [ ! -x "$lts_bin/corepack" ]; then
+      if run "${lts[@]}" npm install -g corepack; then
+        changed=1
+        did "installed corepack (Node LTS has none)"
+      else
+        warn "'npm install -g corepack' failed; next run will retry"
+      fi
+    fi
+    if (( ! DRY_RUN )) && [ ! -x "$lts_bin/corepack" ]; then
+      warn "skipped pnpm: Node LTS has no corepack ($lts_bin/corepack)"
+    # corepack puts pnpm next to the first corepack on PATH; mise exec puts
+    # Node LTS's bin dir first, so pnpm lands there, not among the shims.
+    elif run "${lts[@]}" corepack enable pnpm; then
+      changed=1
+      did "enabled pnpm (corepack enable pnpm)"
+    else
+      warn "'corepack enable pnpm' failed; next run will retry"
+    fi
   fi
   # npm and corepack put their commands in Node's bin dir; reshim gives them shims.
   for tool in "${NODE_TOOLS[@]}"; do
@@ -517,7 +539,8 @@ install_agent_clis() {
     link_local_bin "$lts_bin/${entry#*:}" "$dir/${entry#*:}"
   done
   for tool in "${NODE_TOOLS[@]}"; do
-    link_local_bin "$shims/$tool" "$dir/$tool"
+    # A shim alone proves nothing: it runs for any installed version.
+    link_local_bin "$shims/$tool" "$dir/$tool" "$lts_bin/$tool"
   done
 }
 
@@ -953,6 +976,28 @@ resolve_conflict() {
   backup_file "$a" "$rel" || return 1
 }
 
+# A --no-folding package stowed before with folding still has a directory in
+# $HOME that is a link to its own directory in the repo, so whatever was
+# written there (an installer's links in ~/bin, say) is in the package. Stow
+# refuses to unfold a package holding absolute symlinks ("source is an
+# absolute symlink") and leaves the fold, so move those out to the backup dir
+# first, like any other conflict (never deleted). Returns non-zero if one
+# could not be moved.
+evict_absolute_links() {
+  local pkg_dir="$DOTFILES_DIR/$1" dir rel link sub
+  [[ " ${NO_FOLD_PACKAGES[*]} " == *" $1 "* ]] || return 0
+  while IFS= read -r -d '' dir; do
+    rel="${dir#"$pkg_dir"/}"
+    [ -L "$HOME/$rel" ] && [ "$(realpath "$HOME/$rel" 2>/dev/null)" = "$(realpath "$dir")" ] || continue
+    while IFS= read -r -d '' link; do
+      [[ "$(readlink "$link")" == /* ]] || continue
+      sub="$rel/${link#"$dir"/}"
+      backup_file "$HOME/$sub" "$sub" || return 1
+      warn "absolute symlink ~/$sub, written into the repo through the old ~/$rel fold, goes to the backup dir so ~/$rel can be unfolded; move it back into ~/$rel if you still need it"
+    done < <(find "$dir" -type l -print0)
+  done < <(find "$pkg_dir" -mindepth 1 -type d -print0)
+}
+
 # Back up every file in $HOME that a package would be stowed over. Returns
 # non-zero if any conflict could not be resolved (the package is then skipped).
 backup_conflicts() {
@@ -1082,7 +1127,7 @@ apply_dotfiles() {
       warn "skipped stowing $pkg"
       continue
     fi
-    if ! backup_conflicts "$pkg"; then
+    if ! evict_absolute_links "$pkg" || ! backup_conflicts "$pkg"; then
       warn "skipped stowing $pkg"
       continue
     fi
