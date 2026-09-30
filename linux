@@ -367,6 +367,58 @@ install_node() {
   fi
 }
 
+# Optional Salesforce tools. All execution goes through mise's selected Node.
+install_salesforce() {
+  step "Installing Salesforce tools"
+  local data package plugins
+  local -a missing=()
+  data="$(mise_data_dir)"
+  if [ -z "$NODE_NPM" ]; then
+    warn "skipped Salesforce tools: no usable mise-managed Node; fix Node and re-run"
+    return 0
+  fi
+  if (( ! DRY_RUN )) && ! "$MISE_BIN" exec -- node --version >/dev/null 2>&1; then
+    warn "skipped Salesforce tools: mise-managed Node is unusable; re-run once fixed"
+    return 0
+  fi
+  for package in @salesforce/cli @salesforce/lwc-language-server; do
+    # Dry-run must never execute mise, even for inspection (it writes state).
+    if (( DRY_RUN )); then
+      missing+=("$package")
+    elif "$MISE_BIN" exec -- npm list -g --depth=0 "$package" >/dev/null 2>&1; then
+      ok "$package already installed"
+    else
+      missing+=("$package")
+    fi
+  done
+  if (( ${#missing[@]} )); then
+    if ! run "$MISE_BIN" exec -- npm install -g "${missing[@]}"; then
+      warn "Salesforce npm install failed; next run will retry"
+      return 0
+    fi
+  fi
+  # Repair missing shims too, without upgrading installed packages.
+  if (( ${#missing[@]} )) || [ ! -x "$data/shims/sf" ] || [ ! -x "$data/shims/lwc-language-server" ]; then
+    if ! run "$MISE_BIN" reshim; then
+      warn "Salesforce mise reshim failed; next run will retry"
+      return 0
+    fi
+  fi
+  if (( ! DRY_RUN )); then
+    if ! plugins="$("$MISE_BIN" exec -- sf plugins 2>/dev/null)"; then
+      warn "Salesforce plugin listing failed; next run will retry"
+      return 0
+    fi
+    if grep -Eq '^[[:space:]]*(@salesforce/plugin-)?code-analyzer[[:space:]]' <<<"$plugins"; then
+      ok "Salesforce code-analyzer already installed"
+      return 0
+    fi
+  fi
+  if ! run "$MISE_BIN" exec -- sf plugins install code-analyzer; then
+    warn "Salesforce code-analyzer install failed (requires Java 11+); next run will retry"
+  fi
+}
+
 install_claude() {
   step "Installing Claude Code"
   if cmd_exists claude; then
@@ -1112,6 +1164,7 @@ install_debian() {
   fi
   install_node
   install_claude
+  install_salesforce
   install_bun
 
   step "Installing uv"
@@ -1282,6 +1335,7 @@ install_atomic() {
 
   install_node
   install_claude
+  install_salesforce
   install_bun
 
   install_font

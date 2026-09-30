@@ -109,8 +109,25 @@ tool() { # tool PATH LABEL
   cat > "$1" <<TOOL
 #!@BASH@
 printf '%s\n' "mise-$2 \$*" >> "\$STUB_LOG"
-if [ "\$*" = "install -g @anthropic-ai/claude-code" ]; then
+if [ "\${0##*/}" = node ] && [ -f "\$STUB_STATE/sf-node-fail" ]; then
+  exit 1
+elif [ "\$*" = "install -g @anthropic-ai/claude-code" ]; then
   printf '#!@BASH@\nexit 0\n' > "\${0%/*}/claude"; chmod +x "\${0%/*}/claude"
+elif [ "\${0##*/}" = npm ] && [ "\${1:-}" = list ]; then
+  [ -f "\$STUB_STATE/\${!#}" ]; exit \$?
+elif [ "\${0##*/}" = npm ] && [ "\${1:-}" = install ]; then
+  [ ! -f "\$STUB_STATE/sf-npm-fail" ] || exit 1
+  for pkg in "\$@"; do
+    case "\$pkg" in
+      @salesforce/*)
+        mkdir -p "\$STUB_STATE/@salesforce"; touch "\$STUB_STATE/\$pkg"
+        if [ "\$pkg" = @salesforce/cli ]; then
+          cp "\$STUB_STATE/sf-tool" "\${0%/*}/sf"
+        else
+          cp "\$STUB_STATE/sf-tool" "\${0%/*}/lwc-language-server"
+        fi ;;
+    esac
+  done
 elif [ "\${0##*/} \$*" = "npm ci" ]; then
   [ "\${STUB_NPM_CI_RC:-0}" = 0 ] || exit "\$STUB_NPM_CI_RC"
   rm -rf node_modules; mkdir -p node_modules/playwright
@@ -288,6 +305,14 @@ setup() { # setup TEST_NAME
   stub systemctl; stub unzip; stub fc-cache
   # A competing npm on PATH: the script must only use mise's. It fails, loudly.
   stub npm 'echo "stub: PATH npm used instead of mise-managed npm" >&2; exit 97'
+  stub sf '
+[ ! -f "$STUB_STATE/sf-list-fail" ] || exit 1
+if [ "$*" = "plugins" ]; then
+  [ ! -f "$STUB_STATE/sf-plugin" ] || echo "@salesforce/plugin-code-analyzer 5.16.0"
+elif [ "$*" = "plugins install code-analyzer" ]; then
+  [ ! -f "$STUB_STATE/sf-plugin-fail" ] || exit 1
+  touch "$STUB_STATE/sf-plugin"
+fi'; mv "$STUBS/sf" "$STATE/sf-tool"
   write_node_install
   stub sh '[ -p /dev/stdin ] && cat > /dev/null; exit 0' # `curl ... | sh` installers
   stub curl 'if [ -n "${STUB_CURL_FAIL:-}" ] && [[ "$*" == *"$STUB_CURL_FAIL"* ]]; then exit 22; fi; exit "${STUB_CURL_RC:-0}"'
@@ -1293,7 +1318,7 @@ test_bazzite_run_and_rerun() {
   check "re-run does not regenerate the SSH key" log_lacks '^ssh-keygen'
   check "re-run has no stow failures" lacks "$OUT" "stow failed"
   check "re-run does not re-pin, install or reshim node" log_lacks '^mise (use|install|reshim)'
-  check "re-run runs mise only for Playwright's own check" [ "$(log_count '^mise ')" -eq "$(log_count '^mise exec -- npx playwright install chromium$')" ]
+  check "re-run runs mise only for Playwright's own check" [ "$(log_count '^mise ')" -eq "$(log_count '^mise exec -- (npx playwright install chromium|node --version|npm list -g --depth=0 @salesforce/.*|sf plugins)$')" ]
   check "re-run reports node installed via mise" has "$OUT" "node already installed via mise"
   check "re-run leaves mise config unchanged" [ "$mise_conf_before" = "$(cat "$HOME/.config/mise/config.toml")" ]
   check "re-run finds claude, installs nothing with npm" log_lacks 'npm install'
@@ -1391,7 +1416,7 @@ test_debian_run_and_rerun() {
   check "re-run skips mise install" has "$OUT" "mise already installed"
   check "re-run adds no mise apt repo" log_lacks 'mise\.list|mise-archive-keyring|apt-get install -y mise'
   check "re-run does not re-pin, install or reshim node" log_lacks '^mise (use|install|reshim)'
-  check "re-run runs mise only for Playwright's own check" [ "$(log_count '^mise ')" -eq "$(log_count '^mise exec -- npx playwright install chromium$')" ]
+  check "re-run runs mise only for Playwright's own check" [ "$(log_count '^mise ')" -eq "$(log_count '^mise exec -- (npx playwright install chromium|node --version|npm list -g --depth=0 @salesforce/.*|sf plugins)$')" ]
   check "re-run leaves mise config unchanged" [ "$conf_before" = "$(cat "$HOME/.config/mise/config.toml")" ]
   teardown
 }
@@ -2228,7 +2253,7 @@ test_render_url() {
   STUB_MISE_RC=1 run_linux
   check "run exits 0" [ "$RC" -eq 0 ]
   check "warns and skips" has "$OUT" "skipped render-url dependencies: no usable mise-managed Node"
-  check "never runs npm" log_lacks '^mise exec|^npm |-npm ci'
+  check "never runs npm" log_lacks '^mise exec -- (npm ci|npx)|^npm |-npm ci'
   check "no node_modules" [ ! -e "$HOME/$RU_DIR_REL/node_modules" ]
   teardown
 
@@ -2269,7 +2294,7 @@ test_render_url() {
   run_linux
   check "run exits 0" [ "$RC" -eq 0 ]
   check "warns about the link" has "$OUT" "skipped render-url dependencies: .* resolves into the dotfiles repo"
-  check "never runs npm" log_lacks '^mise exec'
+  check "never runs npm" log_lacks '^mise exec -- (npm ci|npx)'
   check "nothing written into the repo" [ "$repo_before" = "$(repo_snapshot)" ]
   teardown
 
@@ -2281,7 +2306,7 @@ test_render_url() {
   check "run exits 0" [ "$RC" -eq 0 ]
   check "warns the package is missing" has "$OUT" "dotfiles has no 'render-url' package"
   check "no render-url step" lacks "$OUT" "render-url dependencies"
-  check "never runs npm ci" log_lacks '^mise exec'
+  check "never runs npm ci" log_lacks '^mise exec -- (npm ci|npx)'
   teardown
 
   setup "render-url: pop run"
@@ -2296,9 +2321,99 @@ test_render_url() {
   teardown
 }
 
+# Salesforce cases use the same guarded whole-script sandbox as platform tests.
+salesforce_setup() {
+  setup "Salesforce $1"
+  if [ "$1" = debian ]; then os_release pop ubuntu; else bazzite; fi
+  dotfiles_fixture
+}
+
+test_salesforce_platforms() {
+  local platform
+  for platform in atomic debian; do
+    salesforce_setup "$platform"
+    run_linux
+    check "Salesforce install succeeded" [ "$RC" -eq 0 ]
+    check "both packages via mise" log_has '^mise exec -- npm install -g @salesforce/cli @salesforce/lwc-language-server$'
+    check "plugin via mise" log_has '^mise exec -- sf plugins install code-analyzer$'
+    check "after Node" logged_before '^mise use -g node@lts$' '^mise exec -- npm install -g @salesforce'
+    check "sf shim exists" [ -x "$HOME/.local/share/mise/shims/sf" ]
+    : > "$LOG"; run_linux
+    check "packages skipped independently" log_lacks '^mise exec -- npm install -g @salesforce'
+    check "plugin skipped" log_lacks '^mise exec -- sf plugins install'
+    rm "$STATE/@salesforce/lwc-language-server"
+    : > "$LOG"; run_linux
+    check "only missing LWC installed" log_has '^mise exec -- npm install -g @salesforce/lwc-language-server$'
+    check "CLI not upgraded" log_lacks '^mise exec -- npm install -g @salesforce/cli'
+    teardown
+  done
+}
+
+test_salesforce_dry_run() {
+  salesforce_setup atomic
+  local before; before="$(home_snapshot)"
+  run_linux --dry-run
+  check "plans npm packages" has "$OUT" 'exec -- npm install -g @salesforce/cli @salesforce/lwc-language-server'
+  check "plans plugin" has "$OUT" 'exec -- sf plugins install code-analyzer'
+  check "no mise executed" log_lacks '^mise '
+  check "HOME unchanged" [ "$before" = "$(home_snapshot)" ]
+  teardown
+}
+
+test_salesforce_no_node() {
+  salesforce_setup atomic
+  export STUB_MISE_RC=1
+  run_linux
+  unset STUB_MISE_RC
+  check "Salesforce skip warning" has "$OUT" 'skipped Salesforce tools: no usable mise-managed Node'
+  check "no Salesforce commands" log_lacks '^mise exec -- (sf|npm .*@salesforce)'
+  teardown
+}
+
+salesforce_failure() {
+  salesforce_setup atomic
+  touch "$STATE/$1"
+  run_linux
+  check "Salesforce failure is nonfatal" [ "$RC" -eq 0 ]
+  check "specific warning" has "$OUT" "$2"
+  rm "$STATE/$1"; : > "$LOG"; run_linux
+  check "next run retries" log_has "$3"
+  teardown
+}
+test_salesforce_npm_failure() { salesforce_failure sf-npm-fail 'Salesforce npm install failed' '^mise exec -- npm install -g @salesforce'; }
+test_salesforce_plugin_failure() { salesforce_failure sf-plugin-fail 'Salesforce code-analyzer install failed' '^mise exec -- sf plugins install code-analyzer$'; }
+test_salesforce_listing_failure() { salesforce_failure sf-list-fail 'Salesforce plugin listing failed' '^mise exec -- sf plugins install code-analyzer$'; }
+
+test_salesforce_unusable_node() {
+  salesforce_failure sf-node-fail 'skipped Salesforce tools: mise-managed Node is unusable' '^mise exec -- npm install -g @salesforce'
+}
+
+test_salesforce_reshim_failure() {
+  salesforce_setup atomic
+  mise_node_fixture
+  export STUB_RESHIM_RC=1
+  run_linux
+  unset STUB_RESHIM_RC
+  check "reshim failure nonfatal" [ "$RC" -eq 0 ]
+  check "reshim warning" has "$OUT" 'Salesforce mise reshim failed'
+  check "plugin deferred" log_lacks '^mise exec -- sf plugins'
+  : > "$LOG"; run_linux
+  check "shim repair retried" log_has '^mise reshim$'
+  check "plugin installed after repair" log_has '^mise exec -- sf plugins install code-analyzer$'
+  teardown
+}
+
 # ── Run ──────────────────────────────────────────────────────────────────────
 
 TESTS=(
+  test_salesforce_unusable_node
+  test_salesforce_reshim_failure
+  test_salesforce_platforms
+  test_salesforce_dry_run
+  test_salesforce_no_node
+  test_salesforce_npm_failure
+  test_salesforce_plugin_failure
+  test_salesforce_listing_failure
   test_default_terminal
   test_default_terminal_skips
   test_detection
