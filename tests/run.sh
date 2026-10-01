@@ -4654,6 +4654,113 @@ test_stow_packages_match_dotfiles() {
   teardown
 }
 
+# ── Tests: mac/Brewfile ──────────────────────────────────────────────────────
+# Read as text only: brew is never run, and nothing here touches the network.
+
+BREWFILE="$ROOT/mac/Brewfile"
+# One entry: a kind, a quoted name, optional `key: value` options, optional comment.
+BREWFILE_ENTRY='^(tap|brew|cask|mas|vscode) "([A-Za-z0-9@._/+ -]+)"((, [a-z_]+: [^,#]+)*)([[:space:]]+#.*)?$'
+
+# Formulae `linux` installs from Homebrew that the Mac deliberately goes
+# without. Every entry needs a comment saying why. Empty: the Mac wants all of
+# them today.
+LINUX_ONLY_FORMULAE=()
+
+# Print "KIND NAME" for each entry of Brewfile $1, and "invalid LINE_NO" for
+# each line that is not blank, a comment or an entry (a mas entry needs an id).
+brewfile_entries() {
+  local line n=0 kind name opts
+  while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n + 1))
+    [[ "$line" =~ ^[[:space:]]*(#.*)?$ ]] && continue
+    [[ "$line" =~ $BREWFILE_ENTRY ]] || { echo "invalid $n"; continue; }
+    kind="${BASH_REMATCH[1]}" name="${BASH_REMATCH[2]}" opts="${BASH_REMATCH[3]}"
+    if [ "$kind" = mas ] && [[ ! "$opts" =~ ,\ id:\ [0-9]+ ]]; then
+      echo "invalid $n"
+    elif [ "$kind" != mas ] && [[ "$name" == *" "* ]]; then
+      echo "invalid $n"
+    else
+      echo "$kind $name"
+    fi
+  done < "$1"
+}
+
+# Print each entry that Brewfile $1 lists more than once.
+brewfile_duplicates() {
+  local entry
+  local -A seen=()
+  while IFS= read -r entry; do
+    [ -z "${seen[$entry]:-}" ] || echo "$entry"
+    seen[$entry]=1
+  done < <(brewfile_entries "$1")
+}
+
+# The formulae `linux` installs from Homebrew: BREW_FORMULAE, and ffmpeg
+# (ensure_ffmpeg, when the image has none).
+linux_brew_formulae() {
+  sed -n '/^BREW_FORMULAE=(/,/^)/p' "$SCRIPT" | sed -n 's/^  \([^:[:space:]]*\):.*/\1/p'
+  echo ffmpeg
+}
+
+# Print each of the formulae (arguments after the Brewfile $1) that has no
+# brew entry in it and is not on LINUX_ONLY_FORMULAE.
+brewfile_missing() {
+  local entries f
+  entries="$(brewfile_entries "$1")"
+  for f in "${@:2}"; do
+    grep -qxF -- "brew $f" <<<"$entries" && continue
+    [[ " ${LINUX_ONLY_FORMULAE[*]} " == *" $f "* ]] || echo "$f"
+  done
+}
+
+test_brewfile_parses() {
+  CURRENT="mac/Brewfile parses"
+  local entries tmp
+  entries="$(brewfile_entries "$BREWFILE")"
+  check "has entries" [ "$(grep -c . <<<"$entries")" -gt 0 ]
+  check "every line is a tap, brew, cask, mas or vscode entry (invalid lines: $(grep '^invalid' <<<"$entries" | tr '\n' ' '))" lacks "$entries" "^invalid "
+  check "no duplicates ($(brewfile_duplicates "$BREWFILE" | tr '\n' ' '))" [ -z "$(brewfile_duplicates "$BREWFILE")" ]
+  check "no tap: nothing outside Homebrew's own repositories" lacks "$entries" "^tap "
+
+  # The checks themselves, against Brewfiles that must and must not pass.
+  tmp="$(mktemp -d)"
+  printf '%s\n' '# comment' '' 'tap "a/b"' 'brew "x@1", restart_service: :changed # why' 'cask "y"' \
+    'mas "Some App", id: 123' 'vscode "a.b"' > "$tmp/good"
+  check "accepts each entry kind, options and comments" [ "$(brewfile_entries "$tmp/good" | tr '\n' ',')" = "tap a/b,brew x@1,cask y,mas Some App,vscode a.b," ]
+  printf '%s\n' 'brew "x"' 'npm "y"' 'brew x' 'brew "a b"' 'mas "App"' 'system "rm -rf /"' 'brew "x"; system "id"' > "$tmp/bad"
+  check "rejects other kinds, unquoted names, a mas without id, and Ruby code" [ "$(brewfile_entries "$tmp/bad" | tr '\n' ',')" = "brew x,invalid 2,invalid 3,invalid 4,invalid 5,invalid 6,invalid 7," ]
+  printf '%s\n' 'brew "x"' 'cask "x"' 'brew "y"' 'brew "x" # again' > "$tmp/dup"
+  check "reports a duplicate (a brew and a cask of one name are two entries)" [ "$(brewfile_duplicates "$tmp/dup")" = "brew x" ]
+  rm -rf "$tmp"
+}
+
+test_brewfile_linux_parity() {
+  CURRENT="mac/Brewfile covers linux's Homebrew formulae"
+  local -a linux=()
+  local f tmp missing
+  mapfile -t linux < <(linux_brew_formulae)
+  # The list read out of the script is the one the other tests install.
+  check "read BREW_FORMULAE from the script" [ "$(sorted "${linux[@]}")" = "$(sorted "${ALL_FORMULAE[@]}" ffmpeg)" ]
+  missing="$(brewfile_missing "$BREWFILE" "${linux[@]}" | tr '\n' ' ')"
+  check "every linux formula has a brew entry or is on LINUX_ONLY_FORMULAE (missing: $missing)" [ -z "$missing" ]
+  for f in "${LINUX_ONLY_FORMULAE[@]}"; do
+    check "Linux-only $f is a linux formula" has " ${linux[*]} " " $f "
+    check "Linux-only $f is not in the Brewfile" lacks "$(brewfile_entries "$BREWFILE")" "^brew $f\$"
+  done
+  check "the Mac gets JDK 21, not 17" lacks "$(brewfile_entries "$BREWFILE")" "^brew openjdk@17$"
+  check "Ghostty and the font are casks" [ "$(brewfile_entries "$BREWFILE" | grep -cxE 'cask (ghostty|font-jetbrains-mono-nerd-font)')" -eq 2 ]
+
+  # The check itself: a formula missing from a Brewfile is reported, a cask of
+  # that name doesn't count, and only the allowlist excuses it.
+  tmp="$(mktemp -d)"
+  printf '%s\n' 'brew "git"' 'cask "tmux"' > "$tmp/Brewfile"
+  check "reports a formula with no brew entry" [ "$(brewfile_missing "$tmp/Brewfile" git tmux jq | tr '\n' ' ')" = "tmux jq " ]
+  LINUX_ONLY_FORMULAE=(jq)
+  check "not one on the Linux-only list" [ "$(brewfile_missing "$tmp/Brewfile" git tmux jq | tr '\n' ' ')" = "tmux " ]
+  LINUX_ONLY_FORMULAE=()
+  rm -rf "$tmp"
+}
+
 # ── Run ──────────────────────────────────────────────────────────────────────
 
 TESTS=(
@@ -4734,6 +4841,8 @@ TESTS=(
   test_neovim_dry_run
   test_neovim_bazzite_unaffected
   test_neovim_pins
+  test_brewfile_parses
+  test_brewfile_linux_parity
 )
 
 for t in "${TESTS[@]}"; do

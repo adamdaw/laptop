@@ -1,0 +1,69 @@
+# Homebrew packages for the Mac. See docs/mac.md for how to use this file.
+#
+#   brew bundle check --verbose --file=mac/Brewfile
+#   brew bundle install --file=mac/Brewfile
+#
+# Curated by hand, not a `brew bundle dump`: it lists what the dotfiles need
+# (the same tools `linux` installs on Bazzite), plus a few optional extras at
+# the end. tests/run.sh checks that every line parses and that each tool in
+# `linux`'s BREW_FORMULAE has an entry here.
+
+# ── Shell and terminal ───────────────────────────────────────────────────────
+brew "bash" # remote-sync and remote-status need 4.4+; macOS ships 3.2
+brew "zsh" # Ghostty starts brew's zsh
+brew "zsh-autosuggestions"
+brew "zsh-syntax-highlighting"
+brew "starship"
+brew "tmux"
+brew "stow"
+brew "fzf"
+brew "atuin"
+brew "bat"
+brew "ripgrep"
+brew "fd"
+brew "jq"
+brew "wget"
+cask "ghostty"
+
+# ── Editor ───────────────────────────────────────────────────────────────────
+brew "neovim" # the dotfiles config needs 0.12 or newer
+brew "tree-sitter-cli" # builds the treesitter parsers (needs a C compiler: Xcode Command Line Tools)
+brew "shellcheck"
+brew "markdownlint-cli2"
+
+# ── Git ──────────────────────────────────────────────────────────────────────
+brew "git"
+brew "git-delta"
+brew "gh"
+brew "lazygit"
+brew "gitleaks" # the dotfiles pre-commit hook needs 8.20.0 or newer
+
+# ── Languages and runtimes ───────────────────────────────────────────────────
+brew "mise" # Node LTS comes from mise, not from a node formula
+brew "uv"
+brew "bun"
+
+# ── Salesforce ───────────────────────────────────────────────────────────────
+# sf, lwc-language-server and code-analyzer are npm packages under mise's Node.
+brew "openjdk@21" # keg-only; Apex language server and Code Analyzer
+
+# ── Media ────────────────────────────────────────────────────────────────────
+brew "ffmpeg" # the dotfiles transcribe script converts audio with it
+
+# ── Fonts ────────────────────────────────────────────────────────────────────
+cask "font-jetbrains-mono-nerd-font"
+
+# ── Optional ─────────────────────────────────────────────────────────────────
+# Personal extras. Nothing in the dotfiles needs them: delete or comment out
+# any of these lines freely.
+brew "gnupg"
+brew "pinentry-mac"
+brew "zoxide"
+brew "eza"
+brew "pandoc"
+brew "duti"
+brew "ollama"
+brew "opencode"
+cask "localsend"
+cask "crosspaste"
+cask "markdown-preview"
