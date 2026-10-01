@@ -19,6 +19,18 @@ OSTREE_BOOTED_FILE="${LAPTOP_OSTREE_BOOTED:-/run/ostree-booted}"
 YUM_REPOS_DIR="${LAPTOP_YUM_REPOS_DIR:-/etc/yum.repos.d}"
 # Where to look for Homebrew when `brew` is not on PATH (space-separated).
 BREW_DIRS="${LAPTOP_BREW_DIRS:-/home/linuxbrew/.linuxbrew $HOME/.linuxbrew}"
+CPUINFO_FILE="${LAPTOP_CPUINFO:-/proc/cpuinfo}"
+# Where to look for the Vulkan loader when ldconfig does not list it (space-separated).
+VULKAN_LIB_DIRS="${LAPTOP_LIB_DIRS:-/usr/lib64 /usr/lib/x86_64-linux-gnu /usr/lib /lib64 /lib/x86_64-linux-gnu /lib}"
+
+# voxtype (speech-to-text; the dotfiles `transcribe` wrapper runs it): the
+# upstream standalone release binary, pinned, and the key that signs each
+# release's SHA256SUMS.txt.
+VOXTYPE_VERSION=1.1.0
+VOXTYPE_RELEASE="https://github.com/peteonrails/voxtype/releases/download/v$VOXTYPE_VERSION"
+VOXTYPE_KEY_FPR=9CCF7915B750CAE8B095ED1AA3FC9F33FD209279 # gitleaks:allow (a public key's fingerprint, not a secret)
+VOXTYPE_KEY_URL="https://keys.openpgp.org/vks/v1/by-fingerprint/$VOXTYPE_KEY_FPR"
+VOXTYPE_MODEL=large-v3-turbo
 
 # Dotfiles packages to stow (one directory each in the dotfiles repo).
 STOW_PACKAGES=(agy applications atuin bash bat bin claude ghostty git nvim render-url ripgrep ssh starship tmux zsh)
@@ -1226,6 +1238,189 @@ install_render_url() {
   fi
 }
 
+# ffmpeg, which dotfiles' bin/transcribe converts audio with: apt on
+# Debian/Ubuntu; Bazzite ships /usr/bin/ffmpeg, else Homebrew.
+ensure_ffmpeg() { # ensure_ffmpeg debian|atomic
+  local -a install=(brew install ffmpeg)
+  if [ "$1" = debian ]; then install=(sudo apt-get install -y ffmpeg); fi
+  if cmd_exists ffmpeg; then
+    ok "ffmpeg already installed ($(command -v ffmpeg))"
+  elif run "${install[@]}"; then
+    did "installed ffmpeg"
+  else
+    warn "'${install[*]}' failed; transcribe needs ffmpeg (next run will retry)"
+  fi
+}
+
+# Which x86_64 release build suits this machine: vulkan when a Vulkan loader
+# is present (ldconfig's cache, or the usual lib dirs), else the CPU build for
+# the best instruction set /proc/cpuinfo lists.
+voxtype_variant() {
+  local libs dir
+  if cmd_exists ldconfig && libs="$(ldconfig -p 2>/dev/null)" && grep -q 'libvulkan\.so\.1' <<<"$libs"; then
+    echo vulkan
+    return 0
+  fi
+  for dir in $VULKAN_LIB_DIRS; do
+    if [ -e "$dir/libvulkan.so.1" ]; then
+      echo vulkan
+      return 0
+    fi
+  done
+  if grep -qw avx512f "$CPUINFO_FILE" 2>/dev/null; then
+    echo avx512
+  elif grep -qw avx2 "$CPUINFO_FILE" 2>/dev/null; then
+    echo avx2
+  else
+    echo baseline
+  fi
+}
+
+# Something at $1 that this script must never replace: anything that is not a
+# regular file. A symlink counts, whatever it points to.
+not_regular_file() { [ -L "$1" ] || { [ -e "$1" ] && [ ! -f "$1" ]; }; }
+
+# Download release asset $1 and install it as $2 (mode 755), only once it is
+# verified two ways: SHA256SUMS.txt carries a valid signature made by
+# $VOXTYPE_KEY_FPR, and the binary hashes to what SHA256SUMS.txt lists for it.
+# gpg gets a temporary GNUPGHOME (the user's keyring is neither read nor
+# changed) and --no-autostart (no gpg-agent left running in it). The signature
+# is checked before the binary is downloaded. Runs in a subshell, so its temp
+# files go when it exits, however it ends. On failure prints why and returns
+# non-zero, with $2 untouched.
+voxtype_fetch() (
+  asset="$1" dest="$2" base="$VOXTYPE_RELEASE" tmp="" new=""
+  trap 'rm -rf -- "$tmp" "$new"' EXIT
+  fail() { echo "$1"; exit 1; }
+  tmp="$(mktemp -d)" || fail "could not create a temp directory"
+  export GNUPGHOME="$tmp/gnupg"
+  mkdir -m 700 "$GNUPGHOME" || fail "could not create a temporary GNUPGHOME"
+  curl -fsSL -o "$tmp/SHA256SUMS.txt" "$base/SHA256SUMS.txt" || fail "could not download $base/SHA256SUMS.txt"
+  curl -fsSL -o "$tmp/SHA256SUMS.txt.asc" "$base/SHA256SUMS.txt.asc" || fail "could not download $base/SHA256SUMS.txt.asc"
+  curl -fsSL -o "$tmp/key.asc" "$VOXTYPE_KEY_URL" || fail "could not download the signing key from $VOXTYPE_KEY_URL"
+  gpg --batch --quiet --no-autostart --import "$tmp/key.asc" >/dev/null 2>&1 || fail "gpg could not import the signing key"
+  status="$(gpg --batch --no-autostart --status-fd 1 --verify "$tmp/SHA256SUMS.txt.asc" "$tmp/SHA256SUMS.txt" 2>/dev/null)" ||
+    fail "SHA256SUMS.txt has no good GPG signature"
+  # Whatever key the server sent, only the pinned one counts: VALIDSIG's last
+  # field is the fingerprint of the primary key that made the signature.
+  grep -Eq "^\[GNUPG:\] VALIDSIG [0-9A-F]+ .* $VOXTYPE_KEY_FPR\$" <<<"$status" ||
+    fail "SHA256SUMS.txt is not signed by $VOXTYPE_KEY_FPR"
+
+  curl -fsSL -o "$tmp/$asset" "$base/$asset" || fail "could not download $base/$asset"
+  expected=""
+  while read -r sum name; do
+    if [ "${name#\*}" = "$asset" ]; then expected="$sum"; fi
+  done < "$tmp/SHA256SUMS.txt"
+  [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || fail "SHA256SUMS.txt does not list $asset"
+
+  # Staged next to the target and renamed over it: never a half-written
+  # binary. The staged copy is the one that is hashed, so the bytes installed
+  # are the bytes verified.
+  new="$(mktemp "$dest.XXXXXX")" || fail "could not create a temp file next to $dest"
+  cp -- "$tmp/$asset" "$new" || fail "could not write next to $dest"
+  actual="$(sha256sum < "$new")" || fail "could not hash $asset"
+  [ "${actual%% *}" = "$expected" ] || fail "SHA256 mismatch for $asset (expected $expected, got ${actual%% *})"
+  chmod 755 -- "$new" || fail "could not write next to $dest"
+  # The downloads took a while: look at the target again just before the
+  # rename, which would replace a symlink put there in the meantime.
+  if not_regular_file "$dest"; then
+    fail "$dest became something other than a regular file during the download, so it is left alone"
+  fi
+  mv -fT -- "$new" "$dest" || fail "could not write $dest"
+)
+
+# The Whisper model transcribe uses, and voxtype's config pointing at it.
+# `voxtype setup --download` writes a default config whose model is "base.en";
+# only that exact generated line is changed, never a model line edited by hand.
+# The model counts as downloaded when its file exists; its size and content
+# are not checked. LAPTOP_SKIP_VOXTYPE_MODEL=1 skips both.
+voxtype_model() { # voxtype_model VOXTYPE_BINARY
+  local bin="$1" model cfg
+  model="${XDG_DATA_HOME:-$HOME/.local/share}/voxtype/models/ggml-$VOXTYPE_MODEL.bin"
+  cfg="${XDG_CONFIG_HOME:-$HOME/.config}/voxtype/config.toml"
+  if [ "${LAPTOP_SKIP_VOXTYPE_MODEL:-0}" = 1 ]; then
+    ok "skipped the $VOXTYPE_MODEL model and voxtype's config (LAPTOP_SKIP_VOXTYPE_MODEL=1)"
+    return 0
+  fi
+  if [ -f "$model" ]; then
+    ok "voxtype model $VOXTYPE_MODEL already downloaded"
+  else
+    printf "  \033[1;33mnote:\033[0m the %s model is a ~1.6 GB download (LAPTOP_SKIP_VOXTYPE_MODEL=1 skips it)\n" "$VOXTYPE_MODEL"
+    if ! run "$bin" setup --download --model "$VOXTYPE_MODEL" --no-post-install --quiet; then
+      warn "'voxtype setup --download --model $VOXTYPE_MODEL' failed; next run will retry"
+      return 0
+    fi
+    if (( DRY_RUN )); then
+      printf "  \033[2m[dry-run]\033[0m set model = \"%s\" in %s if its model line is the generated \"base.en\"\n" "$VOXTYPE_MODEL" "$cfg"
+      return 0
+    fi
+    if [ ! -f "$model" ]; then
+      warn "'voxtype setup --download --model $VOXTYPE_MODEL' did not leave $model; next run will retry"
+      return 0
+    fi
+    ok "downloaded voxtype model $VOXTYPE_MODEL"
+  fi
+  if [ ! -f "$cfg" ] || [ -L "$cfg" ] || in_repo "$cfg"; then
+    return 0 # no config, or one kept in dotfiles: not this script's to edit
+  fi
+  if ! grep -qx 'model = "base.en"' "$cfg"; then
+    ok "voxtype config's model line is not the generated default; left as it is"
+  elif run sed -i "s/^model = \"base\\.en\"\$/model = \"$VOXTYPE_MODEL\"/" "$cfg"; then
+    did "set model = \"$VOXTYPE_MODEL\" in $cfg (was the generated \"base.en\")"
+  else
+    warn "could not set model = \"$VOXTYPE_MODEL\" in $cfg"
+  fi
+}
+
+# voxtype for dotfiles' bin/transcribe, on both platforms: the pinned upstream
+# release binary in ~/.local/bin, installed only if missing or another version
+# (decided from `voxtype --version`, which writes nothing), then its model.
+# Never installed unverified, and never over anything but a regular file.
+# Every failure is a warning.
+install_voxtype() { # install_voxtype debian|atomic
+  step "Installing voxtype $VOXTYPE_VERSION (speech-to-text for transcribe)"
+  local dir="$HOME/.local/bin" dest reports="voxtype $VOXTYPE_VERSION" arch asset reason
+  dest="$dir/voxtype"
+  ensure_ffmpeg "$1"
+  arch="$(uname -m 2>/dev/null)" || arch=unknown
+  if [ "$arch" != x86_64 ]; then
+    warn "skipped voxtype: only its x86_64 release binaries are installed here (this machine is $arch)"
+    return 0
+  fi
+  if not_regular_file "$dest"; then
+    warn "skipped voxtype: $dest is not a regular file, so it is left alone (move it away to get voxtype $VOXTYPE_VERSION)"
+    return 0
+  fi
+  if [ -f "$dest" ] && [ "$("$dest" --version 2>/dev/null)" = "$reports" ]; then
+    ok "voxtype $VOXTYPE_VERSION already installed ($dest)"
+  elif in_repo "$dir"; then
+    warn "skipped voxtype: $dir resolves into the dotfiles repo"
+    return 0
+  elif (( ! DRY_RUN )) && ! cmd_exists gpg; then
+    warn "skipped voxtype: gpg not found, so the release's signature can't be checked, and nothing is installed unverified. Install gpg and re-run"
+    return 0
+  else
+    asset="voxtype-$VOXTYPE_VERSION-linux-x86_64-$(voxtype_variant)"
+    if (( DRY_RUN )); then
+      printf "  \033[2m[dry-run]\033[0m download %s (with SHA256SUMS.txt and SHA256SUMS.txt.asc)\n" "$VOXTYPE_RELEASE/$asset"
+      printf "  \033[2m[dry-run]\033[0m verify SHA256SUMS.txt's GPG signature against %s (key from keys.openpgp.org, temporary GNUPGHOME) and the binary's SHA256\n" "$VOXTYPE_KEY_FPR"
+      printf "  \033[2m[dry-run]\033[0m install it as %s (mode 755)\n" "$dest"
+    elif ! mkdir -p "$dir"; then
+      warn "could not create $dir; voxtype not installed"
+      return 0
+    elif ! reason="$(voxtype_fetch "$asset" "$dest")"; then
+      warn "voxtype not installed: $reason. Nothing was installed; next run will retry"
+      return 0
+    elif [ "$("$dest" --version 2>/dev/null)" != "$reports" ]; then
+      warn "$asset was verified and installed, but $dest does not report '$reports'; not downloading its model"
+      return 0
+    else
+      ok "installed $asset as $dest (GPG signature and SHA256 verified)"
+    fi
+  fi
+  voxtype_model "$dest"
+}
+
 run_local() {
   if [ -f ~/.laptop.local ]; then
     step "Running ~/.laptop.local"
@@ -1374,6 +1569,7 @@ install_debian() {
   setup_ssh
   apply_dotfiles
   install_render_url
+  install_voxtype debian
   configure_git
 
   step "Setting zsh as default shell"
@@ -1516,6 +1712,7 @@ install_atomic() {
   prepare_default_terminal
   apply_dotfiles
   install_render_url
+  install_voxtype atomic
   configure_default_terminal
   configure_git
 
