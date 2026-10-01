@@ -1458,12 +1458,29 @@ in_unverified_neovim_dir() {
 }
 
 # True if $1 is an nvim of mise's: its shim, or anything under mise's data
-# dir. Such an nvim is never run (a shim runs mise, which writes state) and
-# never judged: which version mise selects depends on its configuration.
+# dir, or a symlink that leads there. Such an nvim is never run (a shim runs
+# mise, which writes state) and never judged: which version mise selects
+# depends on its configuration. The links are followed one hop at a time and
+# each hop is looked at: mise's own shim is a link to the mise program,
+# outside its data dir, so where the chain ends says nothing. A chain that
+# is too long (or cyclic) or can't be read counts as mise's too: not run.
 is_mise_nvim() {
-  local data
+  local data rdata path="$1" parent logical target hops=0
   data="$(mise_data_dir)"
-  [ -n "$1" ] && { [[ "$1" == "$data"/* ]] || [[ "$(realpath -m -- "$(dirname -- "$1")")/" == "$(realpath -m -- "$data")"/* ]]; }
+  rdata="$(realpath -m -- "$data")"
+  [ -n "$path" ] || return 1
+  while :; do
+    parent="$(realpath -m -- "$(dirname -- "$path")")"
+    logical="$(realpath -ms -- "$path")"
+    if [[ "$logical" == "$data"/* || "$logical" == "$rdata"/* || "$parent/" == "$rdata"/* ]]; then
+      return 0
+    fi
+    [ -L "$path" ] || return 1
+    (( ++hops <= 40 )) || return 0
+    target="$(readlink -- "$path")" || return 0
+    # A relative target is relative to the directory the link is really in.
+    case "$target" in /*) path="$target" ;; *) path="$parent/$target" ;; esac
+  done
 }
 
 # The first sign on disk that mise manages a Neovim, or nothing: its nvim
@@ -1617,6 +1634,7 @@ install_neovim() {
     found="$first is $version, older than $NEOVIM_MIN"
   fi
   printf "  \033[2mnote:\033[0m %s\n" "$found"
+  neovim_mise_note "$mise" # before any return below, so the summary has it in every outcome
   still="$found, and the dotfiles config needs >= $NEOVIM_MIN"
   arch="$(uname -m 2>/dev/null)" || arch=unknown
   if [ "$arch" != x86_64 ]; then
@@ -1654,7 +1672,6 @@ install_neovim() {
   fi
   link_local_bin "$dest/bin/nvim" "$dir/nvim"
   neovim_report "$dir"
-  neovim_mise_note "$mise"
 }
 
 run_local() {

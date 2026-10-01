@@ -3869,6 +3869,15 @@ nv_mise_nvim() { # nv_mise_nvim VERSION FIRST_LINE — prints its path
   write_nvim "$d/nvim" "$2" 0 mise-nvim
   echo "$d/nvim"
 }
+# mise's shim for nvim as mise makes it: a link to the mise program, which is
+# outside mise's data dir. Running it (through any link) is running mise: it
+# logs a tag and, like mise, leaves a cache dir behind.
+nv_mise_program_shim() {
+  mkdir -p "$HOME/.local/share/mise/shims" "$HOME/opt/mise/bin"
+  write_nvim "$HOME/opt/mise/bin/mise" "NVIM v$NVIM_VERSION" 0 mise-program
+  sed -i '2a mkdir -p "$HOME/.cache/mise"; : >> "$HOME/.cache/mise/version-probe"' "$HOME/opt/mise/bin/mise"
+  ln -s "$HOME/opt/mise/bin/mise" "$HOME/.local/share/mise/shims/nvim"
+}
 # mise's shim for nvim. It must never be run: that would run mise.
 nv_mise_shim() {
   mkdir -p "$HOME/.local/share/mise/shims"
@@ -4270,6 +4279,106 @@ test_neovim_readiness() {
   check "it is not counted as installed" lacks "$OUT" "$NV_READY"
   check "the install is planned" has "$OUT" "\[dry-run\] download $NVIM_RELEASE/$NVIM_ASSET$"
   check "the summary says mise's was not checked, naming it" has "$OUT" "^  Neovim: mise manages a Neovim \($HOME/\.local/share/mise/installs/aqua-neovim-neovim/0\.12\.5/bin/nvim\) $NV_MISE_UNCHECKED"
+  teardown
+
+  # A symlink that leads to an nvim of mise's is mise's too, however many
+  # links are in between and wherever the chain ends: mise's own shim is a
+  # link to the mise program, outside its data dir. (This script itself links
+  # ~/.local/bin/node and others to mise's shims.) Never run, never judged.
+  local chain
+  for chain in "to mise's shim" "to an nvim mise has installed" "to a non-mise link to mise's shim" \
+               "relative, into mise's installs dir" "relative, through a mise-linked version"; do
+    setup "neovim: ~/.local/bin/nvim is a link $chain"
+    nv_pop "NVIM v0.9.5"
+    mkdir -p "$HOME/.local/bin" "$HOME/links"
+    nv_mise_program_shim
+    nv_mise_nvim "$NVIM_VERSION" "NVIM v$NVIM_VERSION" >/dev/null
+    sign="$HOME/.local/share/mise/shims/nvim"
+    case "$chain" in
+      "to mise's shim") ln -s "$sign" "$(nv_link)" ;;
+      "to an nvim mise has installed") ln -s "$HOME/.local/share/mise/installs/neovim/$NVIM_VERSION/bin/nvim" "$(nv_link)" ;;
+      "to a non-mise link to mise's shim") ln -s "$sign" "$HOME/links/nvim"; ln -s "$HOME/links/nvim" "$(nv_link)" ;;
+      "relative, into mise's installs dir") ln -s "../share/mise/installs/neovim/$NVIM_VERSION/bin/nvim" "$(nv_link)" ;;
+      "relative, through a mise-linked version")   # as `mise link` leaves it: the version dir is a symlink
+        mkdir -p "$HOME/opt/nvim-linked/bin"
+        write_nvim "$HOME/opt/nvim-linked/bin/nvim" "NVIM v$NVIM_VERSION" 0 mise-nvim
+        ln -s "$HOME/opt/nvim-linked" "$HOME/.local/share/mise/installs/neovim/linked"
+        ln -s "../share/mise/installs/neovim/linked/bin/nvim" "$(nv_link)" ;;
+    esac
+    before="$(home_snapshot)"
+    SANDBOX_PATH="$(nv_local_first)" run_linux --dry-run
+    check "control: it is the first nvim on this PATH, and runs" [ "$(nv_first_on "$(nv_local_first)")" = "$(nv_link)" ]
+    check "dry run exits 0" [ "$RC" -eq 0 ]
+    check "dry run runs nothing of mise's through the link" log_lacks '^nvim-tag mise-'
+    check "dry run leaves HOME byte for byte unchanged" [ "$before" = "$(home_snapshot)" ]
+    check "dry run says it is mise's, so not run" has "$OUT" "note: $(nv_link) is mise's, so it is not run and its version is not known$"
+    check "dry run makes no readiness claim" lacks "$OUT" "$NV_READY"
+    check "dry run says mise's was not checked, in the step and the summary" [ "$(grep -cE "Neovim: mise manages a Neovim \($sign\) $NV_MISE_UNCHECKED" <<<"$OUT")" -eq 2 ]
+    check "dry run still plans the install" has "$OUT" "\[dry-run\] download $NVIM_RELEASE/$NVIM_ASSET$"
+    teardown
+  done
+
+  # A cyclic link can't be run by anything, and following it must end.
+  setup "neovim: ~/.local/bin/nvim is a cyclic link"
+  nv_pop "NVIM v0.9.5"
+  mkdir -p "$HOME/.local/bin" "$HOME/links"
+  nv_mise_program_shim
+  ln -s "$HOME/links/nvim" "$(nv_link)"
+  ln -s "$(nv_link)" "$HOME/links/nvim"
+  before="$(home_snapshot)"
+  SANDBOX_PATH="$(nv_local_first)" run_linux --dry-run
+  check "dry run exits 0" [ "$RC" -eq 0 ]
+  check "dry run runs nothing of mise's" log_lacks '^nvim-tag mise-'
+  check "dry run leaves HOME byte for byte unchanged" [ "$before" = "$(home_snapshot)" ]
+  check "dry run makes no readiness claim" lacks "$OUT" "$NV_READY"
+  check "dry run says mise's was not checked" has "$OUT" "^  Neovim: mise manages a Neovim \($HOME/\.local/share/mise/shims/nvim\) $NV_MISE_UNCHECKED"
+  teardown
+
+  setup "neovim: ~/.local/bin/nvim is a link to mise's shim (real run)"
+  nv_pop "NVIM v0.9.5"
+  run_linux   # a machine already set up, so the next run leaves mise's shims alone
+  rm -r "$(nv_dest)" "$(nv_link)"
+  nv_mise_program_shim
+  ln -s "$HOME/.local/share/mise/shims/nvim" "$(nv_link)"
+  : > "$LOG"
+  SANDBOX_PATH="$(nv_local_first)" run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "nothing of mise's is run through the link" log_lacks '^nvim-tag mise-'
+  check "it is not counted as installed" lacks "$OUT" "nvim .*already installed"
+  check "the pinned release is installed, and the link now leads to it" nv_installed
+  check "the summary says mise's was not checked" has "$OUT" "^  Neovim: mise manages a Neovim \($HOME/\.local/share/mise/shims/nvim\) $NV_MISE_UNCHECKED"
+  teardown
+
+  # Control: a link to an nvim that is not mise's is still run and judged.
+  for chain in "one link" "two links, the second relative"; do
+    setup "neovim: ~/.local/bin/nvim is a link to a new enough nvim that is not mise's ($chain)"
+    nv_pop "NVIM v0.9.5"
+    mkdir -p "$HOME/.local/bin" "$HOME/opt/nvim/bin" "$HOME/links"
+    write_nvim "$HOME/opt/nvim/bin/nvim" "NVIM v$NVIM_VERSION" 0 own-nvim
+    if [ "$chain" = "one link" ]; then
+      ln -s "$HOME/opt/nvim/bin/nvim" "$(nv_link)"
+    else
+      ln -s "../opt/nvim/bin/nvim" "$HOME/links/nvim"; ln -s "$HOME/links/nvim" "$(nv_link)"
+    fi
+    before="$(home_snapshot)"
+    SANDBOX_PATH="$(nv_local_first)" run_linux --dry-run
+    check "it is run for its version" log_has '^nvim-tag own-nvim$'
+    check "and accepted" has "$OUT" "nvim $NVIM_VERSION already installed \($(nv_link), first on this run's PATH\)"
+    check "nothing is planned" lacks "$OUT" "$NV_PLAN"
+    check "nothing about mise" lacks "$OUT" "mise manages"
+    check "HOME is untouched" [ "$before" = "$(home_snapshot)" ]
+    teardown
+  done
+
+  # The note about mise is in the summary whatever the step then does.
+  setup "neovim: mise manages a Neovim, and the download fails"
+  nv_pop "NVIM v0.9.5"
+  nv_mise_nvim 0.9.5 "NVIM v0.9.5" >/dev/null
+  STUB_CURL_FAIL="/$NVIM_ASSET" run_linux
+  check "run still completes" [ "$RC" -eq 0 ]
+  check "the summary says Neovim is not installed" has "$OUT" "^    ! Neovim $NVIM_VERSION not installed: could not download"
+  check "and that mise's was not checked" has "$OUT" "^  Neovim: mise manages a Neovim \($HOME/\.local/share/mise/installs/neovim\) $NV_MISE_UNCHECKED"
+  check "once in the step, once in the summary" [ "$(grep -c "mise manages a Neovim" <<<"$OUT")" -eq 2 ]
   teardown
 }
 
