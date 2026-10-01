@@ -36,13 +36,19 @@ VOXTYPE_MODEL=large-v3-turbo
 # the nvim-treesitter revision its lazy-lock.json pins (the `main` branch)
 # requires 0.12. apt's is older (Ubuntu 24.04: 0.9.5), so Debian/Ubuntu get the
 # upstream release tarball, pinned. Neovim publishes no signed checksum file,
-# so the tarball's SHA256 is pinned here (overridable so the test harness can
-# serve a fixture tarball).
+# so the tarball's SHA256 is pinned here, and nothing in the environment
+# changes it.
 NEOVIM_MIN=0.12.0
 NEOVIM_VERSION=0.12.5
 NEOVIM_ASSET=nvim-linux-x86_64.tar.gz
 NEOVIM_RELEASE="https://github.com/neovim/neovim/releases/download/v$NEOVIM_VERSION"
-NEOVIM_SHA256="${LAPTOP_NEOVIM_SHA256:-bce0f56eda1f1b1db6eee8f4133d7a38813ea07933837dd1777411ca384c6875}"
+NEOVIM_SHA256=bce0f56eda1f1b1db6eee8f4133d7a38813ea07933837dd1777411ca384c6875
+# Where the tarball is unpacked (~/.local/bin/nvim links to its bin/nvim), and
+# the file in it that says this script unpacked it from the verified tarball.
+NEOVIM_DIR="$HOME/.local/share/laptop/nvim-$NEOVIM_VERSION"
+NEOVIM_MARKER=.laptop-verified-sha256
+# A line for the summary when which nvim a new session runs can't be checked.
+NEOVIM_NOTE=""
 
 # Dotfiles packages to stow (one directory each in the dotfiles repo).
 STOW_PACKAGES=(agy applications atuin bash bat bin claude ghostty git nvim render-url ripgrep ssh starship tmux zsh)
@@ -1433,11 +1439,60 @@ install_voxtype() { # install_voxtype debian|atomic
   voxtype_model "$dest"
 }
 
+# True if $NEOVIM_DIR is a tree this script unpacked from the verified pinned
+# tarball: neovim_fetch writes the marker, holding that tarball's SHA256, as
+# the last step before the finished tree is renamed into place. Read from
+# disk; nothing in the tree is run.
+neovim_verified() {
+  local marker="$NEOVIM_DIR/$NEOVIM_MARKER"
+  [ -d "$NEOVIM_DIR" ] && [ ! -L "$NEOVIM_DIR" ] && [ -f "$marker" ] && [ ! -L "$marker" ] &&
+    [ "$(cat -- "$marker" 2>/dev/null)" = "$NEOVIM_SHA256" ]
+}
+
+# True if $1 resolves into $NEOVIM_DIR while that tree is not a verified one
+# (directly, or through a link such as ~/.local/bin/nvim): never run.
+in_unverified_neovim_dir() {
+  local real
+  real="$(realpath -- "$1" 2>/dev/null)" || return 1
+  [[ "$real" == "$(realpath -m -- "$NEOVIM_DIR")"/* ]] && ! neovim_verified
+}
+
+# True if $1 is one of mise's shims: never run, since that runs mise, which
+# writes state.
+is_mise_shim() { [ "$(dirname -- "$1")" -ef "$(mise_data_dir)/shims" ]; }
+
+# Why an nvim that mise provides is too old for the dotfiles config (its
+# path, and the version found), or nothing if mise provides none, or only
+# new enough ones. Read from disk under mise's data dir: every nvim it has
+# installed counts, since which one is active can't be told without running
+# mise, and neither mise nor its shim is ever run.
+mise_nvim_problem() {
+  local data f v n=0
+  data="$(mise_data_dir)"
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    n=$((n + 1))
+    v="$(nvim_version "$f")"
+    if [ -z "$v" ] || ! version_at_least "$v" "$NEOVIM_MIN"; then
+      echo "$f (${v:-no version that can be read})"
+      return 0
+    fi
+  done < <(find "$data/installs" -maxdepth 6 -path '*/bin/nvim' \( -type f -o -type l \) 2>/dev/null)
+  if (( ! n )) && { [ -e "$data/shims/nvim" ] || [ -L "$data/shims/nvim" ]; }; then
+    echo "$data/shims/nvim (a shim with no nvim found under $data/installs, so no version can be read)"
+  fi
+}
+
 # The version `$1 --version` reports ("NVIM v0.12.5" gives 0.12.5), or nothing
-# if it can't be run or its first line isn't of that form. NVIM_LOG_FILE:
-# without it even `nvim --version` creates ~/.local/state/nvim/nvim.log.
+# if it can't be run, must not be run (a mise shim, or anything in an
+# unverified $NEOVIM_DIR), or its first line isn't of that form.
+# NVIM_LOG_FILE: without it even `nvim --version` creates
+# ~/.local/state/nvim/nvim.log.
 nvim_version() {
   local out
+  if is_mise_shim "$1" || in_unverified_neovim_dir "$1"; then
+    return 0
+  fi
   out="$(NVIM_LOG_FILE=/dev/null "$1" --version 2>/dev/null)" || return 0
   if [[ "${out%%$'\n'*}" =~ ^NVIM\ v([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
     echo "$((10#${BASH_REMATCH[1]})).$((10#${BASH_REMATCH[2]})).$((10#${BASH_REMATCH[3]}))"
@@ -1458,13 +1513,9 @@ version_at_least() {
   return 0
 }
 
-# The nvim that the shells dotfiles set up will run: its .bashrc and .zshrc
-# put ~/bin and ~/.local/bin first on PATH, ahead of /usr/bin (apt's nvim).
-dotfiles_nvim() { PATH="$HOME/bin:$HOME/.local/bin:$PATH" command -v nvim; }
-
 # Download the pinned release tarball and unpack it as $1, only once its
-# SHA256 is the pinned one. Unpacked next to $1 and renamed into place: never
-# a half-unpacked tree. Runs in a subshell, so its temp files go when it
+# SHA256 is the pinned one. Unpacked next to $1, marked as verified, and
+# renamed into place: never a half-unpacked tree. Runs in a subshell, so its temp files go when it
 # exits, however it ends. On failure prints why and returns non-zero, with
 # nothing left at $1.
 neovim_fetch() (
@@ -1479,30 +1530,90 @@ neovim_fetch() (
   tar -xzf "$tmp/$NEOVIM_ASSET" -C "$new" --strip-components=1 || fail "could not unpack $NEOVIM_ASSET"
   [ "$(nvim_version "$new/bin/nvim")" = "$NEOVIM_VERSION" ] || fail "the unpacked $NEOVIM_ASSET does not report Neovim $NEOVIM_VERSION"
   chmod 755 -- "$new" || fail "could not write next to $dest"
+  # Last, so the marker and the complete tree appear together (see neovim_verified).
+  printf '%s\n' "$NEOVIM_SHA256" > "$new/$NEOVIM_MARKER" || fail "could not write next to $dest"
   mv -T -- "$new" "$dest" || fail "could not move the unpacked $NEOVIM_ASSET to $dest"
 )
 
+# After linking: say what this run can see about which nvim runs, and no
+# more. With ~/.local/bin ($1) on this run's PATH, any nvim ahead of it that
+# is too old is a warning, and only an nvim that resolves new enough is
+# reported as ready. Without it, nothing can be checked (a login session's
+# PATH is made when logging in), which the summary then says.
+neovim_report() {
+  local dir="$1" mise d cand v on_path=0 current
+  local -a dirs=() shadows=()
+  mise="$(mise_data_dir)"
+  IFS=: read -r -a dirs <<<"$PATH"
+  for d in "${dirs[@]}"; do
+    d="${d:-.}"
+    if [ "$(realpath -m -- "$d")" = "$(realpath -m -- "$dir")" ]; then
+      on_path=1
+      break
+    fi
+    cand="$d/nvim"
+    if [ ! -f "$cand" ] || [ ! -x "$cand" ] || [[ "$cand" == "$mise"/* ]]; then
+      continue # no nvim here, or one of mise's (see mise_nvim_problem)
+    fi
+    v="$(nvim_version "$cand")"
+    if [ -z "$v" ] || ! version_at_least "$v" "$NEOVIM_MIN"; then
+      shadows+=("$cand (${v:-no version that can be read})")
+    fi
+  done
+  if (( ! on_path )); then
+    NEOVIM_NOTE="Neovim: $dir is not on this run's PATH, so which nvim a new session runs could not be checked. After logging out and in, check 'nvim --version' (the dotfiles config needs >= $NEOVIM_MIN)"
+    printf "  \033[2mnote:\033[0m %s\n" "$NEOVIM_NOTE"
+  elif (( ${#shadows[@]} )); then
+    for cand in "${shadows[@]}"; do
+      warn "Neovim is not ready: $cand comes before $dir/nvim on this run's PATH, and the dotfiles config needs >= $NEOVIM_MIN. Remove it, or put $dir ahead of it"
+    done
+  elif (( ! DRY_RUN )); then
+    current="$(type -P nvim)" || current=""
+    v="$(nvim_version "$current")"
+    if [ -n "$v" ] && version_at_least "$v" "$NEOVIM_MIN"; then
+      ok "nvim is now $v ($current) on this run's PATH"
+    else
+      warn "Neovim is not ready: on this run's PATH nvim is ${current:-not found} (${v:-no version that can be read}), and the dotfiles config needs >= $NEOVIM_MIN"
+    fi
+  fi
+}
+
 # Debian/Ubuntu only (Bazzite's comes from Homebrew): a Neovim new enough for
-# the dotfiles config. Nothing is done when the nvim that dotfiles' shells
-# resolve (see dotfiles_nvim) is already at least $NEOVIM_MIN. Otherwise the
-# pinned upstream release is unpacked into ~/.local/share/laptop and linked as
-# ~/.local/bin/nvim, which comes before apt's /usr/bin/nvim in those shells.
-# A version that can't be read counts as too old. Every failure is a warning.
+# the dotfiles config. Nothing is done when the first nvim on this run's PATH
+# is already at least $NEOVIM_MIN (for mise's shim, which is never run: when
+# every nvim mise has installed is). Otherwise the pinned upstream release is
+# unpacked into $NEOVIM_DIR and linked as ~/.local/bin/nvim. A tree already
+# at $NEOVIM_DIR is only used if this script verified and unpacked it (see
+# neovim_verified); any other is moved to the backup dir, never run or
+# linked. A version that can't be read counts as too old. Readiness is only
+# reported for what was checked (see neovim_report), and an older nvim that
+# mise provides is a warning. Every failure is a warning.
 install_neovim() {
   step "Installing Neovim $NEOVIM_VERSION (the dotfiles config needs >= $NEOVIM_MIN)"
-  local dir="$HOME/.local/bin" dest="$HOME/.local/share/laptop/nvim-$NEOVIM_VERSION"
-  local current version found still arch reason
-  current="$(dotfiles_nvim)" || current=""
-  version="$(nvim_version "$current")"
-  if [ -z "$current" ]; then
+  local dir="$HOME/.local/bin" dest="$NEOVIM_DIR"
+  local first version found still arch reason mise_problem
+  mise_problem="$(mise_nvim_problem)"
+  first="$(type -P nvim)" || first=""
+  version="$(nvim_version "$first")"
+  if [ -z "$first" ]; then
     found="no nvim found"
+  elif is_mise_shim "$first" && [ -z "$mise_problem" ]; then
+    ok "nvim already installed by mise ($first, first on this run's PATH; every nvim mise has installed is >= $NEOVIM_MIN)"
+    return 0
+  elif is_mise_shim "$first"; then
+    found="$first is mise's shim, and mise provides $mise_problem"
+  elif in_unverified_neovim_dir "$first"; then
+    found="$first is in $dest, which this script did not install, so it is not run and counts as too old"
   elif [ -z "$version" ]; then
-    found="$current reports no version that can be read ('$current --version'), so it counts as too old"
+    found="$first reports no version that can be read ('$first --version'), so it counts as too old"
   elif version_at_least "$version" "$NEOVIM_MIN"; then
-    ok "nvim $version already installed ($current)"
+    ok "nvim $version already installed ($first, first on this run's PATH)"
+    if [ -n "$mise_problem" ]; then
+      warn "Neovim is not ready where mise is active: mise provides $mise_problem, which comes first there, and the dotfiles config needs >= $NEOVIM_MIN. Upgrade or remove it in mise"
+    fi
     return 0
   else
-    found="$current is $version, older than $NEOVIM_MIN"
+    found="$first is $version, older than $NEOVIM_MIN"
   fi
   printf "  \033[2mnote:\033[0m %s\n" "$found"
   still="$found, and the dotfiles config needs >= $NEOVIM_MIN"
@@ -1516,35 +1627,34 @@ install_neovim() {
     warn "skipped Neovim $NEOVIM_VERSION: $dir resolves into the dotfiles repo; $still"
     return 0
   fi
-  if [ "$(nvim_version "$dest/bin/nvim")" = "$NEOVIM_VERSION" ]; then
-    ok "Neovim $NEOVIM_VERSION already unpacked ($dest)"
-  elif [ -e "$dest" ] || [ -L "$dest" ]; then
-    warn "Neovim $NEOVIM_VERSION not installed: $dest exists but holds no working Neovim $NEOVIM_VERSION, so it is left alone (move it away and re-run); $still"
-    return 0
-  elif (( DRY_RUN )); then
-    printf "  \033[2m[dry-run]\033[0m download %s\n" "$NEOVIM_RELEASE/$NEOVIM_ASSET"
-    printf "  \033[2m[dry-run]\033[0m verify its SHA256 against the pinned %s\n" "$NEOVIM_SHA256"
-    printf "  \033[2m[dry-run]\033[0m unpack it into %s\n" "$dest"
-  elif ! mkdir -p "$dir" "$(dirname "$dest")"; then
-    warn "Neovim $NEOVIM_VERSION not installed: could not create $dir or $(dirname "$dest"); $still"
-    return 0
-  elif ! reason="$(neovim_fetch "$dest")"; then
-    warn "Neovim $NEOVIM_VERSION not installed: $reason. Nothing was installed; $still (next run will retry)"
-    return 0
+  if neovim_verified; then
+    ok "Neovim $NEOVIM_VERSION already unpacked ($dest, verified when this script installed it)"
   else
-    ok "installed Neovim $NEOVIM_VERSION in $dest (SHA256 verified)"
+    if [ -e "$dest" ] || [ -L "$dest" ]; then
+      if ! backup_file "$dest" "${dest#"$HOME"/}"; then
+        warn "Neovim $NEOVIM_VERSION not installed: $dest was not installed by this script and could not be moved out of the way; $still"
+        return 0
+      fi
+      warn "$dest was not installed by this script (it has no marker for the pinned release), so nothing in it is run or linked: it goes to the backup directory, and Neovim $NEOVIM_VERSION is installed fresh"
+    fi
+    if (( DRY_RUN )); then
+      printf "  \033[2m[dry-run]\033[0m download %s\n" "$NEOVIM_RELEASE/$NEOVIM_ASSET"
+      printf "  \033[2m[dry-run]\033[0m verify its SHA256 against the pinned %s\n" "$NEOVIM_SHA256"
+      printf "  \033[2m[dry-run]\033[0m unpack it into %s\n" "$dest"
+    elif ! mkdir -p "$dir" "$(dirname "$dest")"; then
+      warn "Neovim $NEOVIM_VERSION not installed: could not create $dir or $(dirname "$dest"); $still"
+      return 0
+    elif ! reason="$(neovim_fetch "$dest")"; then
+      warn "Neovim $NEOVIM_VERSION not installed: $reason. Nothing was installed; $still (next run will retry)"
+      return 0
+    else
+      ok "installed Neovim $NEOVIM_VERSION in $dest (SHA256 verified)"
+    fi
   fi
   link_local_bin "$dest/bin/nvim" "$dir/nvim"
-  if (( DRY_RUN )); then
-    return 0
-  fi
-  # What counts is what `nvim` now runs, not that the steps above went through.
-  current="$(dotfiles_nvim)" || current=""
-  version="$(nvim_version "$current")"
-  if [ -n "$version" ] && version_at_least "$version" "$NEOVIM_MIN"; then
-    ok "nvim is now $version ($current)"
-  else
-    warn "Neovim is not ready: nvim still resolves to ${current:-nothing} (${version:-no readable version}), and the dotfiles config needs >= $NEOVIM_MIN. Check $dir/nvim and anything named nvim in ~/bin"
+  neovim_report "$dir"
+  if [ -n "$mise_problem" ]; then
+    warn "Neovim is not ready where mise is active: mise provides $mise_problem, which comes before $dir/nvim there, and the dotfiles config needs >= $NEOVIM_MIN. Upgrade or remove it in mise"
   fi
 }
 
@@ -1578,6 +1688,9 @@ summary() {
   # atuin-ai-server needs llama-swap on :8080 (see the dotfiles README).
   if (( ATUIN_STOWED )) && cmd_exists podman; then
     printf "  To start Atuin AI's server (needs llama-swap on :8080): systemctl --user daemon-reload && systemctl --user start atuin-ai-server\n"
+  fi
+  if [ -n "$NEOVIM_NOTE" ]; then
+    printf "  %s\n" "$NEOVIM_NOTE"
   fi
   if (( ${#REBOOT_PKGS[@]} )); then
     printf "\n  \033[1;33mReboot required\033[0m to use layered packages: %s\n" "${REBOOT_PKGS[*]}"
@@ -1619,7 +1732,7 @@ install_debian() {
     zsh-syntax-highlighting
   # apt's neovim is too old for the dotfiles config (Ubuntu 24.04: 0.9.5); it
   # stays as /usr/bin/nvim for root and as the fallback, and install_neovim
-  # puts a new enough one ahead of it on PATH.
+  # links a new enough one as ~/.local/bin/nvim.
   # No gitleaks: Ubuntu 24.04's package is 8.16.0, and dotfiles' pre-commit
   # hook needs >= 8.20.0 (it skips the scan with a warning without one).
 
