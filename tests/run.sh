@@ -30,7 +30,7 @@ ALL_PACKAGES=(agy applications atuin bash bat bin claude ghostty git nvim render
 NO_FOLD_PACKAGES=(agy applications atuin bin claude render-url)
 
 # Calls that would change the machine. None may appear during --dry-run.
-MUTATING='^(sudo|apt-get|chsh|usermod|ujust|ssh-keygen|npm|curl|stow|systemctl|ubuntu-report|unzip|fc-cache)( |$)|^brew install|^rpm-ostree (install|upgrade|reboot)|^flatpak install|^git clone|^git config (--global [^-]|.* --(add|unset|unset-all|replace-all|remove-section|rename-section)( |$))|^mise (use|install|reshim|exec)|^mise-|^gsettings set'
+MUTATING='^(sudo|apt-get|chsh|usermod|ujust|ssh-keygen|npm|curl|stow|systemctl|ubuntu-report|unzip|fc-cache)( |$)|^brew install|^rpm-ostree (install|upgrade|reboot)|^flatpak install|^git clone|^git config (--global [^-]|.* --(add|unset|unset-all|replace-all|remove-section|rename-section)( |$))|^mise (use|install|reshim|exec)|^mise-|^gsettings set|^voxtype setup'
 
 # rpm-ostree status --json shapes. Deployments are listed newest first:
 # staged/pending, then booted, then rollback.
@@ -247,6 +247,75 @@ EOF
   chmod +x "$STUBS/git"
 }
 
+# The voxtype release the script pins, and the key that signs it. Kept here as
+# literals, so a change of either in the script has to be made here too.
+VOX_VERSION=1.1.0
+VOX_KEY=9CCF7915B750CAE8B095ED1AA3FC9F33FD209279 # gitleaks:allow (a public key's fingerprint, not a secret)
+VOX_RELEASE="https://github.com/peteonrails/voxtype/releases/download/v$VOX_VERSION"
+VOX_VARIANTS=(vulkan avx512 avx2 baseline)
+# What `voxtype setup --download` generates when there is no config yet.
+VOX_DEFAULT_CONFIG='# Voxtype Configuration
+state_file = "auto"
+
+[whisper]
+# The default is model = "base.en"
+model = "base.en"
+
+# secondary_model = "large-v3-turbo"'
+
+# A fake voxtype. `--version` prints VERSION; `setup --download --model M ...`
+# leaves what the real one does: models/ggml-M.bin, and the default config
+# (model = "base.en") unless a config exists (STUB_VOXTYPE_SETUP_RC makes it
+# fail first). The variant is only a comment, for the tests to read.
+write_voxtype() { # write_voxtype PATH VERSION [VARIANT]
+  cat > "$1" <<'EOF'
+#!@BASH@
+# fake voxtype @VERSION@, variant: @VARIANT@
+printf '%s\n' "voxtype $*" >> "$STUB_LOG"
+case "${1:-}" in
+  --version) echo "voxtype @VERSION@" ;;
+  setup)
+    [ "${STUB_VOXTYPE_SETUP_RC:-0}" = 0 ] || exit "$STUB_VOXTYPE_SETUP_RC"
+    model=""
+    while [ $# -gt 0 ]; do [ "$1" = --model ] && model="${2:-}"; shift; done
+    data="${XDG_DATA_HOME:-$HOME/.local/share}/voxtype/models" conf="${XDG_CONFIG_HOME:-$HOME/.config}/voxtype"
+    mkdir -p "$data" "$conf"
+    echo "weights" > "$data/ggml-$model.bin"
+    [ -e "$conf/config.toml" ] || cat "$STUB_STATE/voxtype-default-config" > "$conf/config.toml" ;;
+esac
+EOF
+  sed -i "s|@BASH@|$SANDBOX/sysbin/bash|g; s|@VERSION@|$2|g; s|@VARIANT@|${3:-none}|g" "$1"
+  chmod +x "$1"
+}
+
+# Write the release's SHA256SUMS.txt from the builds as they are now.
+voxtype_sums() { (cd "$STATE/curl" && sha256sum voxtype-* > SHA256SUMS.txt); }
+# Sign the release's SHA256SUMS.txt as it is now (see the gpg stub).
+voxtype_sign() { echo "signed:$(sha256sum < "$STATE/curl/SHA256SUMS.txt")" > "$STATE/curl/SHA256SUMS.txt.asc"; }
+
+# What the curl stub serves: every x86_64 build of the pinned release, its
+# SHA256SUMS.txt (real hashes) with a good signature, and the signing key.
+voxtype_release_fixture() {
+  local d="$STATE/curl" v
+  mkdir -p "$d"
+  printf '%s\n' "$VOX_DEFAULT_CONFIG" > "$STATE/voxtype-default-config"
+  for v in "${VOX_VARIANTS[@]}"; do
+    write_voxtype "$d/voxtype-$VOX_VERSION-linux-x86_64-$v" "$VOX_VERSION" "$v"
+  done
+  voxtype_sums
+  voxtype_sign
+  echo "-----BEGIN PGP PUBLIC KEY BLOCK-----" > "$d/$VOX_KEY"
+}
+
+# voxtype as a successful run leaves it: the pinned binary, the model, and the
+# generated config with its model line switched to large-v3-turbo.
+voxtype_done_fixture() {
+  mkdir -p "$HOME/.local/bin" "$HOME/.local/share/voxtype/models" "$HOME/.config/voxtype"
+  write_voxtype "$HOME/.local/bin/voxtype" "$VOX_VERSION" avx2
+  echo "weights" > "$HOME/.local/share/voxtype/models/ggml-large-v3-turbo.bin"
+  sed 's/^model = "base.en"$/model = "large-v3-turbo"/' "$STATE/voxtype-default-config" > "$HOME/.config/voxtype/config.toml"
+}
+
 # ── Assertions ───────────────────────────────────────────────────────────────
 
 pass() { PASS=$((PASS + 1)); printf "  ok   %s\n" "$1"; }
@@ -294,7 +363,10 @@ setup() { # setup TEST_NAME
   # Never let the script find the host's Homebrew by its well-known paths.
   export LAPTOP_BREW_DIRS="$SANDBOX/linuxbrew"
   export LAPTOP_OS_RELEASE="$SANDBOX/os-release"
+  # Never let the script read the host's CPU flags or find its Vulkan loader.
+  export LAPTOP_CPUINFO="$SANDBOX/cpuinfo" LAPTOP_LIB_DIRS="$SANDBOX/lib64 $SANDBOX/lib"
   mkdir -p "$STUBS" "$STATE" "$SANDBOX/sysbin" "$HOME" "$LAPTOP_YUM_REPOS_DIR"
+  echo "flags		: fpu sse4_2 avx avx2" > "$LAPTOP_CPUINFO"
   : > "$LOG"
   : > "$STATE/brew-installed"
   : > "$STATE/rpm-installed"
@@ -331,13 +403,43 @@ elif [ "$*" = "plugins install code-analyzer" ]; then
 fi'; mv "$STUBS/sf" "$STATE/sf-tool"
   write_node_install
   stub sh '[ -p /dev/stdin ] && cat > /dev/null; exit 0' # `curl ... | sh` installers
-  stub curl 'if [ -n "${STUB_CURL_FAIL:-}" ] && [[ "$*" == *"$STUB_CURL_FAIL"* ]]; then exit 22; fi; exit "${STUB_CURL_RC:-0}"'
+  # `curl -o FILE URL` writes the fixture named like the URL's last component
+  # ($STATE/curl/, see voxtype_release_fixture), if there is one.
+  stub curl 'if [ -n "${STUB_CURL_FAIL:-}" ] && [[ "$*" == *"$STUB_CURL_FAIL"* ]]; then exit 22; fi
+[ "${STUB_CURL_RC:-0}" = 0 ] || exit "$STUB_CURL_RC"
+out="" url=""
+while [ $# -gt 0 ]; do
+  case "$1" in -o) out="$2"; shift ;; http*) url="$1" ;; esac
+  shift
+done
+if [ -n "$out" ] && [ -f "$STUB_STATE/curl/${url##*/}" ]; then cp "$STUB_STATE/curl/${url##*/}" "$out"; fi
+exit 0'
   stub dpkg 'case "$1" in
   --print-architecture) echo amd64 ;;
   -s) grep -qx -- "$2" "$STUB_STATE/apt-installed" 2>/dev/null ;;
   *) exit 1 ;;
 esac'
-  stub gpg 'exit "${STUB_GPG_RC:-0}"'
+  # A gpg that models a detached signature: `--verify SIG DATA` is good only
+  # when SIG is what voxtype_sign wrote for DATA's current content. It reports
+  # the signing key as the pinned one (STUB_GPG_KEY: another fingerprint), and
+  # logs the GNUPGHOME it was given. `--import FILE` needs a non-empty FILE.
+  stub gpg 'case " $* " in
+  *" --import "*)
+    printf "%s\n" "gpg-home ${GNUPGHOME:-unset}" >> "$STUB_LOG"
+    [ -s "${!#}" ] || exit 2 ;;
+  *" --verify "*)
+    printf "%s\n" "gpg-home ${GNUPGHOME:-unset}" >> "$STUB_LOG"
+    sig="${*: -2:1}" data="${!#}" key="${STUB_GPG_KEY:-9CCF7915B750CAE8B095ED1AA3FC9F33FD209279}"
+    if [ "$(cat "$sig" 2>/dev/null)" != "signed:$(sha256sum < "$data")" ]; then
+      echo "[GNUPG:] BADSIG ${key: -16} Voxtype Release Signing"; exit 1
+    fi
+    echo "[GNUPG:] GOODSIG ${key: -16} Voxtype Release Signing"
+    echo "[GNUPG:] VALIDSIG $key 2026-09-24 1790210708 0 4 0 22 10 00 $key" ;;
+esac
+exit "${STUB_GPG_RC:-0}"'
+  stub uname 'echo "${STUB_UNAME_M:-x86_64}"'
+  stub ffmpeg # Bazzite ships it; tests of a machine without it remove this stub
+  voxtype_release_fixture
   stub fc-list 'echo "/x/JetBrainsMonoNerdFont-Regular.ttf: JetBrainsMono Nerd Font:style=Regular"'
   mkdir -p "$STATE/real"; ln -s "$(PATH=/usr/bin:/bin type -P git)" "$STATE/real/git" || { echo "missing git" >&2; exit 2; }
   write_git_stub
@@ -526,6 +628,7 @@ all_done_fixture() {
   sandboxed "$STUBS/stow" --dir="$HOME/Projects/Home/dotfiles" --target="$HOME" --restow "${folded[@]}"
   sandboxed "$STUBS/stow" --no-folding --dir="$HOME/Projects/Home/dotfiles" --target="$HOME" --restow "${NO_FOLD_PACKAGES[@]}"
   render_url_done_fixture
+  voxtype_done_fixture
   : > "$LOG"
 }
 
@@ -548,13 +651,16 @@ inside_sandbox() {
 
 # Every path the script is told about must be inside the sandbox.
 guard_sandbox() {
-  local entry n=0
-  for entry in ${LAPTOP_BREW_DIRS:-}; do
-    n=$((n + 1))
-    inside_sandbox "$entry" || { echo "guard: LAPTOP_BREW_DIRS entry outside sandbox: $entry" >&2; return 1; }
+  local list entry n
+  for list in LAPTOP_BREW_DIRS LAPTOP_LIB_DIRS; do
+    n=0
+    for entry in ${!list:-}; do
+      n=$((n + 1))
+      inside_sandbox "$entry" || { echo "guard: $list entry outside sandbox: $entry" >&2; return 1; }
+    done
+    [ "$n" -ge 1 ] || { echo "guard: $list is empty" >&2; return 1; }
   done
-  [ "$n" -ge 1 ] || { echo "guard: LAPTOP_BREW_DIRS is empty" >&2; return 1; }
-  for entry in "$HOME" "$LAPTOP_OS_RELEASE" "$LAPTOP_OSTREE_BOOTED" "$LAPTOP_YUM_REPOS_DIR" "$STUB_LOG" "$STUB_STATE"; do
+  for entry in "$HOME" "$LAPTOP_OS_RELEASE" "$LAPTOP_OSTREE_BOOTED" "$LAPTOP_YUM_REPOS_DIR" "$LAPTOP_CPUINFO" "$STUB_LOG" "$STUB_STATE"; do
     inside_sandbox "$entry" || { echo "guard: path outside sandbox: $entry" >&2; return 1; }
   done
 }
@@ -574,9 +680,10 @@ sandboxed() {
     FNM_DIR="$HOME/.local/share/fnm"
     LAPTOP_OS_RELEASE="$LAPTOP_OS_RELEASE" LAPTOP_OSTREE_BOOTED="$LAPTOP_OSTREE_BOOTED"
     LAPTOP_YUM_REPOS_DIR="$LAPTOP_YUM_REPOS_DIR" LAPTOP_BREW_DIRS="$LAPTOP_BREW_DIRS"
+    LAPTOP_CPUINFO="$LAPTOP_CPUINFO" LAPTOP_LIB_DIRS="$LAPTOP_LIB_DIRS"
     STUB_LOG="$STUB_LOG" STUB_STATE="$STUB_STATE"
   )
-  for v in XDG_CURRENT_DESKTOP STUB_GIT_FAIL STUB_GIT_TRUNC STUB_GIT_ON STUB_GIT_DO STUB_CURL_RC STUB_CURL_FAIL STUB_GPG_RC STUB_MISE_RC STUB_RESHIM_RC STUB_OSTREE_RC STUB_NPM_CI_RC STUB_PW_RC STUB_AGENT_FAIL STUB_COREPACK_RC; do
+  for v in XDG_CURRENT_DESKTOP STUB_GIT_FAIL STUB_GIT_TRUNC STUB_GIT_ON STUB_GIT_DO STUB_CURL_RC STUB_CURL_FAIL STUB_GPG_RC STUB_MISE_RC STUB_RESHIM_RC STUB_OSTREE_RC STUB_NPM_CI_RC STUB_PW_RC STUB_AGENT_FAIL STUB_COREPACK_RC STUB_GPG_KEY STUB_UNAME_M STUB_VOXTYPE_SETUP_RC LAPTOP_SKIP_VOXTYPE_MODEL; do
     if [ -n "${!v:-}" ]; then vars+=("$v=${!v}"); fi
   done
   "$SANDBOX/sysbin/env" -i "${vars[@]}" "$@"
@@ -1284,7 +1391,7 @@ test_backup_edge_cases() {
   dotfiles_fixture
   mkdir -p "$STATE/fixed-backup"
   echo "older backup" > "$STATE/fixed-backup/.bashrc"
-  stub mktemp 'if [ "$1" = -d ]; then echo "$STUB_STATE/fixed-backup"; else exec "$STUB_STATE/../sysbin/mktemp" "$@"; fi'
+  stub mktemp 'if [ "$1" = -d ] && [[ "${2:-}" == */backups/* ]]; then echo "$STUB_STATE/fixed-backup"; else exec "$STUB_STATE/../sysbin/mktemp" "$@"; fi'
   echo "current" > "$HOME/.bashrc"
   run_linux
   check "refuses the occupied destination" has "$OUT" "backup destination $STATE/fixed-backup/.bashrc already exists"
@@ -3033,6 +3140,511 @@ test_atuin_package() {
   teardown
 }
 
+# ── Tests: voxtype ───────────────────────────────────────────────────────────
+
+# voxtype for dotfiles' bin/transcribe: the pinned upstream release binary in
+# ~/.local/bin, installed only once SHA256SUMS.txt's signature and the binary's
+# hash are both verified, then its model and config. curl, gpg and voxtype are
+# fakes (see setup, write_voxtype and voxtype_release_fixture); sha256sum is
+# the real one, hashing the fake files. Everything lives in the sandbox HOME.
+VOX_ASSET="voxtype-$VOX_VERSION-linux-x86_64"
+VOX_SETUP='setup --download --model large-v3-turbo --no-post-install --quiet'
+
+vox_bin()     { echo "$HOME/.local/bin/voxtype"; }
+vox_config()  { echo "$HOME/.config/voxtype/config.toml"; }
+vox_model()   { echo "$HOME/.local/share/voxtype/models/ggml-large-v3-turbo.bin"; }
+vox_version() { sandboxed "$(vox_bin)" --version 2>/dev/null; }
+vox_variant() { sed -n 's/^# fake voxtype .*, variant: //p' "$(vox_bin)"; }
+# Nothing of voxtype's in HOME: no binary, no temp file next to it, no model, no config.
+vox_absent() {
+  [ -z "$(find "$HOME/.local/bin" -name 'voxtype*' 2>/dev/null)" ] &&
+    [ ! -e "$HOME/.local/share/voxtype" ] && [ ! -e "$HOME/.config/voxtype" ]
+}
+# The script's temp dir (and the GNUPGHOME in it) is gone, and no keyring was
+# made in HOME.
+vox_tmp_clean() { [ -z "$(find "$SANDBOX/tmp" -name 'SHA256SUMS*' -o -name gnupg -o -name "$VOX_ASSET*")" ] && [ ! -e "$HOME/.gnupg" ]; }
+vox_os() { if [ "$1" = bazzite ]; then bazzite; else os_release pop "ubuntu debian"; fi; dotfiles_fixture; }
+
+test_voxtype_install() {
+  local os before
+  for os in bazzite pop; do
+    setup "voxtype: $os, fresh install + re-run"
+    vox_os "$os"
+    run_linux
+    check "run exits 0" [ "$RC" -eq 0 ]
+    check "installs the pinned version" [ "$(vox_version)" = "voxtype $VOX_VERSION" ]
+    check "as a regular file" [ -f "$(vox_bin)" ] && [ ! -L "$(vox_bin)" ]
+    check "mode 755" [ "$(stat -c %a "$(vox_bin)")" = 755 ]
+    check "the avx2 build (no Vulkan loader, CPU has avx2)" [ "$(vox_variant)" = avx2 ]
+    check "is byte-for-byte the release asset" cmp -s "$(vox_bin)" "$STATE/curl/$VOX_ASSET-avx2"
+    check "downloads SHA256SUMS.txt from the pinned release" log_has "^curl -fsSL -o .*/SHA256SUMS.txt $VOX_RELEASE/SHA256SUMS.txt$"
+    check "downloads its signature" log_has "^curl -fsSL -o .*/SHA256SUMS.txt.asc $VOX_RELEASE/SHA256SUMS.txt.asc$"
+    check "downloads the key by its pinned fingerprint" log_has "^curl -fsSL -o .* https://keys.openpgp.org/vks/v1/by-fingerprint/$VOX_KEY$"
+    check "downloads the binary from the pinned release" log_has "^curl -fsSL -o .* $VOX_RELEASE/$VOX_ASSET-avx2$"
+    check "downloads only that build" [ "$(log_count "^curl .*/$VOX_ASSET-")" -eq 1 ]
+    check "verifies the signature of SHA256SUMS.txt" log_has '^gpg .*--verify [^ ]*/SHA256SUMS.txt.asc [^ ]*/SHA256SUMS.txt$'
+    check "before downloading the binary" logged_before '^gpg .*--verify ' "^curl .*/$VOX_ASSET-avx2$"
+    check "gpg never autostarts an agent" log_lacks '^gpg --batch( --quiet)? --(import|status-fd)'
+    check "gpg only ever gets a temporary GNUPGHOME" [ "$(log_count '^gpg-home ')" -eq "$(log_count "^gpg-home $SANDBOX/tmp/[^/]+/gnupg$")" ]
+    check "and it ran (import, verify)" [ "$(log_count '^gpg-home ')" -eq 2 ]
+    check "temp files and GNUPGHOME are gone; no ~/.gnupg" vox_tmp_clean
+    check "no temp file left next to the binary" [ "$(find "$HOME/.local/bin" -name 'voxtype*' | wc -l)" -eq 1 ]
+    check "says what was verified" has "$OUT" "installed $VOX_ASSET-avx2 as $(vox_bin) \(GPG signature and SHA256 verified\)"
+    check "notes the model's size" has "$OUT" 'large-v3-turbo model is a ~1\.6 GB download'
+    check "downloads the model with the installed voxtype" log_has "^voxtype $VOX_SETUP$"
+    check "once" [ "$(log_count '^voxtype setup')" -eq 1 ]
+    check "the model is there" [ -f "$(vox_model)" ]
+    check "the generated config now uses large-v3-turbo" [ "$(cat "$(vox_config)")" = "${VOX_DEFAULT_CONFIG/$'\n'model = \"base.en\"/$'\n'model = \"large-v3-turbo\"}" ]
+    check "only the model line changed (the comment still says base.en)" grep -qx '# The default is model = "base.en"' "$(vox_config)"
+    check "ffmpeg is present: not installed" log_lacks '(apt-get|brew) install.* ffmpeg'
+    check "no voxtype warning" lacks "$OUT" "! .*voxtype"
+
+    before="$(sha256sum "$(vox_bin)" "$(vox_config)" "$(vox_model)")"
+    : > "$LOG"
+    run_linux
+    check "re-run exits 0" [ "$RC" -eq 0 ]
+    check "re-run reports it installed" has "$OUT" "voxtype $VOX_VERSION already installed"
+    check "re-run reports the model downloaded" has "$OUT" "voxtype model large-v3-turbo already downloaded"
+    check "re-run downloads nothing of voxtype's" log_lacks "^curl .*(voxtype|openpgp)"
+    check "re-run verifies nothing (nothing to install)" log_lacks '^gpg .*--verify'
+    check "re-run only asks voxtype its version" [ "$(log_count '^voxtype ')" -eq "$(log_count '^voxtype --version$')" ]
+    check "re-run leaves binary, config and model as they were" [ "$before" = "$(sha256sum "$(vox_bin)" "$(vox_config)" "$(vox_model)")" ]
+    teardown
+  done
+
+  setup "voxtype: an older version is upgraded"
+  vox_os bazzite
+  mkdir -p "$HOME/.local/bin"
+  write_voxtype "$(vox_bin)" 1.0.0 old
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "now the pinned version" [ "$(vox_version)" = "voxtype $VOX_VERSION" ]
+  check "replaced by the release asset" cmp -s "$(vox_bin)" "$STATE/curl/$VOX_ASSET-avx2"
+  check "mode 755" [ "$(stat -c %a "$(vox_bin)")" = 755 ]
+  check "still a regular file" [ -f "$(vox_bin)" ] && [ ! -L "$(vox_bin)" ]
+  check "verified first" logged_before '^gpg .*--verify ' "^curl .*/$VOX_ASSET-avx2$"
+  check "no temp file left next to it" [ "$(find "$HOME/.local/bin" -name 'voxtype*' | wc -l)" -eq 1 ]
+  teardown
+
+  setup "voxtype: a symlink there is never replaced"
+  vox_os bazzite
+  mkdir -p "$HOME/.local/bin" "$HOME/src"
+  write_voxtype "$HOME/src/voxtype" 1.0.0 mine
+  ln -s "$HOME/src/voxtype" "$(vox_bin)"
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "warns" has "$OUT" "skipped voxtype: $(vox_bin) is not a regular file"
+  check "the link is kept" [ "$(readlink "$(vox_bin)")" = "$HOME/src/voxtype" ]
+  check "nothing downloaded" log_lacks "^curl .*(voxtype|openpgp)"
+  check "it is not run at all" log_lacks '^voxtype '
+  check "its target is untouched" [ "$(sandboxed "$HOME/src/voxtype" --version)" = "voxtype 1.0.0" ]
+  teardown
+
+  setup "voxtype: a directory there is never replaced"
+  vox_os pop
+  mkdir -p "$(vox_bin)"
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "warns" has "$OUT" "skipped voxtype: $(vox_bin) is not a regular file"
+  check "still a directory" is_real_dir "$(vox_bin)"
+  check "nothing downloaded" log_lacks "^curl .*(voxtype|openpgp)"
+  teardown
+
+  for os in bazzite pop; do
+    setup "voxtype: $os, not x86_64"
+    vox_os "$os"
+    STUB_UNAME_M=aarch64 run_linux
+    check "run exits 0" [ "$RC" -eq 0 ]
+    check "warns and skips" has "$OUT" "skipped voxtype: only its x86_64 release binaries are installed here \(this machine is aarch64\)"
+    check "the warning is in the summary" has "$OUT" "    ! skipped voxtype: only its x86_64"
+    check "nothing downloaded" log_lacks "^curl .*(voxtype|openpgp)"
+    check "no signature check, no voxtype" log_lacks '^(gpg-home|voxtype) '
+    check "nothing installed" vox_absent
+    STUB_UNAME_M=aarch64 run_linux --dry-run
+    check "dry run plans nothing either" lacks "$OUT" "\[dry-run\] .*voxtype"
+    teardown
+  done
+
+  setup "voxtype: ~/.local/bin folded into the repo"
+  vox_os bazzite
+  mkdir -p "$HOME/.local"
+  ln -s "$HOME/Projects/Home/dotfiles/applications/.local/bin" "$HOME/.local/bin"
+  local repo_before; repo_before="$(repo_snapshot)"
+  run_linux --dry-run
+  check "dry run: skipped, since the binary would land in the repo" has "$OUT" "skipped voxtype: $HOME/.local/bin resolves into the dotfiles repo"
+  check "dry run: no install planned" lacks "$OUT" "\[dry-run\] .*voxtype"
+  check "the repo is untouched" [ "$repo_before" = "$(repo_snapshot)" ]
+  teardown
+}
+
+test_voxtype_variants() {
+  local case_ want
+  for case_ in "vulkan-libdir:vulkan" "vulkan-ldconfig:vulkan" "avx512:avx512" "avx2:avx2" "baseline:baseline" "no-cpuinfo:baseline" "ldconfig-without-vulkan:avx2"; do
+    want="${case_#*:}"; case_="${case_%%:*}"
+    setup "voxtype: build for $case_"
+    vox_os bazzite
+    case "$case_" in
+      vulkan-libdir)   mkdir -p "$SANDBOX/lib"; touch "$SANDBOX/lib/libvulkan.so.1" ;;
+      vulkan-ldconfig) stub ldconfig 'echo "	libvulkan.so.1 (libc6,x86-64) => /usr/lib64/libvulkan.so.1"' ;;
+      avx512)          echo "flags		: fpu avx avx2 avx512f avx512dq" > "$LAPTOP_CPUINFO" ;;
+      baseline)        echo "flags		: fpu sse4_2 avx" > "$LAPTOP_CPUINFO" ;;
+      no-cpuinfo)      rm "$LAPTOP_CPUINFO" ;;
+      ldconfig-without-vulkan) stub ldconfig 'echo "	libvulkan_radeon.so (libc6,x86-64) => /usr/lib64/libvulkan_radeon.so"' ;;
+    esac
+    run_linux --dry-run
+    check "dry run plans $VOX_ASSET-$want" has "$OUT" "\[dry-run\] download $VOX_RELEASE/$VOX_ASSET-$want \("
+    run_linux
+    check "run installs the $want build" [ "$(vox_variant)" = "$want" ]
+    check "downloads only that build" [ "$(log_count "^curl .*/$VOX_ASSET-")" -eq 1 ]
+    teardown
+  done
+}
+
+# Each failure installs nothing, warns (also in the summary), and lets the run
+# finish. vox_refused checks that; $1 is the warning.
+vox_refused() {
+  check "run still completes" [ "$RC" -eq 0 ]
+  check "warns why" has "$OUT" "$1"
+  check "the warning is in the summary" has "$OUT" "^    ! .*voxtype"
+  check "nothing installed: no binary, temp file, model or config" vox_absent
+  check "the model is never downloaded" log_lacks '^voxtype '
+  check "temp files and GNUPGHOME are gone; no ~/.gnupg" vox_tmp_clean
+  check "the rest of the run went on (git configured after it)" has "$OUT" "Configuring git"
+}
+
+test_voxtype_verification() {
+  local d os
+
+  for os in bazzite pop; do
+    setup "voxtype: $os, checksum mismatch"
+    vox_os "$os"
+    echo "# tampered after signing" >> "$STATE/curl/$VOX_ASSET-avx2"
+    run_linux
+    vox_refused "voxtype not installed: SHA256 mismatch for $VOX_ASSET-avx2 \(expected [0-9a-f]{64}, got [0-9a-f]{64}\)"
+    check "the signature itself was good" log_has '^gpg .*--verify '
+    check "the binary was downloaded, then rejected" log_has "^curl .*/$VOX_ASSET-avx2$"
+    teardown
+  done
+
+  setup "voxtype: checksum mismatch on an upgrade keeps the old binary"
+  vox_os bazzite
+  mkdir -p "$HOME/.local/bin"
+  write_voxtype "$(vox_bin)" 1.0.0 old
+  echo "# tampered after signing" >> "$STATE/curl/$VOX_ASSET-avx2"
+  run_linux
+  check "run still completes" [ "$RC" -eq 0 ]
+  check "warns why" has "$OUT" "voxtype not installed: SHA256 mismatch"
+  check "the old binary is untouched" [ "$(vox_version)" = "voxtype 1.0.0" ] && [ "$(vox_variant)" = old ]
+  check "no temp file left next to it" [ "$(find "$HOME/.local/bin" -name 'voxtype*' | wc -l)" -eq 1 ]
+  check "the model is not downloaded with the old binary" log_lacks '^voxtype setup'
+  teardown
+
+  setup "voxtype: SHA256SUMS.txt does not list the build"
+  vox_os bazzite
+  d="$STATE/curl"
+  grep -v -- "-avx2\$" "$d/SHA256SUMS.txt" > "$d/sums.new"; mv "$d/sums.new" "$d/SHA256SUMS.txt"
+  voxtype_sign
+  run_linux
+  vox_refused "voxtype not installed: SHA256SUMS.txt does not list $VOX_ASSET-avx2"
+  teardown
+
+  # The attack the signature is there for: a replaced binary and a
+  # SHA256SUMS.txt rewritten to match it. The checksum alone would pass.
+  for os in bazzite pop; do
+    setup "voxtype: $os, bad signature (SHA256SUMS.txt rewritten to match a replaced binary)"
+    vox_os "$os"
+    d="$STATE/curl"
+    write_voxtype "$d/$VOX_ASSET-avx2" "$VOX_VERSION" evil
+    voxtype_sums   # not signed again
+    run_linux
+    vox_refused "voxtype not installed: SHA256SUMS.txt has no good GPG signature"
+    check "the checksum would have matched (control)" grep -qx "$(sha256sum < "$d/$VOX_ASSET-avx2" | cut -d' ' -f1)  $VOX_ASSET-avx2" "$d/SHA256SUMS.txt"
+    check "the binary is never even downloaded" log_lacks "^curl .*/$VOX_ASSET-"
+    teardown
+  done
+
+  setup "voxtype: a good signature, but not by the pinned key"
+  vox_os bazzite
+  STUB_GPG_KEY=0123456789ABCDEF0123456789ABCDEF01234567 run_linux # gitleaks:allow (a made-up fingerprint)
+  vox_refused "voxtype not installed: SHA256SUMS.txt is not signed by $VOX_KEY"
+  check "gpg itself reported success (control)" log_has '^gpg .*--verify '
+  check "the binary is never even downloaded" log_lacks "^curl .*/$VOX_ASSET-"
+  teardown
+
+  setup "voxtype: the pinned key only as a prefix of the signer's fingerprint"
+  vox_os bazzite
+  STUB_GPG_KEY="${VOX_KEY}00" run_linux
+  vox_refused "voxtype not installed: SHA256SUMS.txt is not signed by $VOX_KEY"
+  teardown
+
+  for os in bazzite pop; do
+    setup "voxtype: $os, no gpg"
+    vox_os "$os"
+    # On Ubuntu a real run installs gpg with apt, and mise's apt key needs it:
+    # with mise already there, a missing gpg is first noticed here.
+    if [ "$os" = pop ]; then mise_node_fixture; fi
+    rm "$STUBS/gpg"
+    run_linux
+    vox_refused "skipped voxtype: gpg not found, so the release's signature can't be checked, and nothing is installed unverified"
+    check "nothing of voxtype's is downloaded" log_lacks "^curl .*(voxtype|openpgp)"
+    teardown
+  done
+
+  setup "voxtype: the signature cannot be downloaded"
+  vox_os bazzite
+  STUB_CURL_FAIL=SHA256SUMS.txt.asc run_linux
+  vox_refused "voxtype not installed: could not download $VOX_RELEASE/SHA256SUMS.txt.asc"
+  check "the binary is never even downloaded" log_lacks "^curl .*/$VOX_ASSET-"
+  teardown
+
+  setup "voxtype: the key cannot be imported"
+  vox_os bazzite
+  : > "$STATE/curl/$VOX_KEY"
+  run_linux
+  vox_refused "voxtype not installed: gpg could not import the signing key"
+  teardown
+
+  setup "voxtype: the binary cannot be downloaded"
+  vox_os bazzite
+  STUB_CURL_FAIL="$VOX_ASSET-avx2" run_linux
+  vox_refused "voxtype not installed: could not download $VOX_RELEASE/$VOX_ASSET-avx2"
+  teardown
+
+  setup "voxtype: the installed binary reports another version"
+  vox_os bazzite
+  d="$STATE/curl"
+  write_voxtype "$d/$VOX_ASSET-avx2" 9.9.9 avx2
+  voxtype_sums
+  voxtype_sign
+  run_linux
+  check "run still completes" [ "$RC" -eq 0 ]
+  check "warns" has "$OUT" "$(vox_bin) does not report 'voxtype $VOX_VERSION'; not downloading its model"
+  check "no model download" log_lacks '^voxtype setup'
+  teardown
+}
+
+test_voxtype_model() {
+  local before os
+
+  setup "voxtype: model present, config already large-v3-turbo"
+  vox_os bazzite
+  voxtype_done_fixture
+  before="$(sha256sum "$(vox_config)" "$(vox_model)")"
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "reports the model downloaded" has "$OUT" "voxtype model large-v3-turbo already downloaded"
+  check "no size note" lacks "$OUT" '1\.6 GB'
+  check "no model download" log_lacks '^voxtype setup'
+  check "config and model untouched" [ "$before" = "$(sha256sum "$(vox_config)" "$(vox_model)")" ]
+  teardown
+
+  setup "voxtype: model present, config still the generated default"
+  vox_os bazzite
+  voxtype_done_fixture
+  cp "$STATE/voxtype-default-config" "$(vox_config)"
+  run_linux
+  check "no model download" log_lacks '^voxtype setup'
+  check "the generated model line is switched" grep -qx 'model = "large-v3-turbo"' "$(vox_config)"
+  check "says so" has "$OUT" "set model = \"large-v3-turbo\" in $(vox_config)"
+  teardown
+
+  for os in bazzite pop; do
+    setup "voxtype: $os, model missing, user-edited model line"
+    vox_os "$os"
+    mkdir -p "$HOME/.config/voxtype"
+    printf '# mine\n[whisper]\nmodel = "small.en"\n' > "$(vox_config)"
+    before="$(sha256sum "$(vox_config)")"
+    run_linux
+    check "run exits 0" [ "$RC" -eq 0 ]
+    check "the model is downloaded" log_has "^voxtype $VOX_SETUP$"
+    check "the model is there" [ -f "$(vox_model)" ]
+    check "the config is byte-identical" [ "$before" = "$(sha256sum "$(vox_config)")" ]
+    check "says it was left alone" has "$OUT" "voxtype config's model line is not the generated default; left as it is"
+    teardown
+  done
+
+  local line
+  for line in 'model = "base.en"  # on purpose' '  model = "base.en"' 'model="base.en"' "model = 'base.en'" 'model = "base"'; do
+    setup "voxtype: model line edited by hand: $line"
+    vox_os bazzite
+    mkdir -p "$HOME/.config/voxtype"
+    printf '[whisper]\n%s\n' "$line" > "$(vox_config)"
+    before="$(sha256sum "$(vox_config)")"
+    run_linux
+    check "the model is downloaded" [ -f "$(vox_model)" ]
+    check "the config is byte-identical" [ "$before" = "$(sha256sum "$(vox_config)")" ]
+    teardown
+  done
+
+  setup "voxtype: config is a link (kept elsewhere)"
+  vox_os bazzite
+  mkdir -p "$HOME/.config/voxtype" "$HOME/elsewhere"
+  cp "$STATE/voxtype-default-config" "$HOME/elsewhere/voxtype.toml"
+  ln -s "$HOME/elsewhere/voxtype.toml" "$(vox_config)"
+  run_linux
+  check "still a link" [ "$(readlink "$(vox_config)")" = "$HOME/elsewhere/voxtype.toml" ]
+  check "its target is not edited" cmp -s "$HOME/elsewhere/voxtype.toml" "$STATE/voxtype-default-config"
+  teardown
+
+  for os in bazzite pop; do
+    setup "voxtype: $os, LAPTOP_SKIP_VOXTYPE_MODEL=1"
+    vox_os "$os"
+    LAPTOP_SKIP_VOXTYPE_MODEL=1 run_linux
+    check "run exits 0" [ "$RC" -eq 0 ]
+    check "the binary is still installed" [ "$(vox_version)" = "voxtype $VOX_VERSION" ]
+    check "says the model was skipped" has "$OUT" "skipped the large-v3-turbo model and voxtype's config \(LAPTOP_SKIP_VOXTYPE_MODEL=1\)"
+    check "no model download" log_lacks '^voxtype setup'
+    check "no model, no config" [ ! -e "$HOME/.local/share/voxtype" ] && [ ! -e "$HOME/.config/voxtype" ]
+    check "no size note" lacks "$OUT" '1\.6 GB'
+    LAPTOP_SKIP_VOXTYPE_MODEL=1 run_linux --dry-run
+    check "dry run plans no model download either" lacks "$OUT" "\[dry-run\] .*voxtype setup"
+    teardown
+  done
+
+  setup "voxtype: LAPTOP_SKIP_VOXTYPE_MODEL=1 leaves a default config alone"
+  vox_os bazzite
+  voxtype_done_fixture
+  cp "$STATE/voxtype-default-config" "$(vox_config)"
+  LAPTOP_SKIP_VOXTYPE_MODEL=1 run_linux
+  check "config untouched" cmp -s "$(vox_config)" "$STATE/voxtype-default-config"
+  teardown
+
+  setup "voxtype: the model download fails, then works"
+  vox_os bazzite
+  STUB_VOXTYPE_SETUP_RC=1 run_linux
+  check "run still completes" [ "$RC" -eq 0 ]
+  check "warns" has "$OUT" "'voxtype setup --download --model large-v3-turbo' failed; next run will retry"
+  check "the binary stays installed" [ "$(vox_version)" = "voxtype $VOX_VERSION" ]
+  check "no config written" [ ! -e "$(vox_config)" ]
+  : > "$LOG"
+  run_linux
+  check "the next run retries the model" log_has "^voxtype $VOX_SETUP$"
+  check "without installing the binary again" log_lacks "^curl .*(voxtype|openpgp)"
+  check "the model is there" [ -f "$(vox_model)" ]
+  check "the config uses it" grep -qx 'model = "large-v3-turbo"' "$(vox_config)"
+  teardown
+}
+
+test_voxtype_dry_run() {
+  local os before
+  for os in bazzite pop; do
+    setup "voxtype: $os dry-run (fresh)"
+    vox_os "$os"
+    before="$(home_snapshot)"
+    run_linux --dry-run
+    check "exits 0" [ "$RC" -eq 0 ]
+    check "plans the download" has "$OUT" "\[dry-run\] download $VOX_RELEASE/$VOX_ASSET-avx2 \(with SHA256SUMS.txt and SHA256SUMS.txt.asc\)$"
+    check "plans both verifications, naming the pinned key" has "$OUT" "\[dry-run\] verify SHA256SUMS.txt's GPG signature against $VOX_KEY \(key from keys.openpgp.org, temporary GNUPGHOME\) and the binary's SHA256$"
+    check "plans the install" has "$OUT" "\[dry-run\] install it as $(vox_bin) \(mode 755\)$"
+    check "notes the model's size" has "$OUT" 'large-v3-turbo model is a ~1\.6 GB download \(LAPTOP_SKIP_VOXTYPE_MODEL=1 skips it\)'
+    check "plans the model download" has "$OUT" "\[dry-run\] $(vox_bin) $VOX_SETUP$"
+    check "plans the config change" has "$OUT" "\[dry-run\] set model = \"large-v3-turbo\" in $(vox_config) if its model line is the generated \"base.en\"$"
+    check "downloads nothing" log_lacks '^curl'
+    check "runs no gpg and no voxtype" log_lacks '^(gpg|gpg-home|voxtype) '
+    check "no mutating command was executed" log_lacks "$MUTATING"
+    check "HOME is untouched" [ "$before" = "$(home_snapshot)" ]
+    check "no temp files" [ -z "$(ls -A "$SANDBOX/tmp")" ]
+    teardown
+
+    setup "voxtype: $os dry-run (already set up)"
+    vox_os "$os"
+    voxtype_done_fixture
+    before="$(home_snapshot)"
+    run_linux --dry-run
+    check "exits 0" [ "$RC" -eq 0 ]
+    check "reports it installed" has "$OUT" "voxtype $VOX_VERSION already installed"
+    check "plans nothing for voxtype" lacks "$OUT" "\[dry-run\] .*(voxtype|SHA256SUMS)"
+    check "only asks voxtype its version" [ "$(log_count '^voxtype ')" -eq "$(log_count '^voxtype --version$')" ]
+    check "HOME is untouched" [ "$before" = "$(home_snapshot)" ]
+    teardown
+  done
+
+  setup "voxtype: dry-run (older version installed, default config, model present)"
+  vox_os bazzite
+  voxtype_done_fixture
+  write_voxtype "$(vox_bin)" 1.0.0 old
+  cp "$STATE/voxtype-default-config" "$(vox_config)"
+  before="$(home_snapshot)"
+  run_linux --dry-run
+  check "plans the upgrade" has "$OUT" "\[dry-run\] download $VOX_RELEASE/$VOX_ASSET-avx2 "
+  check "plans the config change as a command" has "$OUT" "\[dry-run\] sed -i .*large-v3-turbo.* $(vox_config)$"
+  check "no model download planned" lacks "$OUT" "\[dry-run\] .*voxtype setup"
+  check "downloads nothing" log_lacks '^curl'
+  check "HOME is untouched" [ "$before" = "$(home_snapshot)" ]
+  teardown
+
+  setup "voxtype: dry-run without gpg still prints the plan"
+  vox_os pop   # a real run installs gpg with apt before this step
+  rm "$STUBS/gpg"
+  run_linux --dry-run
+  check "plans the download" has "$OUT" "\[dry-run\] download $VOX_RELEASE/$VOX_ASSET-avx2 "
+  teardown
+}
+
+test_voxtype_ffmpeg() {
+  setup "voxtype: pop without ffmpeg"
+  vox_os pop
+  rm "$STUBS/ffmpeg"
+  run_linux --dry-run
+  check "dry run plans ffmpeg via apt" has "$OUT" "\[dry-run\] sudo apt-get install -y ffmpeg$"
+  check "dry run installs nothing" log_lacks "$MUTATING"
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "ffmpeg installed via apt" log_has '^sudo apt-get install -y ffmpeg$'
+  check "no brew" log_lacks '^brew '
+  check "voxtype still installed" [ "$(vox_version)" = "voxtype $VOX_VERSION" ]
+  teardown
+
+  setup "voxtype: bazzite without ffmpeg"
+  vox_os bazzite
+  rm "$STUBS/ffmpeg"
+  run_linux --dry-run
+  check "dry run plans ffmpeg via Homebrew" has "$OUT" "\[dry-run\] brew install ffmpeg$"
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "ffmpeg installed via Homebrew" log_has '^brew install ffmpeg$'
+  check "no apt, no sudo" log_lacks '^(sudo|apt-get) '
+  teardown
+
+  setup "voxtype: bazzite, the ffmpeg install fails"
+  vox_os bazzite
+  rm "$STUBS/ffmpeg"
+  sed -i '2a [ "$*" != "install ffmpeg" ] || exit 1' "$STUBS/brew"   # after the stub logs the call
+  run_linux
+  check "run still completes" [ "$RC" -eq 0 ]
+  check "warns" has "$OUT" "'brew install ffmpeg' failed; transcribe needs ffmpeg"
+  check "voxtype still installed" [ "$(vox_version)" = "voxtype $VOX_VERSION" ]
+  teardown
+
+  local os
+  for os in bazzite pop; do
+    setup "voxtype: $os with ffmpeg"
+    vox_os "$os"
+    run_linux
+    check "reports ffmpeg present" has "$OUT" "ffmpeg already installed \($STUBS/ffmpeg\)"
+    check "installs no ffmpeg" log_lacks '(apt-get|brew) install.* ffmpeg'
+    teardown
+  done
+}
+
+test_voxtype_pins() {
+  setup "voxtype: the script's pins are the tests' pins"
+  check "version" grep -qx "VOXTYPE_VERSION=$VOX_VERSION" "$SCRIPT"
+  check "signing key fingerprint" grep -qE "^VOXTYPE_KEY_FPR=$VOX_KEY( |\$)" "$SCRIPT"
+  teardown
+
+  setup "voxtype: guard rejects host CPU info and lib dirs"
+  bazzite
+  ( LAPTOP_CPUINFO=/proc/cpuinfo; guard_sandbox 2>/dev/null )
+  check "rejects the host's /proc/cpuinfo" [ $? -ne 0 ]
+  local bad
+  for bad in "/usr/lib64" "$SANDBOX/lib /usr/lib64" ""; do
+    ( LAPTOP_LIB_DIRS="$bad"; guard_sandbox 2>/dev/null )
+    check "rejects LAPTOP_LIB_DIRS='${bad//$SANDBOX/<sandbox>}'" [ $? -ne 0 ]
+  done
+  teardown
+}
+
 # ── Tests: package lists match the dotfiles repo ─────────────────────────────
 
 # Top-level package directories of adamdaw/dotfiles (main), without docs/,
@@ -3141,6 +3753,13 @@ TESTS=(
   test_agent_clis
   test_stow_packages_match_dotfiles
   test_atuin_package
+  test_voxtype_install
+  test_voxtype_variants
+  test_voxtype_verification
+  test_voxtype_model
+  test_voxtype_dry_run
+  test_voxtype_ffmpeg
+  test_voxtype_pins
 )
 
 for t in "${TESTS[@]}"; do
