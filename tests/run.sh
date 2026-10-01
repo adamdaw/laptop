@@ -4658,8 +4658,9 @@ test_stow_packages_match_dotfiles() {
 # Read as text only: brew is never run, and nothing here touches the network.
 
 BREWFILE="$ROOT/mac/Brewfile"
-# One entry: a kind, a quoted name, optional `key: value` options, optional comment.
-BREWFILE_ENTRY='^(tap|brew|cask|mas|vscode) "([A-Za-z0-9@._/+ -]+)"((, [a-z_]+: [^,#]+)*)([[:space:]]+#.*)?$'
+# One entry: a kind, a quoted name, optional comment. No options: the file
+# needs none, so none are accepted, except the `id: NUMBER` a mas entry must have.
+BREWFILE_ENTRY='^(tap|brew|cask|mas|vscode) "([A-Za-z0-9@._/+ -]+)"(, id: [0-9]+)?([[:space:]]+#.*)?$'
 
 # Formulae `linux` installs from Homebrew that the Mac deliberately goes
 # without. Every entry needs a comment saying why. Empty: the Mac wants all of
@@ -4667,17 +4668,18 @@ BREWFILE_ENTRY='^(tap|brew|cask|mas|vscode) "([A-Za-z0-9@._/+ -]+)"((, [a-z_]+: 
 LINUX_ONLY_FORMULAE=()
 
 # Print "KIND NAME" for each entry of Brewfile $1, and "invalid LINE_NO" for
-# each line that is not blank, a comment or an entry (a mas entry needs an id).
+# each line that is not blank, a comment or an entry (a mas entry needs an id,
+# and only a mas entry may have one).
 brewfile_entries() {
-  local line n=0 kind name opts
+  local line n=0 kind name id
   while IFS= read -r line || [ -n "$line" ]; do
     n=$((n + 1))
     [[ "$line" =~ ^[[:space:]]*(#.*)?$ ]] && continue
     [[ "$line" =~ $BREWFILE_ENTRY ]] || { echo "invalid $n"; continue; }
-    kind="${BASH_REMATCH[1]}" name="${BASH_REMATCH[2]}" opts="${BASH_REMATCH[3]}"
-    if [ "$kind" = mas ] && [[ ! "$opts" =~ ,\ id:\ [0-9]+ ]]; then
+    kind="${BASH_REMATCH[1]}" name="${BASH_REMATCH[2]}" id="${BASH_REMATCH[3]}"
+    if [ "$kind" = mas ] && [ -z "$id" ]; then
       echo "invalid $n"
-    elif [ "$kind" != mas ] && [[ "$name" == *" "* ]]; then
+    elif [ "$kind" != mas ] && { [ -n "$id" ] || [[ "$name" == *" "* ]]; }; then
       echo "invalid $n"
     else
       echo "$kind $name"
@@ -4724,11 +4726,13 @@ test_brewfile_parses() {
 
   # The checks themselves, against Brewfiles that must and must not pass.
   tmp="$(mktemp -d)"
-  printf '%s\n' '# comment' '' 'tap "a/b"' 'brew "x@1", restart_service: :changed # why' 'cask "y"' \
+  printf '%s\n' '# comment' '' 'tap "a/b"' 'brew "x@1" # why' 'cask "y"' \
     'mas "Some App", id: 123' 'vscode "a.b"' > "$tmp/good"
-  check "accepts each entry kind, options and comments" [ "$(brewfile_entries "$tmp/good" | tr '\n' ',')" = "tap a/b,brew x@1,cask y,mas Some App,vscode a.b," ]
-  printf '%s\n' 'brew "x"' 'npm "y"' 'brew x' 'brew "a b"' 'mas "App"' 'system "rm -rf /"' 'brew "x"; system "id"' > "$tmp/bad"
-  check "rejects other kinds, unquoted names, a mas without id, and Ruby code" [ "$(brewfile_entries "$tmp/bad" | tr '\n' ',')" = "brew x,invalid 2,invalid 3,invalid 4,invalid 5,invalid 6,invalid 7," ]
+  check "accepts each entry kind and comments" [ "$(brewfile_entries "$tmp/good" | tr '\n' ',')" = "tap a/b,brew x@1,cask y,mas Some App,vscode a.b," ]
+  printf '%s\n' 'brew "x"' 'npm "y"' 'brew review_bad' 'brew "a b"' 'mas "App"' 'system "rm -rf /"' 'brew "x"; system "id"' \
+    'brew "review-bad", restart_service: "' 'brew "review-bad", restart_service: (' \
+    'brew "y", restart_service: :changed' 'brew "z", id: 1' 'mas "App", id: x' 'brew "w" trailing' > "$tmp/bad"
+  check "rejects other kinds, unquoted names, a mas without id, Ruby code, and every option but a mas id" [ "$(brewfile_entries "$tmp/bad" | tr '\n' ',')" = "brew x,invalid 2,invalid 3,invalid 4,invalid 5,invalid 6,invalid 7,invalid 8,invalid 9,invalid 10,invalid 11,invalid 12,invalid 13," ]
   printf '%s\n' 'brew "x"' 'cask "x"' 'brew "y"' 'brew "x" # again' > "$tmp/dup"
   check "reports a duplicate (a brew and a cask of one name are two entries)" [ "$(brewfile_duplicates "$tmp/dup")" = "brew x" ]
   rm -rf "$tmp"

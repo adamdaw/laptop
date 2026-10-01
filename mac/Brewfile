@@ -23,13 +23,14 @@ brew "ripgrep"
 brew "fd"
 brew "jq"
 brew "wget"
+brew "coreutils" # remote-status needs timeout, which macOS doesn't ship
 cask "ghostty"
 
 # ── Editor ───────────────────────────────────────────────────────────────────
 brew "neovim" # the dotfiles config needs 0.12 or newer
 brew "tree-sitter-cli" # builds the treesitter parsers (needs a C compiler: Xcode Command Line Tools)
 brew "shellcheck"
-brew "markdownlint-cli2"
+brew "markdownlint-cli2" # pulls in Homebrew's node as a dependency; don't use that node (docs/mac.md)
 
 # ── Git ──────────────────────────────────────────────────────────────────────
 brew "git"

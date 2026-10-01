@@ -29,8 +29,10 @@ brew bundle install --file=mac/Brewfile           # install what is missing
 - `brew bundle check` exits 0 when everything in the file is installed and up
   to date, and non-zero otherwise. `--verbose` lists what is unmet.
 - `brew bundle install` installs what is missing and **upgrades** anything in
-  the file that is outdated. Add `--no-upgrade` to install only what is
-  missing. Packages already installed and current are left alone.
+  the file that is outdated. With `--no-upgrade` it doesn't run `brew upgrade`
+  on outdated entries, but they may still be upgraded when installing
+  something else needs it. Packages already installed and current are left
+  alone.
 - Both read `./Brewfile` unless `--file` is given, so keep the `--file`.
 
 ### What `brew bundle cleanup` would do
@@ -51,25 +53,71 @@ it gone.
 
 ## After `brew bundle`
 
-These are the steps `linux` does on Linux that the Brewfile can't.
+These are the steps `linux` does on Linux that the Brewfile can't. They mirror
+what `linux` runs; none has been tried on macOS.
 
-1. **Node, through mise.** `mise use -g node@lts`. Don't install Node from
-   Homebrew or fnm.
-2. **npm tools**, under that Node:
+### Node: mise's, never Homebrew's
 
-   ```bash
-   npm install -g @anthropic-ai/claude-code @openai/codex @earendil-works/pi-coding-agent
-   npm install -g @salesforce/cli @salesforce/lwc-language-server   # Salesforce work only
-   sf plugins install code-analyzer                                  # needs the JDK below
-   ```
+```bash
+mise use -g node@lts
+```
 
-3. **Java 21.** `openjdk@21` is keg-only: Homebrew doesn't link it into its
-   prefix. The dotfiles' bash and zsh configuration finds it under the keg and
-   sets `JAVA_HOME`, so no `sudo ln -s` is needed for the shells. If
-   `openjdk@17` is still installed from before, it can go once 21 works
-   (`brew uninstall openjdk@17`).
-4. **GitHub.** `gh auth login`, before cloning anything private.
-5. **Dotfiles**, below.
+Homebrew installs its own `node` anyway, as a dependency of
+`markdownlint-cli2`. That one must not be used for anything below: a bare
+`npm` on a Mac whose shells aren't set up yet is likely to be Homebrew's, and
+its global packages land in Homebrew's prefix, not under mise. So every
+command here goes through `mise exec node@lts --`, which puts mise's Node LTS
+first on `PATH` for that one command, whatever the shell has activated.
+
+### npm tools
+
+```bash
+mise exec node@lts -- npm install -g @anthropic-ai/claude-code @openai/codex @earendil-works/pi-coding-agent
+mise exec node@lts -- corepack enable pnpm
+mise reshim
+```
+
+Salesforce work only (the plugin needs the JDK below):
+
+```bash
+mise exec node@lts -- npm install -g @salesforce/cli @salesforce/lwc-language-server
+mise reshim
+mise exec node@lts -- sf plugins install code-analyzer
+```
+
+### Links in `~/.local/bin`
+
+`claude`, `codex` and `pi` must be linked **directly** to Node LTS's bin
+directory, not to mise's shims. Omnigent starts them with a renamed
+`argv[0]`, and a mise shim picks its tool from `argv[0]`, so it rejects the
+call. `pnpm` is linked the same way. `node`, `npm`, `npx` and `corepack` link
+to the shims.
+
+```bash
+lts=~/.local/share/mise/installs/node/lts/bin    # mise's default data dir
+ls "$lts/claude" "$lts/codex" "$lts/pi" "$lts/pnpm"   # all four must exist first
+mkdir -p ~/.local/bin
+for tool in claude codex pi pnpm; do ln -s "$lts/$tool" ~/.local/bin/$tool; done
+for tool in node npm npx corepack; do ln -s ~/.local/share/mise/shims/$tool ~/.local/bin/$tool; done
+```
+
+`ln -s` refuses to replace a file that is already there; look at what it is
+before removing it. If `MISE_DATA_DIR` or `XDG_DATA_HOME` is set, mise's
+directory is elsewhere. When mise moves to a new Node LTS, `lts` points at an
+install without the three tools: run the first `npm install -g` line again.
+
+### Java 21
+
+`openjdk@21` is keg-only: Homebrew doesn't link it into its prefix. The
+dotfiles' bash and zsh configuration finds it under the keg and sets
+`JAVA_HOME`, so no `sudo ln -s` is needed for the shells. If `openjdk@17` is
+still installed from before, it can go once 21 works
+(`brew uninstall openjdk@17`).
+
+### GitHub, then the dotfiles
+
+`gh auth login`, before cloning anything private. Then stow the dotfiles
+(next section) and install render-url's dependencies (the one after).
 
 ## Stowing the dotfiles on macOS
 
@@ -120,6 +168,38 @@ ln -s ~/Projects/Home/dotfiles/atuin/.config/atuin/config.toml "$cfg"
 History search (`Ctrl+R`) then works. `?` (Atuin AI) fails with a connection
 error on the Mac, because the server it talks to isn't set up there.
 
+## render-url
+
+`bin/render-url` exits with an error until Playwright is installed next to
+the stowed files. After `stow --no-folding -t "$HOME" render-url`:
+
+```bash
+ls -ld ~/.local/share/render-url    # must be a real directory, not a link into the dotfiles
+cd ~/.local/share/render-url
+mise exec node@lts -- npm ci
+mise exec node@lts -- npx playwright install chromium
+```
+
+If that directory is a link into the dotfiles repository, stop: npm would
+write `node_modules` into the repository. Unstow the package and stow it
+again with `--no-folding`. Run `npm ci` again whenever `package-lock.json`
+changes. The Chromium download goes to Playwright's own cache; where that is
+on macOS, and whether this Chromium runs there, is untested.
+
+## remote-status
+
+`remote-status` needs `timeout` and `getent`, and macOS ships neither.
+
+- `timeout` comes from Homebrew's `coreutils`, which is in the Brewfile. It
+  is always installed as `gtimeout`. The formula also links commands macOS
+  doesn't provide under their plain names, so `timeout` should be on `PATH`
+  too. That is read from the formula, not seen on a Mac. If it isn't there,
+  add `$(brew --prefix)/opt/coreutils/libexec/gnubin` to `PATH`, which holds
+  every command under its plain name.
+- `getent` has no Homebrew formula for macOS. Nothing in the Brewfile
+  provides it, so `remote-status` stops at its tool check on the Mac until
+  the script itself handles macOS. `remote-sync` and `macc` don't use it.
+
 ## voxtype and transcribe
 
 The dotfiles `transcribe` script needs `ffmpeg` and `voxtype`. ffmpeg is in
@@ -139,11 +219,12 @@ sets `VOXTYPE` to its path), and downloads a model with
 Roughly what `linux` does, for macOS, with the same `--dry-run`:
 
 - check for Homebrew, then `brew bundle install --file=mac/Brewfile`;
-- Node LTS through mise, then the agent CLIs and the Salesforce tools;
+- Node LTS through mise, then the agent CLIs, their `~/.local/bin` links and
+  the Salesforce tools;
 - clone the dotfiles, back up conflicts (never `--adopt`), carry the git
   identity into `~/.gitconfig.local`, and stow the packages in the table
   above, skipping `applications` and `xdg`;
-- link atuin's config;
+- link atuin's config, and install render-url's dependencies;
 - source `~/.laptop.local` for personal additions.
 
 It would live at `mac/setup`, next to the Brewfile. It isn't written because
