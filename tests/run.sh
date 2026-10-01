@@ -4658,10 +4658,15 @@ test_stow_packages_match_dotfiles() {
 # Read as text only: brew is never run, and nothing here touches the network.
 
 BREWFILE="$ROOT/mac/Brewfile"
-# One entry: a kind, a quoted name, optional comment. No options: the file
-# needs none, so none are accepted, except the `id: NUMBER` a mas entry must have
-# (no leading zero: Ruby reads one as octal).
-BREWFILE_ENTRY='^(tap|brew|cask|mas|vscode) "([A-Za-z0-9@._/+ -]+)"(, id: [1-9][0-9]*)?([[:space:]]+#.*)?$'
+# One entry: a kind, a quoted name, optional comment. Two options are accepted
+# and no others: the `id: NUMBER` a mas entry must have (no leading zero: Ruby
+# reads one as octal), and the literal `trusted: true` on a brew or cask entry,
+# which Homebrew needs to load a formula or cask from a non-official tap.
+BREWFILE_ENTRY='^(tap|brew|cask|mas|vscode) "([A-Za-z0-9@._/+ -]+)"(, id: [1-9][0-9]*)?(, trusted: true)?([[:space:]]+#.*)?$'
+
+# The only taps the Brewfile may add: everything else comes from Homebrew's
+# own repositories.
+BREWFILE_TAPS=(deskflow/tap schpet/tap)
 
 # Formulae `linux` installs from Homebrew that the Mac deliberately goes
 # without. Every entry needs a comment saying why. Empty: the Mac wants all of
@@ -4670,15 +4675,17 @@ LINUX_ONLY_FORMULAE=()
 
 # Print "KIND NAME" for each entry of Brewfile $1, and "invalid LINE_NO" for
 # each line that is not blank, a comment or an entry (a mas entry needs an id,
-# and only a mas entry may have one).
+# and only a mas entry may have one; only a brew or cask entry may be trusted).
 brewfile_entries() {
-  local line n=0 kind name id
+  local line n=0 kind name id trusted
   while IFS= read -r line || [ -n "$line" ]; do
     n=$((n + 1))
     [[ "$line" =~ ^[[:space:]]*(#.*)?$ ]] && continue
     [[ "$line" =~ $BREWFILE_ENTRY ]] || { echo "invalid $n"; continue; }
-    kind="${BASH_REMATCH[1]}" name="${BASH_REMATCH[2]}" id="${BASH_REMATCH[3]}"
+    kind="${BASH_REMATCH[1]}" name="${BASH_REMATCH[2]}" id="${BASH_REMATCH[3]}" trusted="${BASH_REMATCH[4]}"
     if [ "$kind" = mas ] && [ -z "$id" ]; then
+      echo "invalid $n"
+    elif [ -n "$trusted" ] && [ "$kind" != brew ] && [ "$kind" != cask ]; then
       echo "invalid $n"
     elif [ "$kind" != mas ] && { [ -n "$id" ] || [[ "$name" == *" "* ]]; }; then
       echo "invalid $n"
@@ -4723,18 +4730,21 @@ test_brewfile_parses() {
   check "has entries" [ "$(grep -c . <<<"$entries")" -gt 0 ]
   check "every line is a tap, brew, cask, mas or vscode entry (invalid lines: $(grep '^invalid' <<<"$entries" | tr '\n' ' '))" lacks "$entries" "^invalid "
   check "no duplicates ($(brewfile_duplicates "$BREWFILE" | tr '\n' ' '))" [ -z "$(brewfile_duplicates "$BREWFILE")" ]
-  check "no tap: nothing outside Homebrew's own repositories" lacks "$entries" "^tap "
+  check "the only taps are ${BREWFILE_TAPS[*]}" [ "$(grep '^tap ' <<<"$entries" | sort | tr '\n' ',')" = "$(printf 'tap %s,' "${BREWFILE_TAPS[@]}")" ]
 
   # The checks themselves, against Brewfiles that must and must not pass.
   tmp="$(mktemp -d)"
   printf '%s\n' '# comment' '' 'tap "a/b"' 'brew "x@1" # why' 'cask "y"' \
-    'mas "Some App", id: 123' 'vscode "a.b"' > "$tmp/good"
-  check "accepts each entry kind and comments" [ "$(brewfile_entries "$tmp/good" | tr '\n' ',')" = "tap a/b,brew x@1,cask y,mas Some App,vscode a.b," ]
+    'mas "Some App", id: 123' 'vscode "a.b"' 'brew "a/b/c", trusted: true' 'cask "a/b/d", trusted: true # why' > "$tmp/good"
+  check "accepts each entry kind, comments and a trusted brew or cask" [ "$(brewfile_entries "$tmp/good" | tr '\n' ',')" = "tap a/b,brew x@1,cask y,mas Some App,vscode a.b,brew a/b/c,cask a/b/d," ]
   printf '%s\n' 'brew "x"' 'npm "y"' 'brew review_bad' 'brew "a b"' 'mas "App"' 'system "rm -rf /"' 'brew "x"; system "id"' \
     'brew "review-bad", restart_service: "' 'brew "review-bad", restart_service: (' \
     'brew "y", restart_service: :changed' 'brew "z", id: 1' 'mas "App", id: x' 'brew "w" trailing' \
-    'mas "Review App", id: 08' 'mas "Review App", id: 09' > "$tmp/bad"
-  check "rejects other kinds, unquoted names, a mas without id, Ruby code, and every option but a mas id" [ "$(brewfile_entries "$tmp/bad" | tr '\n' ',')" = "brew x,invalid 2,invalid 3,invalid 4,invalid 5,invalid 6,invalid 7,invalid 8,invalid 9,invalid 10,invalid 11,invalid 12,invalid 13,invalid 14,invalid 15," ]
+    'mas "Review App", id: 08' 'mas "Review App", id: 09' \
+    'brew "a/b/c", trusted: tru' 'brew "a/b/c", trusted: "' 'brew "a/b/c", trusted: true, x' \
+    'cask "a/b/d", trusted: false' 'tap "a/b", trusted: true' 'mas "App", id: 1, trusted: true' \
+    'brew "a/b/c", trusted: true, trusted: true' > "$tmp/bad"
+  check "rejects other kinds, unquoted names, a mas without id, Ruby code, and every option but a mas id and a literal trusted: true on a brew or cask" [ "$(brewfile_entries "$tmp/bad" | tr '\n' ',')" = "brew x,$(printf 'invalid %s,' {2..22})" ]
   printf '%s\n' 'brew "x"' 'cask "x"' 'brew "y"' 'brew "x" # again' > "$tmp/dup"
   check "reports a duplicate (a brew and a cask of one name are two entries)" [ "$(brewfile_duplicates "$tmp/dup")" = "brew x" ]
   rm -rf "$tmp"

@@ -68,3 +68,16 @@ brew "opencode"
 cask "localsend"
 cask "crosspaste"
 cask "markdown-preview"
+
+# ── Optional: work apps, network, third-party taps ───────────────────────────
+# Also nothing the dotfiles need. The two taps are not Homebrew's own
+# repositories. `trusted: true` trusts that one formula or cask (not the whole
+# tap), which Homebrew requires before it loads anything from a non-official
+# tap (docs/mac.md).
+cask "slack"
+cask "1password-cli"
+brew "tailscale" # the formula (CLI and daemon), not the App Store or standalone app
+tap "schpet/tap"
+brew "schpet/tap/linear", trusted: true # CLI for linear.app
+tap "deskflow/tap"
+cask "deskflow/tap/deskflow", trusted: true # keyboard and mouse sharing

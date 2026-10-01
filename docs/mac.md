@@ -5,7 +5,8 @@ and nothing in this repository changes a Mac for you. What exists is [`mac/Brewf
 packages, and this page of steps to run by hand.
 
 None of this has been run on a Mac. The Brewfile's names were checked against
-Homebrew's package index, and the tests check its syntax and that it covers
+Homebrew's package index (and, for the two third-party taps, against the tap
+repositories on GitHub), and the tests check its syntax and that it covers
 the tools `linux` installs. Whether `brew bundle` succeeds on a given Mac is
 untested.
 
@@ -13,10 +14,38 @@ untested.
 
 It is curated by hand, not a dump of one machine. The first sections are what
 the dotfiles need, matching what `linux` installs on Bazzite from Homebrew.
-The last section, "Optional", is personal extras that nothing depends on.
+The two "Optional" sections at the end are extras that nothing depends on:
+delete or comment out any of those lines freely.
 
-It deliberately leaves out anything tied to an employer, and it has no `node`
-formula: Node comes from mise, as on Linux.
+It has no `node` formula: Node comes from mise, as on Linux.
+
+### Third-party taps
+
+Everything comes from Homebrew's own repositories except two entries in the
+last section:
+
+- `schpet/tap/linear`, a command-line client for linear.app, from
+  [schpet/homebrew-tap](https://github.com/schpet/homebrew-tap);
+- `deskflow/tap/deskflow`, keyboard and mouse sharing, from
+  [deskflow/homebrew-tap](https://github.com/deskflow/homebrew-tap).
+
+A tap's formulae and casks are Ruby code that Homebrew runs as you, and nobody
+at Homebrew reviews these two. Since Homebrew 6.0.0 it refuses to load anything
+from a non-official tap until that tap or item is
+[trusted](https://docs.brew.sh/Tap-Trust). The two entries carry
+`trusted: true`, so `brew bundle install` trusts exactly those two items (not
+the rest of either tap) before installing them, without a prompt or a separate
+`brew trust`. Running `brew bundle install` on this file therefore means
+accepting those two taps' code. If you don't, delete their four lines first.
+
+### Tailscale
+
+`brew "tailscale"` is the Homebrew formula: the open-source `tailscale` CLI
+and `tailscaled` daemon. It is listed because that is what the Mac uses today.
+Tailscale for macOS also comes as an App Store app and as a standalone app
+from tailscale.com, and those are separate installs that this file doesn't
+manage. Use one variant, not several: drop the line on a Mac that has
+Tailscale from the App Store or the standalone app.
 
 Install [Homebrew](https://brew.sh) first, then from a clone of this
 repository:
@@ -42,10 +71,11 @@ installed that is **not** listed in the file. It prompts before removing
 anything.
 
 Be careful with it on a machine this file doesn't fully describe. The Brewfile
-leaves out work tools on purpose, so on a work Mac cleanup would offer to
-remove them. When cleanup goes ahead it also resets Homebrew's trust store to
-what the file declares, and this file declares none, so every tap, formula or
-cask you trusted by hand would lose that trust.
+isn't a dump of any one Mac, so on a work Mac cleanup would offer to remove
+whatever else is installed there. When cleanup goes ahead it also resets
+Homebrew's trust store to what the file declares, and this file declares only
+`schpet/tap/linear` and `deskflow/tap/deskflow`, so every other tap, formula
+or cask you trusted by hand would lose that trust.
 
 `--force` skips the prompt and removes everything straight away. Don't pass it
 unless you have just read the list the prompt would have shown and want all of
