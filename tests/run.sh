@@ -364,7 +364,9 @@ nv_pack() { # nv_pack [FIRST_LINE]
   mkdir -p "$d/bin" "$d/lib/nvim" "$d/share/nvim/runtime" "$STATE/curl"
   write_nvim "$d/bin/nvim" "${1:-NVIM v$NVIM_VERSION}"
   echo "-- runtime" > "$d/share/nvim/runtime/filetype.lua"
-  PATH="$SANDBOX/sysbin" tar -czf "$STATE/curl/$NVIM_ASSET" -C "$STATE/nvim-release" nvim-linux-x86_64
+  # In the sanitized environment, like everything the script runs: an
+  # inherited TAR_OPTIONS (or GZIP) must not reach tar.
+  sandboxed "$SANDBOX/sysbin/tar" -czf "$STATE/curl/$NVIM_ASSET" -C "$STATE/nvim-release" nvim-linux-x86_64
 }
 
 # Make $SANDBOX/linux, the copy of the script that run_linux runs: the script
@@ -734,6 +736,10 @@ guard_sandbox() {
   for entry in "$HOME" "$LAPTOP_OS_RELEASE" "$LAPTOP_OSTREE_BOOTED" "$LAPTOP_YUM_REPOS_DIR" "$LAPTOP_CPUINFO" "$STUB_LOG" "$STUB_STATE"; do
     inside_sandbox "$entry" || { echo "guard: path outside sandbox: $entry" >&2; return 1; }
   done
+  # An empty element (a leading, doubled or trailing colon) is the current directory.
+  case ":${SANDBOX_PATH:-x}:" in
+    *::*) echo "guard: SANDBOX_PATH has an empty element: $SANDBOX_PATH" >&2; return 1 ;;
+  esac
   local -a path_entries=()
   IFS=: read -r -a path_entries <<<"${SANDBOX_PATH:-}"
   for entry in "${path_entries[@]}"; do
@@ -3821,6 +3827,8 @@ NV_PLAN="\[dry-run\] (download .*/$NVIM_ASSET|verify its SHA256|unpack it into|l
 NV_READY="(installed Neovim|nvim is now|nvim .*already installed)"
 # The line for a PATH this run can't check (in the step, and plain in the summary).
 NV_UNCHECKED="is not on this run's PATH, so which nvim a new session runs could not be checked\. After logging out and in, check 'nvim --version' \(the dotfiles config needs >= $NVIM_MIN\)$"
+# The line for a Neovim that mise manages, after the sign of it in parentheses.
+NV_MISE_UNCHECKED="that this script cannot check; which version runs depends on mise's configuration\. Verify with 'nvim --version' in a new shell \(the dotfiles config needs >= $NVIM_MIN\)$"
 nv_dest() { echo "$HOME/.local/share/laptop/nvim-$NVIM_VERSION"; }
 nv_link() { echo "$HOME/.local/bin/nvim"; }
 nv_marker() { echo "$(nv_dest)/.laptop-verified-sha256"; }
@@ -3888,6 +3896,7 @@ test_neovim_install() {
   check "says what it could not check" has "$OUT" "^  note: Neovim: $HOME/\.local/bin $NV_UNCHECKED"
   check "and again in the summary, as one plain line" has "$OUT" "^  Neovim: $HOME/\.local/bin $NV_UNCHECKED"
   check "not as a warning" lacks "$OUT" "! .*(Neovim|nvim)"
+  check "nothing about mise: it manages no Neovim here" lacks "$OUT" "mise manages"
   check "a session with ~/.local/bin ahead of apt's runs the link" [ "$(nv_first_on "$(nv_local_first)")" = "$(nv_link)" ]
   check "which is $NVIM_VERSION" [ "$(nv_first_on_reports "$(nv_local_first)")" = "NVIM v$NVIM_VERSION" ]
   check "apt's nvim is left as it was" [ "$before" = "$(cat "$STUBS/nvim")" ]
@@ -4037,7 +4046,7 @@ test_neovim_unverified_tree() {
     SANDBOX_PATH="$(nv_local_first)" run_linux
     check "run exits 0" [ "$RC" -eq 0 ]
     check "it is never run, not even for its version" log_lacks '^nvim-tag unverified$'
-    check "the summary says it was not this script's and where it went" has "$OUT" "^    ! $(nv_dest) was not installed by this script \(it has no marker for the pinned release\), so nothing in it is run or linked: it goes to the backup directory, and Neovim $NVIM_VERSION is installed fresh$"
+    check "the summary says it was not this script's and where it went" has "$OUT" "^    ! $(nv_dest) was not installed by this script \(it has no marker for the pinned release\), so nothing in it is run or linked: it goes to the backup directory, and a fresh install of Neovim $NVIM_VERSION is attempted$"
     check "the summary lists the move" has "$OUT" "^    $(nv_dest) -> $HOME/\.local/state/laptop/backups/[^ ]*/\.local/share/laptop/nvim-$NVIM_VERSION$"
     backup="$(find "$HOME/.local/state/laptop/backups" -path "*/.local/share/laptop/nvim-$NVIM_VERSION")"
     if [ "$case_" = "a symlink to a tree with a marker" ]; then
@@ -4076,6 +4085,8 @@ test_neovim_unverified_tree() {
   check "it is in the backup dir" [ -x "$(find "$HOME/.local/state/laptop/backups" -path "*/nvim-$NVIM_VERSION/bin/nvim")" ]
   check "and not linked" [ -z "$(find "$HOME/.local/bin" -name nvim 2>/dev/null)" ]
   check "the summary says Neovim is not installed" has "$OUT" "^    ! Neovim $NVIM_VERSION not installed: could not download"
+  check "and that a fresh install was attempted, not that one was made" has "$OUT" "^    ! $(nv_dest) was not installed by this script .*, and a fresh install of Neovim $NVIM_VERSION is attempted$"
+  check "nothing says it is installed fresh" lacks "$OUT" "installed fresh"
   check "never says it is installed or ready" lacks "$OUT" "$NV_READY"
   teardown
 }
@@ -4106,11 +4117,10 @@ test_neovim_unreadable_version() {
 }
 
 # Readiness is only reported for what the run can see. On its own PATH: an
-# older nvim ahead of ~/.local/bin is a warning that names it. Where mise is
-# active (it puts its tools first): an older nvim that mise has installed is
-# a warning that names it. mise and its shims are never run.
+# older nvim ahead of ~/.local/bin is a warning that names it. A Neovim that
+# mise manages is never checked, and the run says so (see below).
 test_neovim_readiness() {
-  local before mise_nvim shim
+  local before shim
 
   setup "neovim: an old nvim ahead of ~/.local/bin on the run's PATH"
   nv_pop "NVIM v0.9.5"
@@ -4149,89 +4159,117 @@ test_neovim_readiness() {
   check "never says nvim is now $NVIM_VERSION" lacks "$OUT" "nvim is now"
   teardown
 
-  setup "neovim: mise has installed an older nvim"
+  # mise. Which nvim its shim selects depends on mise's configuration, and
+  # mise is never run, so a Neovim that mise manages is never judged: not as
+  # new enough, not as too old. Its presence (the shim, or a neovim/nvim
+  # entry in mise's installs dir; existence only) gets one plain line saying
+  # it was not checked, and nothing of mise's is ever executed.
+  local kind sign
+  for kind in "an installs/neovim directory" "an installs/neovim symlink" "a dangling installs/neovim symlink" "an installs/nvim directory" "the nvim shim"; do
+    setup "neovim: mise manages a Neovim ($kind), not on this run's PATH"
+    nv_pop "NVIM v0.9.5"
+    mkdir -p "$HOME/.local/bin" "$HOME/.local/share/mise/installs" "$HOME/opt/nvim-linked/bin"
+    sign="$HOME/.local/share/mise/installs/neovim"
+    case "$kind" in
+      "an installs/neovim directory") nv_mise_nvim 0.9.5 "NVIM v0.9.5" >/dev/null ;;
+      "an installs/neovim symlink") write_nvim "$HOME/opt/nvim-linked/bin/nvim" "NVIM v0.9.5" 0 mise-nvim; ln -s "$HOME/opt" "$sign" ;;
+      "a dangling installs/neovim symlink") ln -s "$HOME/gone" "$sign" ;;
+      "an installs/nvim directory") sign="$HOME/.local/share/mise/installs/nvim"; mkdir -p "$sign" ;;
+      "the nvim shim") nv_mise_shim; sign="$HOME/.local/share/mise/shims/nvim" ;;
+    esac
+    before="$(home_snapshot)"
+    SANDBOX_PATH="$(nv_local_first)" run_linux --dry-run
+    check "dry run says it was not checked, naming the sign, in the step and the summary" [ "$(grep -cE "Neovim: mise manages a Neovim \($sign\) $NV_MISE_UNCHECKED" <<<"$OUT")" -eq 2 ]
+    check "dry run still plans the install" has "$OUT" "\[dry-run\] download $NVIM_RELEASE/$NVIM_ASSET$"
+    check "dry run runs nothing of mise's" log_lacks '^(mise|nvim-tag mise-)'
+    check "dry run leaves HOME untouched" [ "$before" = "$(home_snapshot)" ]
+    teardown
+  done
+
+  setup "neovim: mise manages a Neovim, not on this run's PATH (real run)"
   nv_pop "NVIM v0.9.5"
-  mise_nvim="$(nv_mise_nvim 0.9.5 "NVIM v0.9.5")"
+  nv_mise_nvim 0.9.5 "NVIM v0.9.5" >/dev/null
   mkdir -p "$HOME/.local/bin"
-  before="$(home_snapshot)"
-  SANDBOX_PATH="$(nv_local_first)" run_linux --dry-run
-  check "dry run warns, naming it" has "$OUT" "^    ! Neovim is not ready where mise is active: mise provides $mise_nvim \(0\.9\.5\), which comes before $(nv_link) there, and the dotfiles config needs >= $NVIM_MIN\. Upgrade or remove it in mise$"
-  check "dry run never runs mise" log_lacks '^mise'
-  check "dry run leaves HOME untouched" [ "$before" = "$(home_snapshot)" ]
   SANDBOX_PATH="$(nv_local_first)" run_linux
   check "run exits 0" [ "$RC" -eq 0 ]
   check "the pinned release is installed and linked" nv_installed
-  check "warns, naming it, in the summary" has "$OUT" "^    ! Neovim is not ready where mise is active: mise provides $mise_nvim \(0\.9\.5\), which comes before $(nv_link) there"
-  check "what this run's PATH gives is still reported as that, no more" has "$OUT" "nvim is now $NVIM_VERSION \($(nv_link)\) on this run's PATH$"
+  check "what this run's PATH gives is reported as that, no more" has "$OUT" "nvim is now $NVIM_VERSION \($(nv_link)\) on this run's PATH$"
+  check "the summary says, in one plain line, that mise's was not checked" has "$OUT" "^  Neovim: mise manages a Neovim \($HOME/\.local/share/mise/installs/neovim\) $NV_MISE_UNCHECKED"
+  check "not as a warning" lacks "$OUT" "! .*(Neovim|nvim)"
+  check "mise's nvim is never run" log_lacks '^nvim-tag mise-'
   teardown
 
-  setup "neovim: mise has installed an nvim with no readable version"
-  nv_pop "NVIM v0.9.5"
-  mise_nvim="$(nv_mise_nvim 0.12.5 "garbage")"
-  run_linux --dry-run
-  check "warns, naming it" has "$OUT" "^    ! Neovim is not ready where mise is active: mise provides $mise_nvim \(no version that can be read\), which comes before"
-  teardown
-
-  setup "neovim: nvim first on PATH is new enough, but mise has installed an older one"
+  setup "neovim: nvim first on PATH is new enough and not mise's, and mise manages a Neovim"
   nv_pop "NVIM v$NVIM_VERSION"
-  mise_nvim="$(nv_mise_nvim 0.11.6 "NVIM v0.11.6")"
+  nv_mise_nvim 0.9.5 "NVIM v0.9.5" >/dev/null
   run_linux
   check "run exits 0" [ "$RC" -eq 0 ]
   check "nothing is installed" log_lacks "^curl .*$NVIM_ASSET"
-  check "warns, naming mise's" has "$OUT" "^    ! Neovim is not ready where mise is active: mise provides $mise_nvim \(0\.11\.6\), which comes first there"
+  check "reports the one first on PATH" has "$OUT" "nvim $NVIM_VERSION already installed \($STUBS/nvim, first on this run's PATH\)"
+  check "the summary says mise's was not checked" has "$OUT" "^  Neovim: mise manages a Neovim \($HOME/\.local/share/mise/installs/neovim\) $NV_MISE_UNCHECKED"
+  check "mise's nvim is never run" log_lacks '^nvim-tag mise-'
   teardown
 
-  setup "neovim: mise has installed a new enough nvim"
-  nv_pop "NVIM v0.9.5"
-  nv_mise_nvim "$NVIM_VERSION" "NVIM v$NVIM_VERSION" >/dev/null
-  mkdir -p "$HOME/.local/bin"
-  SANDBOX_PATH="$(nv_local_first)" run_linux
-  check "run exits 0" [ "$RC" -eq 0 ]
-  check "no Neovim warning" lacks "$OUT" "! .*(Neovim|nvim)"
-  check "nvim is now $NVIM_VERSION on this run's PATH" has "$OUT" "nvim is now $NVIM_VERSION \($(nv_link)\) on this run's PATH$"
-  teardown
+  # mise's shim first on PATH (as it is for this script, which puts mise's
+  # shims first). Two states in which what mise has installed says nothing
+  # about what the shim runs: an install made with `mise link` (a symlinked
+  # version directory) that the config selects, next to a regular 0.12.5;
+  # and a config selecting a version that is not installed, when the shim
+  # falls through to another nvim. Neither is judged.
+  shim_path() { echo "$HOME/.local/share/mise/shims:$HOME/.local/bin:$STUBS:$SANDBOX/sysbin"; }
+  local state
+  for state in "a linked 0.9.5 is selected, a regular 0.12.5 is installed" "0.12.5 is installed, the config selects a version that is not"; do
+    setup "neovim: mise's shim first on PATH ($state)"
+    nv_pop "NVIM v0.9.5"
+    run_linux   # a machine already set up, so the next run leaves mise's shims alone
+    rm -r "$(nv_dest)" "$(nv_link)"
+    nv_mise_shim
+    shim="$HOME/.local/share/mise/shims/nvim"
+    nv_mise_nvim "$NVIM_VERSION" "NVIM v$NVIM_VERSION" >/dev/null
+    if [ "$state" = "a linked 0.9.5 is selected, a regular 0.12.5 is installed" ]; then
+      mkdir -p "$HOME/opt/nvim-old/bin"
+      write_nvim "$HOME/opt/nvim-old/bin/nvim" "NVIM v0.9.5" 0 mise-nvim
+      ln -s "$HOME/opt/nvim-old" "$HOME/.local/share/mise/installs/neovim/0.9.5"
+      printf 'neovim = "0.9.5"\n' >> "$HOME/.config/mise/config.toml"
+    else
+      printf 'neovim = "0.9.0"\n' >> "$HOME/.config/mise/config.toml"
+    fi
+    before="$(home_snapshot)"
+    : > "$LOG"
+    SANDBOX_PATH="$(shim_path)" run_linux --dry-run
+    check "dry run exits 0" [ "$RC" -eq 0 ]
+    check "dry run says the shim is not run and its version is not known" has "$OUT" "note: $shim is mise's, so it is not run and its version is not known$"
+    check "dry run plans the install" has "$OUT" "\[dry-run\] download $NVIM_RELEASE/$NVIM_ASSET$"
+    check "dry run makes no success claim" lacks "$OUT" "$NV_READY"
+    check "dry run says mise's was not checked, in the step and the summary" [ "$(grep -cE "Neovim: mise manages a Neovim \($shim\) $NV_MISE_UNCHECKED" <<<"$OUT")" -eq 2 ]
+    check "dry run runs neither the shim nor any nvim of mise's" log_lacks '^nvim-tag mise-'
+    check "dry run never runs mise" log_lacks '^mise'
+    check "dry run leaves HOME untouched" [ "$before" = "$(home_snapshot)" ]
+    : > "$LOG"
+    SANDBOX_PATH="$(shim_path)" run_linux
+    check "run exits 0" [ "$RC" -eq 0 ]
+    check "control: mise's shim is still what this PATH runs" [ "$(nv_first_on "$(shim_path)")" = "$shim" ]
+    check "the pinned release is installed and linked as usual" nv_installed
+    check "downloaded once" [ "$(log_count "^curl .*/$NVIM_ASSET")" -eq 1 ]
+    check "no claim that nvim is ready or already installed" lacks "$OUT" "(nvim is now|nvim .*already installed)"
+    check "the summary says, in one plain line, that mise's was not checked" has "$OUT" "^  Neovim: mise manages a Neovim \($shim\) $NV_MISE_UNCHECKED"
+    check "not as a warning" lacks "$OUT" "! .*(Neovim|nvim)"
+    check "neither the shim nor any nvim of mise's is run" log_lacks '^nvim-tag mise-'
+    teardown
+  done
 
-  # mise's shim first on PATH (the script itself puts mise's shims first).
-  # It is judged by what mise has installed, and never run.
-  shim_path() { echo "$HOME/.local/share/mise/shims:$STUBS:$SANDBOX/sysbin"; }
-  setup "neovim: mise's shim first on PATH, mise's nvim is new enough"
+  # An nvim in mise's installs dir directly on PATH (as `mise activate` puts
+  # it) is mise's too: not run, not judged, even with no shim and no
+  # neovim/nvim entry to go by.
+  setup "neovim: an nvim under mise's installs dir first on PATH"
   nv_pop "NVIM v0.9.5"
-  nv_mise_shim
-  nv_mise_nvim "$NVIM_VERSION" "NVIM v$NVIM_VERSION" >/dev/null
-  shim="$HOME/.local/share/mise/shims/nvim"
-  before="$(home_snapshot)"
-  SANDBOX_PATH="$(shim_path)" run_linux --dry-run
-  check "exits 0" [ "$RC" -eq 0 ]
-  check "reports mise's as installed" has "$OUT" "nvim already installed by mise \($shim, first on this run's PATH; every nvim mise has installed is >= $NVIM_MIN\)"
-  check "plans nothing for Neovim" lacks "$OUT" "$NV_PLAN"
-  check "the shim is never run" log_lacks '^nvim-tag mise-shim$'
-  check "mise is never run" log_lacks '^mise'
-  check "HOME is untouched" [ "$before" = "$(home_snapshot)" ]
-  teardown
-
-  setup "neovim: mise's shim first on PATH, mise's nvim is older"
-  nv_pop "NVIM v0.9.5"
-  nv_mise_shim
-  mise_nvim="$(nv_mise_nvim 0.9.5 "NVIM v0.9.5")"
-  shim="$HOME/.local/share/mise/shims/nvim"
-  SANDBOX_PATH="$(shim_path)" run_linux --dry-run
-  check "says what it found" has "$OUT" "note: $shim is mise's shim, and mise provides $mise_nvim \(0\.9\.5\)$"
-  check "plans the install" has "$OUT" "\[dry-run\] download $NVIM_RELEASE/$NVIM_ASSET$"
-  check "warns, naming mise's nvim" has "$OUT" "^    ! Neovim is not ready where mise is active: mise provides $mise_nvim \(0\.9\.5\)"
-  check "the shim is never run" log_lacks '^nvim-tag mise-shim$'
-  check "mise is never run" log_lacks '^mise'
-  teardown
-
-  setup "neovim: mise's shim first on PATH, no nvim found among mise's installs"
-  nv_pop "NVIM v0.9.5"
-  nv_mise_shim
-  shim="$HOME/.local/share/mise/shims/nvim"
-  SANDBOX_PATH="$(shim_path)" run_linux --dry-run
-  check "does not call it installed" lacks "$OUT" "$NV_READY"
-  check "plans the install" has "$OUT" "\[dry-run\] download $NVIM_RELEASE/$NVIM_ASSET$"
-  check "warns, naming the shim" has "$OUT" "^    ! Neovim is not ready where mise is active: mise provides $shim \(a shim with no nvim found under $HOME/\.local/share/mise/installs, so no version can be read\)"
-  check "the shim is never run" log_lacks '^nvim-tag mise-shim$'
-  check "mise is never run" log_lacks '^mise'
+  mkdir -p "$HOME/.local/share/mise/installs/aqua-neovim-neovim/0.12.5/bin"
+  write_nvim "$HOME/.local/share/mise/installs/aqua-neovim-neovim/0.12.5/bin/nvim" "NVIM v$NVIM_VERSION" 0 mise-nvim
+  SANDBOX_PATH="$HOME/.local/share/mise/installs/aqua-neovim-neovim/0.12.5/bin:$STUBS:$SANDBOX/sysbin" run_linux --dry-run
+  check "it is not run" log_lacks '^nvim-tag mise-'
+  check "it is not counted as installed" lacks "$OUT" "$NV_READY"
+  check "the install is planned" has "$OUT" "\[dry-run\] download $NVIM_RELEASE/$NVIM_ASSET$"
+  check "the summary says mise's was not checked, naming it" has "$OUT" "^  Neovim: mise manages a Neovim \($HOME/\.local/share/mise/installs/aqua-neovim-neovim/0\.12\.5/bin/nvim\) $NV_MISE_UNCHECKED"
   teardown
 }
 
@@ -4432,7 +4470,36 @@ test_neovim_pins() {
   bazzite
   ( SANDBOX_PATH="$STUBS:/usr/bin"; guard_sandbox 2>/dev/null )
   check "rejects /usr/bin on SANDBOX_PATH" [ $? -ne 0 ]
+  # An empty element is the current directory, wherever the tests are run from.
+  local bad
+  for bad in "$STUBS:" ":$STUBS" "$STUBS::$SANDBOX/sysbin" ":"; do
+    ( SANDBOX_PATH="$bad"; guard_sandbox 2>/dev/null )
+    check "rejects an empty element in SANDBOX_PATH='${bad//$SANDBOX/<sandbox>}'" [ $? -ne 0 ]
+  done
+  ( SANDBOX_PATH="$STUBS:$SANDBOX/sysbin"; guard_sandbox 2>/dev/null )
+  check "control: accepts sandbox directories" [ $? -eq 0 ]
   teardown
+
+  # The fixture tarball is made by the harness, not the script: tar must get
+  # the sanitized environment too. TAR_OPTIONS can make GNU tar run a command.
+  setup "neovim: the fixture's tar does not get an inherited TAR_OPTIONS"
+  bazzite
+  printf '#!%s
+touch "%s"
+' "$SANDBOX/sysbin/bash" "$SANDBOX/tar-options-ran" > "$SANDBOX/hook"
+  chmod +x "$SANDBOX/hook"
+  ( export TAR_OPTIONS="--checkpoint=1 --checkpoint-action=exec=$SANDBOX/hook"; neovim_release_fixture )
+  check "its checkpoint action did not run" [ ! -e "$SANDBOX/tar-options-ran" ]
+  check "the tarball is made all the same" [ "$(sandboxed "$SANDBOX/sysbin/tar" -tzf "$STATE/curl/$NVIM_ASSET" | grep -c '^nvim-linux-x86_64/bin/nvim$')" -eq 1 ]
+  check "control: with TAR_OPTIONS in its environment, this tar runs the action" tar_options_control
+  teardown
+}
+
+# True if a tar that does get this TAR_OPTIONS runs the action (so the check
+# above can fail): the same archive, made with TAR_OPTIONS passed through.
+tar_options_control() {
+  "$SANDBOX/sysbin/env" -i PATH="$SANDBOX/sysbin" TAR_OPTIONS="--checkpoint=1 --checkpoint-action=exec=$SANDBOX/hook"     "$SANDBOX/sysbin/tar" -czf "$SANDBOX/control.tar.gz" -C "$STATE/nvim-release" nvim-linux-x86_64 2>/dev/null
+  [ -e "$SANDBOX/tar-options-ran" ]
 }
 
 # ── Tests: package lists match the dotfiles repo ─────────────────────────────
