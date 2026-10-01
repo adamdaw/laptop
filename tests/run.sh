@@ -3865,9 +3865,9 @@ test_neovim_install() {
     teardown
   done
 
-  # Older than the minimum, compared number by number: as strings, 0.9.5,
-  # 0.10.4 and 0.11.6 would all sort after 0.12.0 or need luck not to.
-  for line in "NVIM v0.9.5" "NVIM v0.10.4" "NVIM v0.11.6" "NVIM v0.2.2"; do
+  # Older than the minimum, compared number by number (0.9.5 is covered
+  # above): as strings, 0.2.2 sorts after 0.12.0.
+  for line in "NVIM v0.10.4" "NVIM v0.11.6" "NVIM v0.2.2"; do
     setup "neovim: pop, nvim on PATH is too old ($line)"
     nv_pop "$line"
     run_linux --dry-run
@@ -3891,9 +3891,8 @@ test_neovim_install() {
 
   setup "neovim: pop, already unpacked but the link is gone"
   nv_pop "NVIM v0.9.5"
-  run_linux
-  rm "$(nv_link)"
-  : > "$LOG"
+  mkdir -p "$(nv_dest)/bin"
+  write_nvim "$(nv_dest)/bin/nvim" "NVIM v$NVIM_VERSION"
   run_linux
   check "run exits 0" [ "$RC" -eq 0 ]
   check "reports it unpacked" has "$OUT" "Neovim $NVIM_VERSION already unpacked \($(nv_dest)\)"
@@ -3957,9 +3956,7 @@ test_neovim_failures() {
   setup "neovim: the tarball is not the pinned one (SHA256 mismatch)"
   nv_pop "NVIM v0.9.5"
   local pinned="$LAPTOP_NEOVIM_SHA256"
-  neovim_release_fixture "NVIM v$NVIM_VERSION"   # same version, other bytes (rebuilt: new mtimes)
-  echo "tampered" >> "$STATE/nvim-release/nvim-linux-x86_64/bin/nvim"
-  PATH="$SANDBOX/sysbin" tar -czf "$STATE/curl/$NVIM_ASSET" -C "$STATE/nvim-release" nvim-linux-x86_64
+  neovim_release_fixture "NVIM v$NVIM_VERSION-other"   # still reports the pinned version: only the hash differs
   LAPTOP_NEOVIM_SHA256="$pinned" run_linux
   nv_refused "Neovim $NVIM_VERSION not installed: SHA256 mismatch for $NVIM_ASSET \(expected $pinned, got [0-9a-f]{64}\)"
   check "the tarball was downloaded (control)" log_has "^curl .*/$NVIM_ASSET$"
@@ -4066,14 +4063,17 @@ test_neovim_dry_run() {
   check "no temp files" [ -z "$(ls -A "$SANDBOX/tmp")" ]
   teardown
 
-  setup "neovim: pop dry-run (fresh machine: no nvim yet)"
-  nv_pop
+  # No dotfiles clone either, and ~/.local exists, as on a desktop install.
+  setup "neovim: pop dry-run (fresh machine: no nvim, no dotfiles clone)"
+  os_release pop "ubuntu debian"
+  mkdir -p "$HOME/.local/share"
   before="$(home_snapshot)"
   run_linux --dry-run
   check "plans apt's neovim" has "$OUT" "\[dry-run\] sudo apt-get install -y neovim$"
   check "says none was found" has "$OUT" "note: no nvim found$"
   check "plans the download" has "$OUT" "\[dry-run\] download $NVIM_RELEASE/$NVIM_ASSET$"
   check "plans the link" has "$OUT" "\[dry-run\] ln -sfn $(nv_dest)/bin/nvim $(nv_link)$"
+  check "no Neovim warning" lacks "$OUT" "! .*(Neovim|nvim)"
   check "HOME is untouched" [ "$before" = "$(home_snapshot)" ]
   teardown
 

@@ -43,8 +43,6 @@ NEOVIM_VERSION=0.12.5
 NEOVIM_ASSET=nvim-linux-x86_64.tar.gz
 NEOVIM_RELEASE="https://github.com/neovim/neovim/releases/download/v$NEOVIM_VERSION"
 NEOVIM_SHA256="${LAPTOP_NEOVIM_SHA256:-bce0f56eda1f1b1db6eee8f4133d7a38813ea07933837dd1777411ca384c6875}"
-# Where the tarball is unpacked; ~/.local/bin/nvim links to its bin/nvim.
-NEOVIM_DIR="$HOME/.local/share/laptop/nvim-$NEOVIM_VERSION"
 
 # Dotfiles packages to stow (one directory each in the dotfiles repo).
 STOW_PACKAGES=(agy applications atuin bash bat bin claude ghostty git nvim render-url ripgrep ssh starship tmux zsh)
@@ -1487,15 +1485,15 @@ neovim_fetch() (
 # Debian/Ubuntu only (Bazzite's comes from Homebrew): a Neovim new enough for
 # the dotfiles config. Nothing is done when the nvim that dotfiles' shells
 # resolve (see dotfiles_nvim) is already at least $NEOVIM_MIN. Otherwise the
-# pinned upstream release is unpacked into $NEOVIM_DIR and linked as
+# pinned upstream release is unpacked into ~/.local/share/laptop and linked as
 # ~/.local/bin/nvim, which comes before apt's /usr/bin/nvim in those shells.
 # A version that can't be read counts as too old. Every failure is a warning.
 install_neovim() {
   step "Installing Neovim $NEOVIM_VERSION (the dotfiles config needs >= $NEOVIM_MIN)"
-  local dir="$HOME/.local/bin" dest="$NEOVIM_DIR" current version found arch reason
+  local dir="$HOME/.local/bin" dest="$HOME/.local/share/laptop/nvim-$NEOVIM_VERSION"
+  local current version found still arch reason
   current="$(dotfiles_nvim)" || current=""
-  version=""
-  if [ -n "$current" ]; then version="$(nvim_version "$current")"; fi
+  version="$(nvim_version "$current")"
   if [ -z "$current" ]; then
     found="no nvim found"
   elif [ -z "$version" ]; then
@@ -1507,29 +1505,31 @@ install_neovim() {
     found="$current is $version, older than $NEOVIM_MIN"
   fi
   printf "  \033[2mnote:\033[0m %s\n" "$found"
+  still="$found, and the dotfiles config needs >= $NEOVIM_MIN"
   arch="$(uname -m 2>/dev/null)" || arch=unknown
   if [ "$arch" != x86_64 ]; then
-    warn "skipped Neovim $NEOVIM_VERSION: only its x86_64 release tarball is installed here (this machine is $arch); $found, and the dotfiles config needs >= $NEOVIM_MIN"
+    warn "skipped Neovim $NEOVIM_VERSION: only its x86_64 release tarball is installed here (this machine is $arch); $still"
     return 0
   fi
-  if in_repo "$dir"; then
-    warn "skipped Neovim $NEOVIM_VERSION: $dir resolves into the dotfiles repo; $found, and the dotfiles config needs >= $NEOVIM_MIN"
+  # Without the clone (a fresh machine's --dry-run) nothing can resolve into it.
+  if [ -d "$DOTFILES_DIR" ] && in_repo "$dir"; then
+    warn "skipped Neovim $NEOVIM_VERSION: $dir resolves into the dotfiles repo; $still"
     return 0
   fi
-  if [ -x "$dest/bin/nvim" ] && [ "$(nvim_version "$dest/bin/nvim")" = "$NEOVIM_VERSION" ]; then
+  if [ "$(nvim_version "$dest/bin/nvim")" = "$NEOVIM_VERSION" ]; then
     ok "Neovim $NEOVIM_VERSION already unpacked ($dest)"
   elif [ -e "$dest" ] || [ -L "$dest" ]; then
-    warn "Neovim $NEOVIM_VERSION not installed: $dest exists but holds no working Neovim $NEOVIM_VERSION, so it is left alone (move it away and re-run); $found, and the dotfiles config needs >= $NEOVIM_MIN"
+    warn "Neovim $NEOVIM_VERSION not installed: $dest exists but holds no working Neovim $NEOVIM_VERSION, so it is left alone (move it away and re-run); $still"
     return 0
   elif (( DRY_RUN )); then
     printf "  \033[2m[dry-run]\033[0m download %s\n" "$NEOVIM_RELEASE/$NEOVIM_ASSET"
     printf "  \033[2m[dry-run]\033[0m verify its SHA256 against the pinned %s\n" "$NEOVIM_SHA256"
     printf "  \033[2m[dry-run]\033[0m unpack it into %s\n" "$dest"
   elif ! mkdir -p "$dir" "$(dirname "$dest")"; then
-    warn "Neovim $NEOVIM_VERSION not installed: could not create $dir or $(dirname "$dest"); $found, and the dotfiles config needs >= $NEOVIM_MIN"
+    warn "Neovim $NEOVIM_VERSION not installed: could not create $dir or $(dirname "$dest"); $still"
     return 0
   elif ! reason="$(neovim_fetch "$dest")"; then
-    warn "Neovim $NEOVIM_VERSION not installed: $reason. Nothing was installed; $found, and the dotfiles config needs >= $NEOVIM_MIN (next run will retry)"
+    warn "Neovim $NEOVIM_VERSION not installed: $reason. Nothing was installed; $still (next run will retry)"
     return 0
   else
     ok "installed Neovim $NEOVIM_VERSION in $dest (SHA256 verified)"
@@ -1540,8 +1540,7 @@ install_neovim() {
   fi
   # What counts is what `nvim` now runs, not that the steps above went through.
   current="$(dotfiles_nvim)" || current=""
-  version=""
-  if [ -n "$current" ]; then version="$(nvim_version "$current")"; fi
+  version="$(nvim_version "$current")"
   if [ -n "$version" ] && version_at_least "$version" "$NEOVIM_MIN"; then
     ok "nvim is now $version ($current)"
   else
