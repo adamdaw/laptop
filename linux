@@ -32,6 +32,20 @@ VOXTYPE_KEY_FPR=9CCF7915B750CAE8B095ED1AA3FC9F33FD209279 # gitleaks:allow (a pub
 VOXTYPE_KEY_URL="https://keys.openpgp.org/vks/v1/by-fingerprint/$VOXTYPE_KEY_FPR"
 VOXTYPE_MODEL=large-v3-turbo
 
+# Neovim for the dotfiles nvim package. NEOVIM_MIN is what that config needs:
+# the nvim-treesitter revision its lazy-lock.json pins (the `main` branch)
+# requires 0.12. apt's is older (Ubuntu 24.04: 0.9.5), so Debian/Ubuntu get the
+# upstream release tarball, pinned. Neovim publishes no signed checksum file,
+# so the tarball's SHA256 is pinned here (overridable so the test harness can
+# serve a fixture tarball).
+NEOVIM_MIN=0.12.0
+NEOVIM_VERSION=0.12.5
+NEOVIM_ASSET=nvim-linux-x86_64.tar.gz
+NEOVIM_RELEASE="https://github.com/neovim/neovim/releases/download/v$NEOVIM_VERSION"
+NEOVIM_SHA256="${LAPTOP_NEOVIM_SHA256:-bce0f56eda1f1b1db6eee8f4133d7a38813ea07933837dd1777411ca384c6875}"
+# Where the tarball is unpacked; ~/.local/bin/nvim links to its bin/nvim.
+NEOVIM_DIR="$HOME/.local/share/laptop/nvim-$NEOVIM_VERSION"
+
 # Dotfiles packages to stow (one directory each in the dotfiles repo).
 STOW_PACKAGES=(agy applications atuin bash bat bin claude ghostty git nvim render-url ripgrep ssh starship tmux zsh)
 # Stowed with --no-folding: their target dirs (~/bin, ~/.local/bin,
@@ -1421,6 +1435,120 @@ install_voxtype() { # install_voxtype debian|atomic
   voxtype_model "$dest"
 }
 
+# The version `$1 --version` reports ("NVIM v0.12.5" gives 0.12.5), or nothing
+# if it can't be run or its first line isn't of that form. NVIM_LOG_FILE:
+# without it even `nvim --version` creates ~/.local/state/nvim/nvim.log.
+nvim_version() {
+  local out
+  out="$(NVIM_LOG_FILE=/dev/null "$1" --version 2>/dev/null)" || return 0
+  if [[ "${out%%$'\n'*}" =~ ^NVIM\ v([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+    echo "$((10#${BASH_REMATCH[1]})).$((10#${BASH_REMATCH[2]})).$((10#${BASH_REMATCH[3]}))"
+  fi
+}
+
+# True if version $1 is at least $2 (both MAJOR.MINOR.PATCH), compared number
+# by number: 0.9.5 is older than 0.12.0, which comparing strings gets wrong.
+version_at_least() {
+  local -a have want
+  local i
+  IFS=. read -r -a have <<<"$1"
+  IFS=. read -r -a want <<<"$2"
+  for i in 0 1 2; do
+    if (( have[i] > want[i] )); then return 0; fi
+    if (( have[i] < want[i] )); then return 1; fi
+  done
+  return 0
+}
+
+# The nvim that the shells dotfiles set up will run: its .bashrc and .zshrc
+# put ~/bin and ~/.local/bin first on PATH, ahead of /usr/bin (apt's nvim).
+dotfiles_nvim() { PATH="$HOME/bin:$HOME/.local/bin:$PATH" command -v nvim; }
+
+# Download the pinned release tarball and unpack it as $1, only once its
+# SHA256 is the pinned one. Unpacked next to $1 and renamed into place: never
+# a half-unpacked tree. Runs in a subshell, so its temp files go when it
+# exits, however it ends. On failure prints why and returns non-zero, with
+# nothing left at $1.
+neovim_fetch() (
+  dest="$1" tmp="" new=""
+  trap 'rm -rf -- "$tmp" "$new"' EXIT
+  fail() { echo "$1"; exit 1; }
+  tmp="$(mktemp -d)" || fail "could not create a temp directory"
+  curl -fsSL -o "$tmp/$NEOVIM_ASSET" "$NEOVIM_RELEASE/$NEOVIM_ASSET" || fail "could not download $NEOVIM_RELEASE/$NEOVIM_ASSET"
+  actual="$(sha256sum < "$tmp/$NEOVIM_ASSET")" || fail "could not hash $NEOVIM_ASSET"
+  [ "${actual%% *}" = "$NEOVIM_SHA256" ] || fail "SHA256 mismatch for $NEOVIM_ASSET (expected $NEOVIM_SHA256, got ${actual%% *})"
+  new="$(mktemp -d "$dest.XXXXXX")" || fail "could not create a temp directory next to $dest"
+  tar -xzf "$tmp/$NEOVIM_ASSET" -C "$new" --strip-components=1 || fail "could not unpack $NEOVIM_ASSET"
+  [ "$(nvim_version "$new/bin/nvim")" = "$NEOVIM_VERSION" ] || fail "the unpacked $NEOVIM_ASSET does not report Neovim $NEOVIM_VERSION"
+  chmod 755 -- "$new" || fail "could not write next to $dest"
+  mv -T -- "$new" "$dest" || fail "could not move the unpacked $NEOVIM_ASSET to $dest"
+)
+
+# Debian/Ubuntu only (Bazzite's comes from Homebrew): a Neovim new enough for
+# the dotfiles config. Nothing is done when the nvim that dotfiles' shells
+# resolve (see dotfiles_nvim) is already at least $NEOVIM_MIN. Otherwise the
+# pinned upstream release is unpacked into $NEOVIM_DIR and linked as
+# ~/.local/bin/nvim, which comes before apt's /usr/bin/nvim in those shells.
+# A version that can't be read counts as too old. Every failure is a warning.
+install_neovim() {
+  step "Installing Neovim $NEOVIM_VERSION (the dotfiles config needs >= $NEOVIM_MIN)"
+  local dir="$HOME/.local/bin" dest="$NEOVIM_DIR" current version found arch reason
+  current="$(dotfiles_nvim)" || current=""
+  version=""
+  if [ -n "$current" ]; then version="$(nvim_version "$current")"; fi
+  if [ -z "$current" ]; then
+    found="no nvim found"
+  elif [ -z "$version" ]; then
+    found="$current reports no version that can be read ('$current --version'), so it counts as too old"
+  elif version_at_least "$version" "$NEOVIM_MIN"; then
+    ok "nvim $version already installed ($current)"
+    return 0
+  else
+    found="$current is $version, older than $NEOVIM_MIN"
+  fi
+  printf "  \033[2mnote:\033[0m %s\n" "$found"
+  arch="$(uname -m 2>/dev/null)" || arch=unknown
+  if [ "$arch" != x86_64 ]; then
+    warn "skipped Neovim $NEOVIM_VERSION: only its x86_64 release tarball is installed here (this machine is $arch); $found, and the dotfiles config needs >= $NEOVIM_MIN"
+    return 0
+  fi
+  if in_repo "$dir"; then
+    warn "skipped Neovim $NEOVIM_VERSION: $dir resolves into the dotfiles repo; $found, and the dotfiles config needs >= $NEOVIM_MIN"
+    return 0
+  fi
+  if [ -x "$dest/bin/nvim" ] && [ "$(nvim_version "$dest/bin/nvim")" = "$NEOVIM_VERSION" ]; then
+    ok "Neovim $NEOVIM_VERSION already unpacked ($dest)"
+  elif [ -e "$dest" ] || [ -L "$dest" ]; then
+    warn "Neovim $NEOVIM_VERSION not installed: $dest exists but holds no working Neovim $NEOVIM_VERSION, so it is left alone (move it away and re-run); $found, and the dotfiles config needs >= $NEOVIM_MIN"
+    return 0
+  elif (( DRY_RUN )); then
+    printf "  \033[2m[dry-run]\033[0m download %s\n" "$NEOVIM_RELEASE/$NEOVIM_ASSET"
+    printf "  \033[2m[dry-run]\033[0m verify its SHA256 against the pinned %s\n" "$NEOVIM_SHA256"
+    printf "  \033[2m[dry-run]\033[0m unpack it into %s\n" "$dest"
+  elif ! mkdir -p "$dir" "$(dirname "$dest")"; then
+    warn "Neovim $NEOVIM_VERSION not installed: could not create $dir or $(dirname "$dest"); $found, and the dotfiles config needs >= $NEOVIM_MIN"
+    return 0
+  elif ! reason="$(neovim_fetch "$dest")"; then
+    warn "Neovim $NEOVIM_VERSION not installed: $reason. Nothing was installed; $found, and the dotfiles config needs >= $NEOVIM_MIN (next run will retry)"
+    return 0
+  else
+    ok "installed Neovim $NEOVIM_VERSION in $dest (SHA256 verified)"
+  fi
+  link_local_bin "$dest/bin/nvim" "$dir/nvim"
+  if (( DRY_RUN )); then
+    return 0
+  fi
+  # What counts is what `nvim` now runs, not that the steps above went through.
+  current="$(dotfiles_nvim)" || current=""
+  version=""
+  if [ -n "$current" ]; then version="$(nvim_version "$current")"; fi
+  if [ -n "$version" ] && version_at_least "$version" "$NEOVIM_MIN"; then
+    ok "nvim is now $version ($current)"
+  else
+    warn "Neovim is not ready: nvim still resolves to ${current:-nothing} (${version:-no readable version}), and the dotfiles config needs >= $NEOVIM_MIN. Check $dir/nvim and anything named nvim in ~/bin"
+  fi
+}
+
 run_local() {
   if [ -f ~/.laptop.local ]; then
     step "Running ~/.laptop.local"
@@ -1490,6 +1618,9 @@ install_debian() {
     openjdk-21-jdk \
     zsh-autosuggestions \
     zsh-syntax-highlighting
+  # apt's neovim is too old for the dotfiles config (Ubuntu 24.04: 0.9.5); it
+  # stays as /usr/bin/nvim for root and as the fallback, and install_neovim
+  # puts a new enough one ahead of it on PATH.
   # No gitleaks: Ubuntu 24.04's package is 8.16.0, and dotfiles' pre-commit
   # hook needs >= 8.20.0 (it skips the scan with a warning without one).
 
@@ -1569,6 +1700,7 @@ install_debian() {
   setup_ssh
   apply_dotfiles
   install_render_url
+  install_neovim
   install_voxtype debian
   configure_git
 
