@@ -1276,6 +1276,10 @@ voxtype_variant() {
   fi
 }
 
+# Something at $1 that this script must never replace: anything that is not a
+# regular file. A symlink counts, whatever it points to.
+not_regular_file() { [ -L "$1" ] || { [ -e "$1" ] && [ ! -f "$1" ]; }; }
+
 # Download release asset $1 and install it as $2 (mode 755), only once it is
 # verified two ways: SHA256SUMS.txt carries a valid signature made by
 # $VOXTYPE_KEY_FPR, and the binary hashes to what SHA256SUMS.txt lists for it.
@@ -1308,20 +1312,28 @@ voxtype_fetch() (
     if [ "${name#\*}" = "$asset" ]; then expected="$sum"; fi
   done < "$tmp/SHA256SUMS.txt"
   [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || fail "SHA256SUMS.txt does not list $asset"
-  actual="$(sha256sum < "$tmp/$asset")" || fail "could not hash $asset"
-  [ "${actual%% *}" = "$expected" ] || fail "SHA256 mismatch for $asset (expected $expected, got ${actual%% *})"
 
-  # Built next to the target and renamed over it: never a half-written binary.
+  # Staged next to the target and renamed over it: never a half-written
+  # binary. The staged copy is the one that is hashed, so the bytes installed
+  # are the bytes verified.
   new="$(mktemp "$dest.XXXXXX")" || fail "could not create a temp file next to $dest"
-  if ! { cp -- "$tmp/$asset" "$new" && chmod 755 -- "$new" && mv -fT -- "$new" "$dest"; }; then
-    fail "could not write $dest"
+  cp -- "$tmp/$asset" "$new" || fail "could not write next to $dest"
+  actual="$(sha256sum < "$new")" || fail "could not hash $asset"
+  [ "${actual%% *}" = "$expected" ] || fail "SHA256 mismatch for $asset (expected $expected, got ${actual%% *})"
+  chmod 755 -- "$new" || fail "could not write next to $dest"
+  # The downloads took a while: look at the target again just before the
+  # rename, which would replace a symlink put there in the meantime.
+  if not_regular_file "$dest"; then
+    fail "$dest became something other than a regular file during the download, so it is left alone"
   fi
+  mv -fT -- "$new" "$dest" || fail "could not write $dest"
 )
 
 # The Whisper model transcribe uses, and voxtype's config pointing at it.
 # `voxtype setup --download` writes a default config whose model is "base.en";
 # only that exact generated line is changed, never a model line edited by hand.
-# LAPTOP_SKIP_VOXTYPE_MODEL=1 skips both.
+# The model counts as downloaded when its file exists; its size and content
+# are not checked. LAPTOP_SKIP_VOXTYPE_MODEL=1 skips both.
 voxtype_model() { # voxtype_model VOXTYPE_BINARY
   local bin="$1" model cfg
   model="${XDG_DATA_HOME:-$HOME/.local/share}/voxtype/models/ggml-$VOXTYPE_MODEL.bin"
@@ -1375,7 +1387,7 @@ install_voxtype() { # install_voxtype debian|atomic
     warn "skipped voxtype: only its x86_64 release binaries are installed here (this machine is $arch)"
     return 0
   fi
-  if [ -L "$dest" ] || { [ -e "$dest" ] && [ ! -f "$dest" ]; }; then
+  if not_regular_file "$dest"; then
     warn "skipped voxtype: $dest is not a regular file, so it is left alone (move it away to get voxtype $VOXTYPE_VERSION)"
     return 0
   fi

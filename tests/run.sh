@@ -266,7 +266,9 @@ model = "base.en"
 # A fake voxtype. `--version` prints VERSION; `setup --download --model M ...`
 # leaves what the real one does: models/ggml-M.bin, and the default config
 # (model = "base.en") unless a config exists (STUB_VOXTYPE_SETUP_RC makes it
-# fail first). The variant is only a comment, for the tests to read.
+# fail first; with STUB_VOXTYPE_SETUP_PART=1 it leaves models/ggml-M.bin.part
+# behind, an unfinished download). The variant is only a comment, for the
+# tests to read.
 write_voxtype() { # write_voxtype PATH VERSION [VARIANT]
   cat > "$1" <<'EOF'
 #!@BASH@
@@ -275,10 +277,13 @@ printf '%s\n' "voxtype $*" >> "$STUB_LOG"
 case "${1:-}" in
   --version) echo "voxtype @VERSION@" ;;
   setup)
-    [ "${STUB_VOXTYPE_SETUP_RC:-0}" = 0 ] || exit "$STUB_VOXTYPE_SETUP_RC"
     model=""
     while [ $# -gt 0 ]; do [ "$1" = --model ] && model="${2:-}"; shift; done
     data="${XDG_DATA_HOME:-$HOME/.local/share}/voxtype/models" conf="${XDG_CONFIG_HOME:-$HOME/.config}/voxtype"
+    if [ "${STUB_VOXTYPE_SETUP_RC:-0}" != 0 ]; then
+      if [ "${STUB_VOXTYPE_SETUP_PART:-0}" = 1 ]; then mkdir -p "$data"; echo "wei" > "$data/ggml-$model.bin.part"; fi
+      exit "$STUB_VOXTYPE_SETUP_RC"
+    fi
     mkdir -p "$data" "$conf"
     echo "weights" > "$data/ggml-$model.bin"
     [ -e "$conf/config.toml" ] || cat "$STUB_STATE/voxtype-default-config" > "$conf/config.toml" ;;
@@ -405,7 +410,9 @@ fi'; mv "$STUBS/sf" "$STATE/sf-tool"
   stub sh '[ -p /dev/stdin ] && cat > /dev/null; exit 0' # `curl ... | sh` installers
   # `curl -o FILE URL` writes the fixture named like the URL's last component
   # ($STATE/curl/, see voxtype_release_fixture), if there is one.
-  stub curl 'if [ -n "${STUB_CURL_FAIL:-}" ] && [[ "$*" == *"$STUB_CURL_FAIL"* ]]; then exit 22; fi
+  # STUB_CURL_ON=S STUB_CURL_DO=CMD: CMD runs (eval) before a call containing S.
+  stub curl 'if [ -n "${STUB_CURL_ON:-}" ] && [[ "$*" == *"$STUB_CURL_ON"* ]]; then eval "$STUB_CURL_DO"; fi
+if [ -n "${STUB_CURL_FAIL:-}" ] && [[ "$*" == *"$STUB_CURL_FAIL"* ]]; then exit 22; fi
 [ "${STUB_CURL_RC:-0}" = 0 ] || exit "$STUB_CURL_RC"
 out="" url=""
 while [ $# -gt 0 ]; do
@@ -683,7 +690,7 @@ sandboxed() {
     LAPTOP_CPUINFO="$LAPTOP_CPUINFO" LAPTOP_LIB_DIRS="$LAPTOP_LIB_DIRS"
     STUB_LOG="$STUB_LOG" STUB_STATE="$STUB_STATE"
   )
-  for v in XDG_CURRENT_DESKTOP STUB_GIT_FAIL STUB_GIT_TRUNC STUB_GIT_ON STUB_GIT_DO STUB_CURL_RC STUB_CURL_FAIL STUB_GPG_RC STUB_MISE_RC STUB_RESHIM_RC STUB_OSTREE_RC STUB_NPM_CI_RC STUB_PW_RC STUB_AGENT_FAIL STUB_COREPACK_RC STUB_GPG_KEY STUB_UNAME_M STUB_VOXTYPE_SETUP_RC LAPTOP_SKIP_VOXTYPE_MODEL; do
+  for v in XDG_CURRENT_DESKTOP STUB_GIT_FAIL STUB_GIT_TRUNC STUB_GIT_ON STUB_GIT_DO STUB_CURL_RC STUB_CURL_FAIL STUB_CURL_ON STUB_CURL_DO STUB_GPG_RC STUB_MISE_RC STUB_RESHIM_RC STUB_OSTREE_RC STUB_NPM_CI_RC STUB_PW_RC STUB_AGENT_FAIL STUB_COREPACK_RC STUB_GPG_KEY STUB_UNAME_M STUB_VOXTYPE_SETUP_RC STUB_VOXTYPE_SETUP_PART LAPTOP_SKIP_VOXTYPE_MODEL; do
     if [ -n "${!v:-}" ]; then vars+=("$v=${!v}"); fi
   done
   "$SANDBOX/sysbin/env" -i "${vars[@]}" "$@"
@@ -3250,6 +3257,47 @@ test_voxtype_install() {
   check "nothing downloaded" log_lacks "^curl .*(voxtype|openpgp)"
   teardown
 
+  # The first look at ~/.local/bin/voxtype is before the downloads. What is
+  # there when they are done is what counts: the curl stub puts a symlink (or
+  # a directory) there while "downloading" the binary.
+  local was
+  for was in absent "an older version"; do
+    setup "voxtype: a symlink that appears during the download is never replaced (was $was)"
+    vox_os bazzite
+    mkdir -p "$HOME/.local/bin" "$HOME/src"
+    write_voxtype "$HOME/src/voxtype" 1.0.0 mine
+    if [ "$was" != absent ]; then write_voxtype "$(vox_bin)" 1.0.0 old; fi
+    STUB_CURL_ON="/$VOX_ASSET-avx2" STUB_CURL_DO='ln -sfT "$HOME/src/voxtype" "$HOME/.local/bin/voxtype"' run_linux
+    check "run exits 0" [ "$RC" -eq 0 ]
+    check "the first check passed: the binary was downloaded (control)" log_has "^curl .*/$VOX_ASSET-avx2$"
+    check "warns" has "$OUT" "voxtype not installed: $(vox_bin) became something other than a regular file during the download, so it is left alone"
+    check "the warning is in the summary" has "$OUT" "^    ! voxtype not installed: $(vox_bin) became"
+    check "the link is kept" [ "$(readlink "$(vox_bin)")" = "$HOME/src/voxtype" ]
+    check "its target is untouched" [ "$(sandboxed "$HOME/src/voxtype" --version)" = "voxtype 1.0.0" ] && [ "$(sed -n 's/^# fake voxtype .*, variant: //p' "$HOME/src/voxtype")" = mine ]
+    check "the staged file is removed" [ "$(find "$HOME/.local/bin" -name 'voxtype*' | wc -l)" -eq 1 ]
+    check "temp files and GNUPGHOME are gone" vox_tmp_clean
+    check "the model is not downloaded" log_lacks '^voxtype setup'
+    check "the rest of the run went on" has "$OUT" "Configuring git"
+    teardown
+  done
+
+  setup "voxtype: a directory that appears during the download is never replaced"
+  vox_os bazzite
+  STUB_CURL_ON="/$VOX_ASSET-avx2" STUB_CURL_DO='mkdir -p "$HOME/.local/bin/voxtype"' run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "warns" has "$OUT" "voxtype not installed: $(vox_bin) became something other than a regular file during the download"
+  check "still a directory, and empty" is_real_dir "$(vox_bin)" && [ -z "$(ls -A "$(vox_bin)")" ]
+  check "the staged file is removed" [ "$(find "$HOME/.local/bin" -name 'voxtype*' | wc -l)" -eq 1 ]
+  teardown
+
+  setup "voxtype: a regular file that appears during the download is replaced"
+  vox_os bazzite
+  STUB_CURL_ON="/$VOX_ASSET-avx2" STUB_CURL_DO='echo other > "$HOME/.local/bin/voxtype"' run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "the pinned version is installed" [ "$(vox_version)" = "voxtype $VOX_VERSION" ]
+  check "the release asset, byte for byte" cmp -s "$(vox_bin)" "$STATE/curl/$VOX_ASSET-avx2"
+  teardown
+
   for os in bazzite pop; do
     setup "voxtype: $os, not x86_64"
     vox_os "$os"
@@ -3337,6 +3385,18 @@ test_voxtype_verification() {
   check "the old binary is untouched" [ "$(vox_version)" = "voxtype 1.0.0" ] && [ "$(vox_variant)" = old ]
   check "no temp file left next to it" [ "$(find "$HOME/.local/bin" -name 'voxtype*' | wc -l)" -eq 1 ]
   check "the model is not downloaded with the old binary" log_lacks '^voxtype setup'
+  teardown
+
+  # What is installed is the copy that was hashed: a copy into ~/.local/bin
+  # that comes out different from the (good) download is refused.
+  setup "voxtype: the staged copy differs from the download"
+  vox_os bazzite
+  stub cp '"$STUB_STATE/../sysbin/cp" "$@" || exit $?
+case "${!#}" in "$HOME"/.local/bin/voxtype.*) echo "# changed while copying" >> "${!#}" ;; esac'
+  run_linux
+  vox_refused "voxtype not installed: SHA256 mismatch for $VOX_ASSET-avx2 \(expected [0-9a-f]{64}, got [0-9a-f]{64}\)"
+  check "the download itself was good (control)" grep -qx "$(sha256sum < "$STATE/curl/$VOX_ASSET-avx2" | cut -d' ' -f1)  $VOX_ASSET-avx2" "$STATE/curl/SHA256SUMS.txt"
+  check "the copy was made (control)" log_has "^cp -- .*/$VOX_ASSET-avx2 $HOME/.local/bin/voxtype\.[A-Za-z0-9]+$"
   teardown
 
   setup "voxtype: SHA256SUMS.txt does not list the build"
@@ -3522,6 +3582,37 @@ test_voxtype_model() {
   check "without installing the binary again" log_lacks "^curl .*(voxtype|openpgp)"
   check "the model is there" [ -f "$(vox_model)" ]
   check "the config uses it" grep -qx 'model = "large-v3-turbo"' "$(vox_config)"
+  teardown
+
+  setup "voxtype: a failed model download leaves a .part file, then works"
+  vox_os bazzite
+  STUB_VOXTYPE_SETUP_RC=1 STUB_VOXTYPE_SETUP_PART=1 run_linux
+  check "run still completes" [ "$RC" -eq 0 ]
+  check "the .part file is there (control)" [ -f "$(vox_model).part" ]
+  check "warns" has "$OUT" "'voxtype setup --download --model large-v3-turbo' failed; next run will retry"
+  check "no config written" [ ! -e "$(vox_config)" ]
+  : > "$LOG"
+  run_linux
+  check "the .part file does not count as the model: the next run retries" log_has "^voxtype $VOX_SETUP$"
+  check "notes the size again" has "$OUT" 'large-v3-turbo model is a ~1\.6 GB download'
+  check "the model is there" [ -f "$(vox_model)" ]
+  check "the config uses it" grep -qx 'model = "large-v3-turbo"' "$(vox_config)"
+  check "the .part file is voxtype's: the script does not remove it" [ -f "$(vox_model).part" ]
+  teardown
+
+  # Only the model file's presence is checked (documented in the README): a
+  # truncated file with the model's own name counts as downloaded.
+  setup "voxtype: a truncated model file counts as present"
+  vox_os bazzite
+  voxtype_done_fixture
+  : > "$(vox_model)"
+  cp "$STATE/voxtype-default-config" "$(vox_config)"
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "reports the model downloaded" has "$OUT" "voxtype model large-v3-turbo already downloaded"
+  check "no model download" log_lacks '^voxtype setup'
+  check "the file is left as it is" [ -f "$(vox_model)" ] && [ ! -s "$(vox_model)" ]
+  check "the config is still switched to it" grep -qx 'model = "large-v3-turbo"' "$(vox_config)"
   teardown
 }
 
