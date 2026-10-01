@@ -4659,8 +4659,9 @@ test_stow_packages_match_dotfiles() {
 
 BREWFILE="$ROOT/mac/Brewfile"
 # One entry: a kind, a quoted name, optional comment. No options: the file
-# needs none, so none are accepted, except the `id: NUMBER` a mas entry must have.
-BREWFILE_ENTRY='^(tap|brew|cask|mas|vscode) "([A-Za-z0-9@._/+ -]+)"(, id: [0-9]+)?([[:space:]]+#.*)?$'
+# needs none, so none are accepted, except the `id: NUMBER` a mas entry must have
+# (no leading zero: Ruby reads one as octal).
+BREWFILE_ENTRY='^(tap|brew|cask|mas|vscode) "([A-Za-z0-9@._/+ -]+)"(, id: [1-9][0-9]*)?([[:space:]]+#.*)?$'
 
 # Formulae `linux` installs from Homebrew that the Mac deliberately goes
 # without. Every entry needs a comment saying why. Empty: the Mac wants all of
@@ -4731,8 +4732,9 @@ test_brewfile_parses() {
   check "accepts each entry kind and comments" [ "$(brewfile_entries "$tmp/good" | tr '\n' ',')" = "tap a/b,brew x@1,cask y,mas Some App,vscode a.b," ]
   printf '%s\n' 'brew "x"' 'npm "y"' 'brew review_bad' 'brew "a b"' 'mas "App"' 'system "rm -rf /"' 'brew "x"; system "id"' \
     'brew "review-bad", restart_service: "' 'brew "review-bad", restart_service: (' \
-    'brew "y", restart_service: :changed' 'brew "z", id: 1' 'mas "App", id: x' 'brew "w" trailing' > "$tmp/bad"
-  check "rejects other kinds, unquoted names, a mas without id, Ruby code, and every option but a mas id" [ "$(brewfile_entries "$tmp/bad" | tr '\n' ',')" = "brew x,invalid 2,invalid 3,invalid 4,invalid 5,invalid 6,invalid 7,invalid 8,invalid 9,invalid 10,invalid 11,invalid 12,invalid 13," ]
+    'brew "y", restart_service: :changed' 'brew "z", id: 1' 'mas "App", id: x' 'brew "w" trailing' \
+    'mas "Review App", id: 08' 'mas "Review App", id: 09' > "$tmp/bad"
+  check "rejects other kinds, unquoted names, a mas without id, Ruby code, and every option but a mas id" [ "$(brewfile_entries "$tmp/bad" | tr '\n' ',')" = "brew x,invalid 2,invalid 3,invalid 4,invalid 5,invalid 6,invalid 7,invalid 8,invalid 9,invalid 10,invalid 11,invalid 12,invalid 13,invalid 14,invalid 15," ]
   printf '%s\n' 'brew "x"' 'cask "x"' 'brew "y"' 'brew "x" # again' > "$tmp/dup"
   check "reports a duplicate (a brew and a cask of one name are two entries)" [ "$(brewfile_duplicates "$tmp/dup")" = "brew x" ]
   rm -rf "$tmp"

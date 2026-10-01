@@ -77,6 +77,14 @@ mise exec node@lts -- corepack enable pnpm
 mise reshim
 ```
 
+Node 25 and later no longer ship corepack. If
+`~/.local/share/mise/installs/node/lts/bin/corepack` doesn't exist, install
+it first, with the same Node, and then run the `corepack enable pnpm` line:
+
+```bash
+mise exec node@lts -- npm install -g corepack
+```
+
 Salesforce work only (the plugin needs the JDK below):
 
 ```bash
