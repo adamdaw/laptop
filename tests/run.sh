@@ -4671,11 +4671,16 @@ tar_options_control() {
 # tests/ and dot-dirs. Update with the dotfiles repo. Set
 # LAPTOP_TEST_DOTFILES_DIR to a checkout to check this list against it too
 # (read-only; skipped otherwise, so the tests need no network or checkout).
-DOTFILES_PACKAGES=(agy applications atuin bash bat bin claude ghostty git mise nvim render-url ripgrep ssh starship tmux xdg zsh)
+DOTFILES_PACKAGES=(agy applications atuin bash bat bin claude ghostty git mise nvim render-url ripgrep soulseek ssh starship tmux xdg zsh)
 # In dotfiles but not in STOW_PACKAGES, on purpose: xdg makes Ghostty the
 # default terminal, so it is stowed only on Bazzite GNOME with Ghostty present
 # (prepare_default_terminal adds it; see test_default_terminal).
 CONDITIONAL_PACKAGES=(xdg)
+# In dotfiles but never stowed by the script, on purpose: soulseek runs
+# SoulseekQt through ProtonVPN in a network namespace and needs set-up by hand
+# first (a Proton WireGuard config, the AppImage, natpmpc), so it is stowed by
+# hand where it is wanted (see the dotfiles README, Soulseek over ProtonVPN).
+MANUAL_PACKAGES=(soulseek)
 
 script_list() { sed -n "s/^$1=(\(.*\))\$/\1/p" "$SCRIPT"; }
 sorted() { printf '%s\n' "$@" | sort | tr '\n' ' '; }
@@ -4687,7 +4692,10 @@ test_stow_packages_match_dotfiles() {
   read -ra nofold <<<"$(script_list NO_FOLD_PACKAGES)"
   local p
   check "parsed STOW_PACKAGES" [ "${#stow[@]}" -gt 0 ]
-  check "STOW_PACKAGES + conditional = dotfiles packages" [ "$(sorted "${stow[@]}" "${CONDITIONAL_PACKAGES[@]}")" = "$(sorted "${DOTFILES_PACKAGES[@]}")" ]
+  check "STOW_PACKAGES + conditional + manual = dotfiles packages" [ "$(sorted "${stow[@]}" "${CONDITIONAL_PACKAGES[@]}" "${MANUAL_PACKAGES[@]}")" = "$(sorted "${DOTFILES_PACKAGES[@]}")" ]
+  for p in "${MANUAL_PACKAGES[@]}"; do
+    check "$p is never stowed" lacks " ${stow[*]} ${nofold[*]} " " $p "
+  done
   for p in "${CONDITIONAL_PACKAGES[@]}"; do
     check "$p is not stowed unconditionally" lacks " ${stow[*]} " " $p "
   done

@@ -362,7 +362,10 @@ install_node() {
   fi
   MISE_BIN="${MISE_BIN:-mise}"
   # Decided from files on disk, never by running mise (it creates state, so a
-  # --dry-run must not run it), so a dry run and a real run agree.
+  # --dry-run must not run it). A dry run and a real run can still differ:
+  # --dry-run never stows, so on a fresh machine it doesn't see the dotfiles'
+  # mise config and plans `mise use -g node@lts`, while a real run stows it
+  # first, finds its node pin and runs `mise install node`.
   pin="$(mise_node_pin "$config")"
   IFS='|' read -r state version key <<<"$pin"
   pinned="tools.$key = ${version:-(version not derived)}"
