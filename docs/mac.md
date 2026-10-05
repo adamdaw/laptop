@@ -88,9 +88,17 @@ what `linux` runs; none has been tried on macOS.
 
 ### Node: mise's, never Homebrew's
 
+The dotfiles `mise` package is mise's global config, and it pins Node LTS.
+Stow the dotfiles first, `mise` included and with `--no-folding` (see
+[Stowing the dotfiles on macOS](#stowing-the-dotfiles-on-macos)), then
+install the Node it pins:
+
 ```bash
-mise use -g node@lts
+mise install
 ```
+
+Don't run `mise use -g node@lts` first: it writes a `~/.config/mise/config.toml`
+of its own, which then conflicts with the package's.
 
 Homebrew installs its own `node` anyway, as a dependency of
 `markdownlint-cli2`. That one must not be used for anything below: a bare
@@ -178,7 +186,7 @@ stow -t "$HOME" zsh
 | Package | On macOS |
 |---|---|
 | `bash`, `zsh`, `tmux`, `ghostty`, `starship`, `nvim`, `ripgrep`, `bat` | `stow -t "$HOME" <package>` |
-| `bin`, `agy`, `claude`, `render-url` | `stow --no-folding -t "$HOME" <package>`, so `~/bin`, `~/.config/agy`, `~/.claude` and `~/.local/share/render-url` stay real directories and nothing written there lands in the repository |
+| `bin`, `agy`, `claude`, `mise`, `render-url` | `stow --no-folding -t "$HOME" <package>`, so `~/bin`, `~/.config/agy`, `~/.claude`, `~/.config/mise` and `~/.local/share/render-url` stay real directories and nothing written there lands in the repository |
 | `git` | Before moving an existing `~/.gitconfig` away, copy its `user.name`, `user.email`, `user.signingkey` and `credential.*` settings into `~/.gitconfig.local`, which the dotfiles `.gitconfig` includes. Then stow. |
 | `ssh` | An existing `~/.ssh/config` conflicts. Read it before moving it: it may hold hosts the dotfiles one doesn't have. |
 | `atuin` | Link the one file that matters. See below. |
@@ -257,11 +265,11 @@ sets `VOXTYPE` to its path), and downloads a model with
 Roughly what `linux` does, for macOS, with the same `--dry-run`:
 
 - check for Homebrew, then `brew bundle install --file=mac/Brewfile`;
-- Node LTS through mise, then the agent CLIs, their `~/.local/bin` links and
-  the Salesforce tools;
 - clone the dotfiles, back up conflicts (never `--adopt`), carry the git
   identity into `~/.gitconfig.local`, and stow the packages in the table
   above, skipping `applications` and `xdg`;
+- Node LTS through mise (pinned by the stowed `mise` package), then the agent
+  CLIs, their `~/.local/bin` links and the Salesforce tools;
 - link atuin's config, and install render-url's dependencies;
 - source `~/.laptop.local` for personal additions.
 

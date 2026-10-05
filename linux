@@ -51,15 +51,15 @@ NEOVIM_MARKER=.laptop-verified-sha256
 NEOVIM_NOTES=()
 
 # Dotfiles packages to stow (one directory each in the dotfiles repo).
-STOW_PACKAGES=(agy applications atuin bash bat bin claude ghostty git nvim render-url ripgrep ssh starship tmux zsh)
+STOW_PACKAGES=(agy applications atuin bash bat bin claude ghostty git mise nvim render-url ripgrep ssh starship tmux zsh)
 # Stowed with --no-folding: their target dirs (~/bin, ~/.local/bin,
 # ~/.local/share/..., ~/.config, ~/.config/agy, ~/.config/atuin,
-# ~/.config/atuin-ai-server, ~/.config/containers/systemd, ~/.claude) must stay
-# real directories, so nothing written there (scripts other installers drop
-# into ~/bin, agy's and atuin's own files, other Quadlet units, render-url's
-# node_modules, Claude Code's sessions and credentials, other apps' files)
-# ever lands in the dotfiles repo.
-NO_FOLD_PACKAGES=(agy applications atuin bin claude render-url xdg)
+# ~/.config/atuin-ai-server, ~/.config/containers/systemd, ~/.config/mise,
+# ~/.claude) must stay real directories, so nothing written there (scripts
+# other installers drop into ~/bin, agy's, atuin's and mise's own files, other
+# Quadlet units, render-url's node_modules, Claude Code's sessions and
+# credentials, other apps' files) ever lands in the dotfiles repo.
+NO_FOLD_PACKAGES=(agy applications atuin bin claude mise render-url xdg)
 
 # Existing files that conflict with a stowed file are moved into a fresh,
 # uniquely named directory under here (created on first use), never adopted.
@@ -1778,9 +1778,6 @@ install_debian() {
     run sudo apt-get install -y mise
     did "installed mise"
   fi
-  install_node
-  install_agent_clis
-  install_salesforce
   install_bun
 
   step "Installing uv"
@@ -1820,11 +1817,16 @@ install_debian() {
   if cmd_exists go; then
     run go telemetry off 2>/dev/null || true
   fi
-  npm_no_fund
   ok "telemetry disabled"
 
   setup_ssh
   apply_dotfiles
+  # After stowing, so a stowed mise config pins Node before mise runs (and mise
+  # never writes a config of its own that the stow would back up).
+  install_node
+  install_agent_clis
+  install_salesforce
+  npm_no_fund
   install_render_url
   install_neovim
   install_voxtype debian
@@ -1951,9 +1953,6 @@ install_atomic() {
   ensure_brew
   install_brew_formulae
 
-  install_node
-  install_agent_clis
-  install_salesforce
   install_bun
 
   install_font
@@ -1963,12 +1962,17 @@ install_atomic() {
   if cmd_exists go; then
     run go telemetry off 2>/dev/null || true
   fi
-  npm_no_fund
   ok "telemetry disabled"
 
   setup_ssh
   prepare_default_terminal
   apply_dotfiles
+  # After stowing, so a stowed mise config pins Node before mise runs (and mise
+  # never writes a config of its own that the stow would back up).
+  install_node
+  install_agent_clis
+  install_salesforce
+  npm_no_fund
   install_render_url
   install_voxtype atomic
   configure_default_terminal

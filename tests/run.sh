@@ -30,9 +30,9 @@ CURRENT=""
 CORE_UTILS=(bash env cat grep sed find realpath dirname basename date mkdir mv cp rm ln chmod head tr sort mktemp touch readlink ls wc python3 sha256sum tar gzip)
 
 ALL_FORMULAE=(git git-delta stow neovim tmux jq ripgrep fd fzf bat wget gh starship zsh zsh-autosuggestions zsh-syntax-highlighting uv mise openjdk@21 lazygit tree-sitter-cli shellcheck markdownlint-cli2 gitleaks atuin)
-ALL_PACKAGES=(agy applications atuin bash bat bin claude ghostty git nvim render-url ripgrep ssh starship tmux zsh)
+ALL_PACKAGES=(agy applications atuin bash bat bin claude ghostty git mise nvim render-url ripgrep ssh starship tmux zsh)
 # Stowed with --no-folding (as the script does).
-NO_FOLD_PACKAGES=(agy applications atuin bin claude render-url)
+NO_FOLD_PACKAGES=(agy applications atuin bin claude mise render-url)
 
 # Calls that would change the machine. None may appear during --dry-run.
 MUTATING='^(sudo|apt-get|chsh|usermod|ujust|ssh-keygen|npm|curl|stow|systemctl|ubuntu-report|unzip|fc-cache)( |$)|^brew install|^rpm-ostree (install|upgrade|reboot)|^flatpak install|^git clone|^git config (--global [^-]|.* --(add|unset|unset-all|replace-all|remove-section|rename-section)( |$))|^mise (use|install|reshim|exec)|^mise-|^gsettings set|^voxtype setup'
@@ -1095,12 +1095,28 @@ test_folded_into_other_package() {
   check ".config was unfolded into a real dir" is_real_dir "$HOME/.config"
   check "repo contents unchanged" [ "$repo_before" = "$(repo_snapshot)" ]
   check "mise config not written through the fold" [ ! -e "$d/agy/.config/mise" ]
+  check "node pinned only once stowing unfolded .config" logged_before '^stow ' '^mise use -g node@lts$'
+  check "mise wrote a real config" [ -f "$HOME/.config/mise/config.toml" ] && [ ! -L "$HOME/.config/mise/config.toml" ]
+  check "competing PATH npm never used" log_lacks '^npm '
+  check "no backups made" [ ! -e "$HOME/.local/state/laptop/backups" ]
+  teardown
+
+  # A link stow leaves alone: still into the repo when Node is installed.
+  setup ".config/mise linked into the repo by hand"
+  bazzite
+  dotfiles_fixture
+  d="$HOME/Projects/Home/dotfiles"
+  mkdir -p "$HOME/.config"
+  ln -s "$d/agy/.config/agy" "$HOME/.config/mise"
+  repo_before="$(repo_snapshot)"
+  run_linux
+  check "run exits 0" [ "$RC" -eq 0 ]
+  check "repo contents unchanged" [ "$repo_before" = "$(repo_snapshot)" ]
   check "mise was not asked to pin node" log_lacks '^mise use'
   check "says why node was not pinned" has "$OUT" "mise's global config .* resolves into the dotfiles repo; not writing to it"
   check "skips Claude with a clear warning" has "$OUT" "skipped agent CLIs: no usable mise-managed Node"
   check "competing PATH npm never used" log_lacks '^npm '
   check "no npm through mise either" log_lacks '^mise-'
-  check "no backups made" [ ! -e "$HOME/.local/state/laptop/backups" ]
   teardown
 }
 
@@ -1214,7 +1230,8 @@ test_node_readiness() {
   setup "config blocked, no npm anywhere"
   bazzite
   dotfiles_fixture
-  ln -s Projects/Home/dotfiles/agy/.config "$HOME/.config"
+  mkdir -p "$HOME/.config"
+  ln -s "$HOME/Projects/Home/dotfiles/agy/.config/agy" "$HOME/.config/mise"
   rm "$STUBS/npm"
   run_linux
   check "run exits 0" [ "$RC" -eq 0 ]
@@ -3146,11 +3163,14 @@ test_agent_clis() {
   check "warns pnpm is missing from Node LTS" has "$OUT" "not linking ~/.local/bin/pnpm: $data/installs/node/lts/bin/pnpm is missing"
   teardown
 
+  # Into a dir no stowed package unfolds (applications, which would, is
+  # absent), so it still resolves into the repo when the CLIs are linked.
   setup "agent CLIs: ~/.local/bin folded into the repo"
   bazzite
   dotfiles_fixture
+  rm -rf "$HOME/Projects/Home/dotfiles/applications"
   mkdir -p "$HOME/.local"
-  ln -s ../Projects/Home/dotfiles/applications/.local/bin "$HOME/.local/bin"
+  ln -s ../Projects/Home/dotfiles/bin/bin "$HOME/.local/bin"
   local repo_before; repo_before="$(repo_snapshot)"
   run_linux
   check "run exits 0" [ "$RC" -eq 0 ]
@@ -3165,6 +3185,40 @@ test_agent_clis() {
 # ~/.config/atuin-ai-server and ~/.config/containers/systemd, so none may be
 # folded into the repo. atuin writes its own config.toml on first run: a
 # regular file, backed up before stowing. The Quadlet unit is never started.
+test_mise_package() {
+  local df repo_before backups_before os
+  for os in bazzite pop; do
+    setup "mise: $os fresh HOME, the stowed config pins node"
+    if [ "$os" = bazzite ]; then bazzite; else os_release pop "ubuntu debian"; fi
+    dotfiles_fixture
+    df="$HOME/Projects/Home/dotfiles/mise/.config/mise"
+    mkdir -p "$df"
+    printf '[tools]\nnode = "lts"\n' > "$df/config.toml"
+    run_linux --dry-run
+    check "dry run plans mise without folding" has "$OUT" '\[dry-run\] stow --no-folding .* --restow mise$'
+    check "dry run never mutates" log_lacks "$MUTATING"
+    repo_before="$(repo_snapshot)"
+    run_linux
+    check "run exits 0" [ "$RC" -eq 0 ]
+    check "HOME/.config/mise is a real dir" is_real_dir "$HOME/.config/mise"
+    check "config.toml is the stowed link" [ "$(realpath "$HOME/.config/mise/config.toml")" = "$(realpath "$df/config.toml")" ]
+    check "no backup of a mise-written config.toml" [ -z "$(find "$HOME/.local/state/laptop/backups" -path '*/.config/mise/*' 2>/dev/null)" ]
+    check "mise stowed before it runs" logged_before '^stow .* --restow mise$' '^mise '
+    check "node installed from the stowed pin, never re-pinned" log_has '^mise install node$' && log_lacks '^mise use'
+    check "node is installed under mise" [ -x "$HOME/.local/share/mise/installs/node/22.12.0/bin/node" ]
+    check "claude installed through Node LTS's npm, after node" logged_before '^mise install node$' '^mise exec node@lts -- npm install -g @anthropic-ai/claude-code$'
+    check "never wrote into the repo" [ "$repo_before" = "$(repo_snapshot)" ]
+    : > "$LOG"
+    backups_before="$(find "$HOME/.local/state/laptop/backups" -type f 2>/dev/null | wc -l)"
+    run_linux
+    check "re-run exits 0" [ "$RC" -eq 0 ]
+    check "re-run does not re-pin, install or reshim node" log_lacks '^mise (use|install|reshim)'
+    check "re-run makes no new backups" [ "$(find "$HOME/.local/state/laptop/backups" -type f 2>/dev/null | wc -l)" -eq "$backups_before" ]
+    check "re-run leaves the repo unchanged" [ "$repo_before" = "$(repo_snapshot)" ]
+    teardown
+  done
+}
+
 test_atuin_package() {
   local df before repo_before backups os
   for os in bazzite pop; do
@@ -4617,7 +4671,7 @@ tar_options_control() {
 # tests/ and dot-dirs. Update with the dotfiles repo. Set
 # LAPTOP_TEST_DOTFILES_DIR to a checkout to check this list against it too
 # (read-only; skipped otherwise, so the tests need no network or checkout).
-DOTFILES_PACKAGES=(agy applications atuin bash bat bin claude ghostty git nvim render-url ripgrep ssh starship tmux xdg zsh)
+DOTFILES_PACKAGES=(agy applications atuin bash bat bin claude ghostty git mise nvim render-url ripgrep ssh starship tmux xdg zsh)
 # In dotfiles but not in STOW_PACKAGES, on purpose: xdg makes Ghostty the
 # default terminal, so it is stowed only on Bazzite GNOME with Ghostty present
 # (prepare_default_terminal adds it; see test_default_terminal).
@@ -4841,6 +4895,7 @@ TESTS=(
   test_bin_absolute_links
   test_agent_clis
   test_stow_packages_match_dotfiles
+  test_mise_package
   test_atuin_package
   test_voxtype_install
   test_voxtype_variants
