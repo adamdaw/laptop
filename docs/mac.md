@@ -1,8 +1,9 @@
 # Mac setup
 
 There is no automated Mac setup script yet. `linux` doesn't support macOS,
-and nothing in this repository changes a Mac for you. What exists is [`mac/Brewfile`](../mac/Brewfile), a list of Homebrew
-packages, and this page of steps to run by hand.
+and nothing in this repository changes a Mac for you. What exists is
+[`mac/Brewfile`](../mac/Brewfile), a list of Homebrew packages, and this page
+of steps to run by hand.
 
 None of this has been run on a Mac. The Brewfile's names were checked against
 Homebrew's package index (and, for the two third-party taps, against the tap
